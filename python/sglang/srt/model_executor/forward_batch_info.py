@@ -55,6 +55,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
+    create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
