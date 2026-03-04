@@ -1432,6 +1432,24 @@ class GroupCoordinator:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+    ) -> None:
+        """All-to-All: exchange equal-sized chunks between all ranks."""
+        if self.world_size == 1:
+            output.copy_(input)
+            return
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(
+                output, input, group=self.device_group
+            )
+
     def destroy(self):
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
