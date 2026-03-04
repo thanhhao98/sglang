@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
@@ -141,7 +142,26 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
-    def alloc(self, need_size: int):
+    def alloc(self, need_size: int, token_positions=None):
+        dcp_world_size = get_dcp_world_size()
+        dcp_rank = get_dcp_rank()
+
+        if dcp_world_size > 1 and token_positions is not None:
+            local_mask = (token_positions % dcp_world_size) == dcp_rank
+            local_count = int(local_mask.sum().item())
+
+            if self.need_sort and local_count > len(self.free_pages):
+                self.merge_and_sort_free()
+            if local_count > len(self.free_pages):
+                return None
+
+            result = torch.full(
+                (need_size,), -1, dtype=torch.int64, device=self.device
+            )
+            result[local_mask] = self.free_pages[:local_count]
+            self.free_pages = self.free_pages[local_count:]
+            return result
+
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -400,6 +420,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return out_indices
 
+    def _apply_dcp_filter(self, out_indices, token_positions):
+        """Apply DCP interleaving filter: set indices to -1 for positions not on this rank."""
+        dcp_world_size = get_dcp_world_size()
+        dcp_rank = get_dcp_rank()
+        if dcp_world_size > 1 and token_positions is not None:
+            remote_mask = (token_positions % dcp_world_size) != dcp_rank
+            out_indices[remote_mask] = -1
+        return out_indices
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -408,6 +437,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        token_positions=None,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -446,13 +476,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices
+        return self._apply_dcp_filter(out_indices, token_positions)
 
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        token_positions=None,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -485,7 +516,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices
+        return self._apply_dcp_filter(out_indices, token_positions)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
