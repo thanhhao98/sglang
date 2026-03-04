@@ -32,6 +32,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
 )
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     get_nsa_index_head_dim,
@@ -187,6 +188,22 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
+    "fa3",
+    "nsa",
+    "flashinfer",
+    "cutlass_mla",
+    "trtllm_mla",
+    "ascend",
+]
+
+
+def add_forward_absorb_core_attention_backend(backend_name):
+    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
 
 
 class DeepseekV2MLP(nn.Module):
