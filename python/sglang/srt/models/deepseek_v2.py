@@ -175,7 +175,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm, merge_state_v2
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
