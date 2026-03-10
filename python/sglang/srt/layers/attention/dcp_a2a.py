@@ -189,6 +189,7 @@ def dcp_a2a_lse_reduce(
     cp_attn_lse: torch.Tensor,
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
+    cuda_graph_buffers: Optional[dict] = None,
 ) -> torch.Tensor:
     """A2A-based DCP reduce: exchange head partials, then local combine.
 
@@ -199,6 +200,9 @@ def dcp_a2a_lse_reduce(
         cp_attn_lse: [B, H]     log-sum-exp values (fp32)
         cp_group:    DCP GroupCoordinator
         is_lse_base_on_e: True for FlashAttention (base-e), False for FlashInfer (base-2)
+        cuda_graph_buffers: Pre-allocated buffers for CUDA graph mode.
+            Keys: send_output, recv_output, send_lse, recv_lse
+            (max-sized [N, max_bs, H_per_rank, D] / [N, max_bs, H_per_rank])
 
     Returns:
         [B, H_local, D] combined attention output for this rank's local heads.
@@ -211,24 +215,36 @@ def dcp_a2a_lse_reduce(
     H_per_rank = H // N
 
     # Reshape [B, H, D] -> [N, B, H/N, D] — split heads across ranks
-    send_output = (
-        cp_attn_out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3).contiguous()
-    )
-    recv_output = torch.empty_like(send_output)
+    reshaped_out = cp_attn_out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
+    reshaped_lse = cp_attn_lse.view(B, N, H_per_rank).permute(1, 0, 2)
 
-    # Reshape [B, H] -> [N, B, H/N]
-    send_lse = cp_attn_lse.view(B, N, H_per_rank).permute(1, 0, 2).contiguous()
-    recv_lse = torch.empty_like(send_lse)
+    if cuda_graph_buffers is not None:
+        # CUDA graph path: write into pre-allocated buffers at fixed addresses.
+        # Each CUDA graph is captured per batch size, so B is constant for
+        # a given graph.  We operate on the full [N, max_bs, ...] buffer to
+        # keep NCCL chunk boundaries and data pointers stable across replays,
+        # and only read the first B rows from the recv buffer afterward.
+        send_buf = cuda_graph_buffers["send_output"]
+        recv_buf = cuda_graph_buffers["recv_output"]
+        send_lse_buf = cuda_graph_buffers["send_lse"]
+        recv_lse_buf = cuda_graph_buffers["recv_lse"]
 
-    # A2A exchange: each rank sends its chunk i to rank i
-    cp_group.all_to_all_single(
-        recv_output.view(-1), send_output.view(-1)
-    )
-    cp_group.all_to_all_single(
-        recv_lse.view(-1), send_lse.view(-1)
-    )
+        send_buf[:, :B, :, :].copy_(reshaped_out)
+        send_lse_buf[:, :B, :].copy_(reshaped_lse)
 
-    # Local Triton combine — no further communication needed
+        cp_group.all_to_all_single(recv_buf.view(-1), send_buf.view(-1))
+        cp_group.all_to_all_single(recv_lse_buf.view(-1), send_lse_buf.view(-1))
+
+        recv_output = recv_buf[:, :B, :, :].contiguous()
+        recv_lse = recv_lse_buf[:, :B, :].contiguous()
+    else:
+        send_output = reshaped_out.contiguous()
+        recv_output = torch.empty_like(send_output)
+        send_lse = reshaped_lse.contiguous()
+        recv_lse = torch.empty_like(send_lse)
+        cp_group.all_to_all_single(recv_output.view(-1), send_output.view(-1))
+        cp_group.all_to_all_single(recv_lse.view(-1), send_lse.view(-1))
+
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
