@@ -90,6 +90,10 @@ class FlashAttentionMetadata:
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
+    # DCP-filtered metadata (local KV shard)
+    dcp_page_table: torch.Tensor = None
+    dcp_cache_seqlens: torch.Tensor = None
+
 
 # Copied from:
 # https://github.com/houseroad/vllm/blob/4e45bfcaf928bdb9bd952b4ac922a3c205589ae8/vllm/v1/attention/backends/flash_attn.py
@@ -509,6 +513,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+
+                if self.dcp_size > 1:
+                    self._init_dcp_decode_metadata(metadata, device)
+
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -1237,7 +1245,12 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                page_table = metadata.page_table
+                if use_dcp and metadata.dcp_page_table is not None:
+                    page_table = metadata.dcp_page_table
+                    cache_seqlens = metadata.dcp_cache_seqlens
+                else:
+                    page_table = metadata.page_table
+                    cache_seqlens = metadata.cache_seqlens_int32
                 if is_swa_layer and self.use_sliding_window_kv_pool:
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
@@ -1247,7 +1260,6 @@ class FlashAttentionBackend(AttentionBackend):
                                 metadata.page_table
                             )
                         )
-                cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
@@ -1312,16 +1324,25 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
                 if use_dcp:
+                    # FA3 LSE shape: [B,H,S], [H,B], or [B,H]. Normalize to [B,H].
+                    B_out = o.shape[0]
+                    H_out = q_reshaped.shape[1]
+                    if softmax_lse.ndim == 3:
+                        lse_2d = softmax_lse.squeeze(-1)
+                    elif softmax_lse.shape == (H_out, B_out):
+                        lse_2d = softmax_lse.T.contiguous()
+                    else:
+                        lse_2d = softmax_lse.view(B_out, H_out)
                     if self.dcp_comm_backend == "a2a":
                         o = dcp_a2a_lse_reduce(
-                            o, softmax_lse, get_dcp_group(),
+                            o, lse_2d, get_dcp_group(),
                             is_lse_base_on_e=True,
                             cuda_graph_buffers=getattr(
                                 self, "dcp_cuda_graph_buffers", None
                             ),
                         )
                     else:
-                        o = cp_lse_ag_out_rs(o, softmax_lse, get_dcp_group())
+                        o = cp_lse_ag_out_rs(o, lse_2d, get_dcp_group())
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
@@ -1350,26 +1371,35 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
+            need_mla_lse = use_cascade_attn or use_dcp
+
+            dcp_pt = metadata.dcp_page_table if use_dcp else None
+            dcp_sl = metadata.dcp_cache_seqlens if use_dcp else None
+
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
+                page_table=dcp_pt if dcp_pt is not None else metadata.page_table,
+                cache_seqlens=dcp_sl if dcp_sl is not None else metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                cu_seqlens_k_new=None if use_dcp else metadata.cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
+                return_softmax_lse=need_mla_lse,
                 num_splits=self.num_splits,
             )
-            if use_cascade_attn:
+            if need_mla_lse:
                 o, softmax_lse, *rest = result
+            else:
+                o = result
+
+            if use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1395,8 +1425,21 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+
+        if use_dcp:
+            # FA3 LSE shape varies by mode:
+            #   [B, H, S] for batch mode (S=1 for decode)
+            #   [H, total_q] for varlen/cu_seqlens mode
+            # Normalize to [B, H] for DCP reduce.
+            B_out = o.shape[0]
+            H_out = layer.tp_q_head_num
+            if softmax_lse.ndim == 3:
+                lse_2d = softmax_lse.squeeze(-1)  # [B, H, 1] -> [B, H]
+            elif softmax_lse.shape == (H_out, B_out):
+                lse_2d = softmax_lse.T.contiguous()  # [H, B] -> [B, H]
             else:
-                o = result
+                lse_2d = softmax_lse.view(B_out, H_out)
+            return o.view(-1, H_out * layer.v_head_dim), lse_2d
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -1463,6 +1506,15 @@ class FlashAttentionBackend(AttentionBackend):
                 max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
+            )
+
+        if self.dcp_size > 1:
+            max_local_pages = (max_num_pages + self.dcp_size - 1) // self.dcp_size
+            self.decode_cuda_graph_metadata["dcp_page_table"] = torch.zeros(
+                max_bs, max_local_pages, dtype=torch.int32, device=self.device,
+            )
+            self.decode_cuda_graph_metadata["dcp_cache_seqlens"] = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device,
             )
 
         if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
@@ -1807,6 +1859,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
 
+                if self.dcp_size > 1:
+                    self._init_dcp_decode_metadata(metadata, device)
+
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
@@ -2055,6 +2110,9 @@ class FlashAttentionBackend(AttentionBackend):
                     self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
 
+                if self.dcp_size > 1:
+                    self._init_dcp_decode_metadata(metadata, device)
+
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
                     bs,
@@ -2271,6 +2329,58 @@ class FlashAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def _init_dcp_decode_metadata(self, metadata: FlashAttentionMetadata, device):
+        """Build DCP-filtered page_table and cache_seqlens for local KV shard.
+
+        DCP interleaved ownership: token at virtual position `pos` belongs to
+        rank `pos % dcp_size`. The local KV buffer stores only this rank's
+        tokens, so page_table and seqlens must be remapped to local indices.
+
+        During CUDA graph mode, writes into pre-allocated buffers from
+        decode_cuda_graph_metadata to keep tensor addresses stable.
+        """
+        from sglang.srt.distributed.parallel_state import get_dcp_rank
+
+        N = self.dcp_size
+        dcp_rank = get_dcp_rank()
+
+        full_seqlens = metadata.cache_seqlens_int32  # [B]
+        B = full_seqlens.shape[0]
+
+        local_seqlens = ((full_seqlens - dcp_rank - 1) // N + 1).clamp(min=0)
+
+        global_pt = metadata.page_table  # [B, max_pages] (page indices, already strided)
+        max_global_pages = global_pt.shape[1]
+
+        # Compute local page count per request
+        max_local_tokens = local_seqlens.max().item()
+        max_local_pages = (max_local_tokens + self.page_size - 1) // self.page_size
+
+        # Build local page table by selecting every N-th page and converting to local
+        # Global virtual token pos `dcp_rank + j*N` maps to global page `(dcp_rank + j*N) // page_size`
+        # Local token index j maps to local page `j // page_size`
+        # We need: for each local page p, find the global page that contains the p-th local token
+        local_pt = torch.zeros(B, max_local_pages, dtype=torch.int32, device=device)
+
+        for p in range(max_local_pages):
+            local_token_start = p * self.page_size
+            global_token_pos = dcp_rank + local_token_start * N
+            global_page_idx = global_token_pos // self.page_size
+            if global_page_idx < max_global_pages:
+                global_page_val = global_pt[:, min(global_page_idx, max_global_pages - 1)]
+                local_pt[:, p] = global_page_val // N
+
+        # Use pre-allocated buffers if available (CUDA graph mode)
+        cg_meta = self.decode_cuda_graph_metadata
+        if isinstance(cg_meta, dict) and "dcp_page_table" in cg_meta:
+            cg_meta["dcp_cache_seqlens"][:B].copy_(local_seqlens.to(torch.int32))
+            cg_meta["dcp_page_table"][:B, :max_local_pages].copy_(local_pt)
+            metadata.dcp_cache_seqlens = cg_meta["dcp_cache_seqlens"][:B]
+            metadata.dcp_page_table = cg_meta["dcp_page_table"][:B, :max_local_pages]
+        else:
+            metadata.dcp_page_table = local_pt
+            metadata.dcp_cache_seqlens = local_seqlens.to(torch.int32)
 
     def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device

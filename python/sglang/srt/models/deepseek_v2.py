@@ -2002,6 +2002,8 @@ class DeepseekV2AttentionMLA(
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+            # FA3/FA4 return base-e LSE; FlashInfer returns base-2 LSE
+            is_base_e = self.current_attention_backend in ("fa3", "fa4")
             if get_global_server_args().dcp_comm_backend == "a2a":
                 attn_output = attn_output.view(
                     -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
@@ -2011,9 +2013,11 @@ class DeepseekV2AttentionMLA(
                     attn_output,
                     lse,
                     get_dcp_group(),
-                    is_lse_base_on_e=False,
+                    is_lse_base_on_e=is_base_e,
                 )
             else:
+                if is_base_e:
+                    lse = lse / 0.6931471805599453  # ln(2): convert base-e → base-2 for AG+RS kernel
                 with use_symmetric_memory(get_dcp_group()):
                     attn_output = attn_output.view(
                         -1,
