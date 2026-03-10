@@ -4,6 +4,7 @@
 **Model:** DeepSeek-V2-Lite (15.7B, MLA attention)
 **Base PR:** [sglang#14194](https://github.com/sgl-project/sglang/pull/14194) -- DCP for DeepSeek-V2 by @staugust
 **A2A Reference:** [vllm#34883](https://github.com/vllm-project/vllm/pull/34883) -- A2A communication backend for DCP
+**Attention backends:** FlashInfer (MLA) + FA3 (FlashAttention, MLA with `qv`). Both support DCP with A2A and AG+RS, with and without CUDA graph.
 
 ---
 
@@ -97,7 +98,7 @@ A2A advantage: the Triton combine is local (no network reduce), and A2A point-to
 
 **`is_lse_base_on_e=False` for FlashInfer.** FlashInfer MLA returns base-2 LSE. Setting `True` (base-e) produces silently incorrect attention outputs -- no crash, just wrong answers. The Triton kernel handles both conventions via a compile-time constexpr.
 
-**CUDA graph deferred.** Initial A2A implementation requires `--disable-cuda-graph`. Graph support needs pre-allocated send/recv buffers with fixed addresses (Task 8 in helix_plan.md).
+**CUDA graph supported.** A2A send/recv buffers and DCP page_table/seqlens are pre-allocated in `init_cuda_graph_state` with fixed addresses for graph capture/replay. Both FlashInfer and FA3 backends work with CUDA graph + DCP (validated in 24/24 accuracy matrix).
 
 ### 2.4 Triton Kernel: `_dcp_lse_combine_kernel`
 
@@ -252,7 +253,32 @@ Overhead is identical between 128K and 256K -- confirms it's from DCP communicat
 
 Within noise. A2A slightly faster due to skipping symmetric memory allocation overhead.
 
-### 3.8 Reference: PR Author Results (Kimi-K2-Instruct, 8xH20)
+### 3.8 Full DCP Accuracy Matrix (TP4, DCP4, 4xH100)
+
+End-to-end accuracy validation across all backend/comm/graph/request-type combinations.
+Both FA3 (FlashAttention) and FlashInfer backends are tested. Each scenario verifies
+correctness (coherent output) and determinism (same prompt produces identical output).
+
+| # | Backend | DCP | CUDA Graph | prefill_only | decode_heavy | mixed |
+|---|---------|-----|------------|-------------|-------------|-------|
+| 1-3 | FA3 | A2A | disabled | PASS | PASS | PASS |
+| 4-6 | FA3 | AG+RS | disabled | PASS | PASS | PASS |
+| 7-9 | FA3 | A2A | enabled | PASS | PASS | PASS |
+| 10-12 | FA3 | AG+RS | enabled | PASS | PASS | PASS |
+| 13-15 | FlashInfer | AG+RS | enabled | PASS | PASS | PASS |
+| 16-18 | FlashInfer | AG+RS | disabled | PASS | PASS | PASS |
+| 19-21 | FlashInfer | A2A | disabled | PASS | PASS | PASS |
+| 22-24 | FlashInfer | A2A | enabled | PASS | PASS | PASS |
+
+**24/24 passed, 0 failed.**
+
+FA3 DCP support required three additional fixes beyond the FlashInfer path:
+1. **DCP page_table filtering** -- FA3 uses paged KV cache with `page_table` indices. With DCP, the global page_table must be filtered to local token positions (`pos % dcp_size == dcp_rank`) and indices converted to local (`// dcp_size`). FlashInfer MLA has this via `filter_seq_indices()` in `flashinfer_mla_backend.py`; the equivalent was added to `flashattention_backend.py` as `_init_dcp_decode_metadata()`.
+2. **LSE shape normalization** -- FA3 returns LSE as `[B, H, seqlen]` (3D), FlashInfer returns `[B, H]` (2D). DCP reduce expects `[B, H]`. Fixed with `.squeeze(-1)` and shape-aware normalization for varlen mode.
+3. **LSE base conversion** -- FA3 returns base-e LSE, FlashInfer returns base-2. The A2A path passes `is_lse_base_on_e` correctly; the AG+RS path converts via `lse / ln(2)`.
+4. **CUDA graph buffer pre-allocation** -- DCP metadata (page_table, cache_seqlens) must use pre-allocated buffers during CUDA graph capture/replay to keep tensor addresses stable. Without this, FA3 TMA descriptor initialization fails.
+
+### 3.9 Reference: PR Author Results (Kimi-K2-Instruct, 8xH20)
 
 | Config | max_concurrency | req/s | output tok/s | Mean TPOT (ms) |
 |--------|----------------|-------|-------------|-----------------|
@@ -273,6 +299,7 @@ On H20 (lower NVLink bandwidth), DCP overhead is near-zero at concurrency 8 (TPO
 | OOM with TP8 at 256K | Use `--mem-fraction-static 0.85`. TP8 has no DCP capacity expansion. |
 | `SGLANG_DCP` must divide `--tp-size` | For full DCP: `SGLANG_DCP=8 --tp-size 8`. TP4+DCP2 also works. |
 | FlashMLA + FP8 KV + DCP | Not supported. Use `--attention-backend flashinfer`. |
-| Wrong outputs with A2A (no crash) | Check `is_lse_base_on_e`. FlashInfer = `False` (base-2). FlashAttention = `True` (base-e). |
+| Wrong outputs with A2A (no crash) | Check `is_lse_base_on_e`. FlashInfer = `False` (base-2). FlashAttention = `True` (base-e). Detected automatically via `current_attention_backend`. |
 | NCCL hang | `NCCL_DEBUG=INFO`. Ensure all ranks enter same collective at same time. |
-| A2A + CUDA graph crash | Use `--disable-cuda-graph`. Graph support requires pre-allocated A2A buffers (not yet implemented). |
+| A2A + CUDA graph | Supported. Pre-allocated A2A buffers and DCP page_table buffers are created in `init_cuda_graph_state`. |
+| FA3 + DCP wrong output | Ensure `_init_dcp_decode_metadata` is called to filter page_table to local KV shard indices. |
