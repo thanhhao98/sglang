@@ -9,7 +9,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_group,
+    get_dcp_size_from_env,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -372,6 +378,20 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
 
         self.fa_impl_ver = fa_impl_ver
+
+        # DCP (Decode Context Parallelism) settings
+        self.dcp_size = get_dcp_size_from_env()
+        self.dcp_comm_backend = model_runner.server_args.dcp_comm_backend
+        if self.dcp_size > 1:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            tp_size = get_attention_tp_size()
+            self.dcp_num_heads_per_tp = (
+                model_runner.model_config.num_attention_heads // tp_size
+            )
+            self.dcp_head_dim = model_runner.model_config.head_dim
+            self.dcp_v_head_dim = model_runner.model_config.v_head_dim
+            self.dcp_dtype = model_runner.dtype
 
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
@@ -828,6 +848,7 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
             and not is_swa_layer
+            and self.dcp_size <= 1
         )
 
         flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
@@ -1171,7 +1192,13 @@ class FlashAttentionBackend(AttentionBackend):
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
-        use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
+        use_dcp = self.dcp_size > 1
+        use_cascade_attn = (
+            forward_batch.spec_info is not None
+            and self.topk > 1
+            and not use_dcp
+        )
+        need_lse = use_cascade_attn or use_dcp
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -1280,7 +1307,11 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                # Default: single-token self-attention
+                if use_dcp:
+                    q_reshaped = get_dcp_group().all_gather(
+                        q_reshaped.contiguous(), dim=1
+                    )
+
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1295,12 +1326,16 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=need_lse,
                     num_splits=self.num_splits,
                     **kwargs,
                 )
-                if use_cascade_attn:
+                if need_lse:
                     o, softmax_lse, *rest = result
+                else:
+                    o = result
+
+                if use_cascade_attn:
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -1328,8 +1363,18 @@ class FlashAttentionBackend(AttentionBackend):
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
                     )
-                else:
-                    o = result
+
+                if use_dcp:
+                    if self.dcp_comm_backend == "a2a":
+                        o = dcp_a2a_lse_reduce(
+                            o, softmax_lse, get_dcp_group(),
+                            is_lse_base_on_e=True,
+                            cuda_graph_buffers=getattr(
+                                self, "dcp_cuda_graph_buffers", None
+                            ),
+                        )
+                    else:
+                        o = cp_lse_ag_out_rs(o, softmax_lse, get_dcp_group())
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
@@ -1472,6 +1517,34 @@ class FlashAttentionBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+        if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
+            N = self.dcp_size
+            H_per_rank = self.dcp_num_heads_per_tp
+            H_all = H_per_rank * N
+            D = self.dcp_v_head_dim
+            self.dcp_cuda_graph_buffers = {
+                "q_gathered": torch.empty(
+                    max_bs, H_all, self.dcp_head_dim,
+                    dtype=self.dcp_dtype, device=self.device,
+                ),
+                "send_output": torch.empty(
+                    N, max_bs, H_per_rank, D,
+                    dtype=self.dcp_dtype, device=self.device,
+                ),
+                "recv_output": torch.empty(
+                    N, max_bs, H_per_rank, D,
+                    dtype=self.dcp_dtype, device=self.device,
+                ),
+                "send_lse": torch.empty(
+                    N, max_bs, H_per_rank,
+                    dtype=torch.float32, device=self.device,
+                ),
+                "recv_lse": torch.empty(
+                    N, max_bs, H_per_rank,
+                    dtype=torch.float32, device=self.device,
+                ),
+            }
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
