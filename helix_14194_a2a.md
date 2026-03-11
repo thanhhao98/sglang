@@ -290,6 +290,60 @@ On H20 (lower NVLink bandwidth), DCP overhead is near-zero at concurrency 8 (TPO
 
 ---
 
+## Running the Accuracy Test Matrix
+
+The script `test/srt/test_dcp_accuracy_matrix.py` validates all DCP configurations end-to-end.
+
+### Quick Run
+
+```bash
+# 1. Start container (adjust --gpus for available devices; needs 4+ GPUs)
+docker run -d --gpus '"device=4,5,6,7"' \
+  --name sglang-accuracy-test \
+  --shm-size 32g --network host --ulimit memlock=-1 --init \
+  -v $HF_CACHE:/root/.cache/huggingface \
+  -v $(pwd)/python/sglang:/sgl-workspace/sglang/python/sglang \
+  -v $(pwd)/test:/sgl-workspace/sglang/test \
+  -e HF_HOME=/root/.cache/huggingface -e PYTHONUNBUFFERED=1 \
+  -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  --entrypoint sleep sglang-dcp-a2a:local infinity
+
+# 2. Run all 24 scenarios
+docker exec sglang-accuracy-test bash -c \
+  'CUDA_VISIBLE_DEVICES=0,1,2,3 python3 /sgl-workspace/sglang/test/srt/test_dcp_accuracy_matrix.py'
+
+# 3. Clean up
+docker rm -f sglang-accuracy-test
+```
+
+### What It Tests
+
+8 server configs (FA3 x {A2A, AG+RS} x {CUDA graph on, off} + FlashInfer x same) times 3 request types each = **24 scenarios**.
+
+| Request Type | Input Tokens | Output Tokens | Tests |
+|-------------|-------------|--------------|-------|
+| `prefill_only` | 2048 | 1 | Prefill path |
+| `decode_heavy` | 32 | 512 | Decode path |
+| `mixed` | 512 | 256 | Both paths |
+
+Each scenario verifies: (1) non-empty coherent output, (2) deterministic with temperature=0.
+
+### Expected Runtime
+
+~25 minutes (8 server restarts, each ~1-2 min startup + ~30s for 3 requests).
+
+### Unit Tests
+
+```bash
+# Inside the container:
+python3 -m pytest test/srt/test_dcp_flashattn.py -v     # 34 tests: cascade guard, CUDA graph buffers, LSE logic
+python3 -m pytest test/srt/test_dcp_a2a.py -v            # 16 tests: Triton kernel vs CPU reference
+python3 -m pytest test/srt/test_fa3_flashinfer_lse_compare.py -v  # 6 tests: LSE shape/base conventions
+python3 -m pytest test/srt/test_fa3_mla_dcp_standalone.py -v      # 6 tests: simulated DCP sharding
+```
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
