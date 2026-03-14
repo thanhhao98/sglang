@@ -33,6 +33,26 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_prepare_server_args_parses_dcp_size(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dcp-size",
+                "4",
+            ]
+        )
+        self.assertEqual(server_args.dcp_size, 4)
+
+
+class TestDcpArgs(unittest.TestCase):
+    def test_dcp_size_must_divide_tp_size(self):
+        server_args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=3)
+        with self.assertRaisesRegex(
+            ValueError, "--tp-size must be divisible by --dcp-size"
+        ):
+            server_args._handle_context_parallelism()
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

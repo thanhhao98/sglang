@@ -70,7 +70,9 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 # check whether only enable symmetric_memory for dcp group
-_DCP_ENABLE_SYMM_ONLY = get_bool_env_var("SGLANG_DCP_SYMM_ONLY", "false")
+_DCP_ENABLE_SYMM_ONLY = get_bool_env_var(
+    "SGLANG_DCP_SYMM_ONLY", "false"
+)
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -1522,10 +1524,15 @@ _DCP: Optional[GroupCoordinator] = None
 decode_context_parallel_size: Optional[int] = None
 
 
-def get_dcp_size_from_env():
+def set_dcp_size(dcp_size: int):
     global decode_context_parallel_size
-    if decode_context_parallel_size is None:
-        decode_context_parallel_size = int(os.getenv("SGLANG_DCP", 1))
+    decode_context_parallel_size = dcp_size
+
+
+def get_dcp_size() -> int:
+    assert decode_context_parallel_size is not None, (
+        "decode context parallel size is not initialized"
+    )
     return decode_context_parallel_size
 
 
@@ -1810,6 +1817,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
+    decode_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -1983,7 +1991,7 @@ def initialize_model_parallel(
         )
 
     # build decode context parallel groups
-    decode_context_model_parallel_size = get_dcp_size_from_env()
+    set_dcp_size(decode_context_model_parallel_size)
     if decode_context_model_parallel_size > 1:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2181,10 +2189,10 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size,
-            expert_model_parallel_size,
-            pipeline_model_parallel_size,
-            backend,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            backend=backend,
         )
         return
 
@@ -2202,8 +2210,8 @@ def ensure_model_parallel_initialized(
 
     dcp_world_size = get_dcp_group().world_size
     assert (
-        dcp_world_size == get_dcp_size_from_env()
-    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+        dcp_world_size == get_dcp_size()
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size()=}"
 
 
 def model_parallel_is_initialized():
@@ -2376,6 +2384,10 @@ def destroy_model_parallel():
     global _DCP
     if _DCP:
         _DCP.destroy()
+    _DCP = None
+
+    global decode_context_parallel_size
+    decode_context_parallel_size = None
 
 
 def destroy_distributed_environment():
