@@ -436,6 +436,7 @@ class ServerArgs:
     load_balance_method: str = "auto"
 
     attn_cp_size: int = 1
+    dcp_size: int = 1
     moe_dp_size: int = 1
 
     # Multi-node distributed serving
@@ -2441,6 +2442,12 @@ class ServerArgs:
                     self.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
 
+        if self.dcp_size <= 0:
+            raise ValueError("--dcp-size must be positive")
+
+        if self.dcp_size > 1 and self.tp_size % self.dcp_size != 0:
+            raise ValueError("--tp-size must be divisible by --dcp-size")
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -3749,6 +3756,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attn_cp_size,
             help="The attention context parallelism size.",
+        )
+        parser.add_argument(
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="Decode-context parallel size.",
         )
         parser.add_argument(
             "--moe-data-parallel-size",
