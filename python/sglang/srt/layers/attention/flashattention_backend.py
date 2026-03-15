@@ -1518,32 +1518,12 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
         if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
-            N = self.dcp_size
-            H_per_rank = self.dcp_num_heads_per_tp
-            H_all = H_per_rank * N
-            D = self.dcp_v_head_dim
-            self.dcp_cuda_graph_buffers = {
-                "q_gathered": torch.empty(
-                    max_bs, H_all, self.dcp_head_dim,
-                    dtype=self.dcp_dtype, device=self.device,
-                ),
-                "send_output": torch.empty(
-                    N, max_bs, H_per_rank, D,
-                    dtype=self.dcp_dtype, device=self.device,
-                ),
-                "recv_output": torch.empty(
-                    N, max_bs, H_per_rank, D,
-                    dtype=self.dcp_dtype, device=self.device,
-                ),
-                "send_lse": torch.empty(
-                    N, max_bs, H_per_rank,
-                    dtype=torch.float32, device=self.device,
-                ),
-                "recv_lse": torch.empty(
-                    N, max_bs, H_per_rank,
-                    dtype=torch.float32, device=self.device,
-                ),
-            }
+            # Per-bs buffer allocation: each CUDA graph capture gets
+            # right-sized buffers so NCCL transfers only actual batch data,
+            # not the full max_bs padding. Buffers are lazily allocated in
+            # _alloc_dcp_a2a_buffers_for_bs() during graph capture.
+            self.dcp_cuda_graph_buffers_per_bs = {}
+            self.dcp_cuda_graph_buffers = None
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1861,6 +1841,8 @@ class FlashAttentionBackend(AttentionBackend):
 
                 if self.dcp_size > 1:
                     self._init_dcp_decode_metadata(metadata, device)
+                    if self.dcp_comm_backend == "a2a":
+                        self._alloc_dcp_a2a_buffers_for_bs(bs)
 
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
@@ -2112,6 +2094,11 @@ class FlashAttentionBackend(AttentionBackend):
 
                 if self.dcp_size > 1:
                     self._init_dcp_decode_metadata(metadata, device)
+                    if self.dcp_comm_backend == "a2a":
+                        # Point to the right per-bs buffers for this graph replay.
+                        self.dcp_cuda_graph_buffers = (
+                            self.dcp_cuda_graph_buffers_per_bs[bs]
+                        )
 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
@@ -2329,6 +2316,52 @@ class FlashAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def _alloc_dcp_a2a_buffers_for_bs(self, bs: int):
+        """Allocate right-sized DCP A2A buffers for a specific batch size.
+
+        Uses a fused buffer layout that packs output (bf16) + LSE (fp32
+        reinterpreted as 2×bf16) into a single [N, bs, H_per_rank, D+2]
+        buffer, enabling one all_to_all call instead of two.
+        """
+        if bs in self.dcp_cuda_graph_buffers_per_bs:
+            self.dcp_cuda_graph_buffers = self.dcp_cuda_graph_buffers_per_bs[bs]
+            return
+
+        from sglang.srt.layers.attention.dcp_a2a import _lse_pack_dim
+
+        N = self.dcp_size
+        H_per_rank = self.dcp_num_heads_per_tp
+        H_all = H_per_rank * N
+        D = self.dcp_v_head_dim
+        lpd = _lse_pack_dim(self.dcp_dtype)
+
+        buffers = {
+            "q_gathered": torch.empty(
+                bs, H_all, self.dcp_head_dim,
+                dtype=self.dcp_dtype, device=self.device,
+            ),
+            # Fused output+LSE buffer: [N, bs, H_per_rank, D + lse_pack_dim]
+            "send_combined": torch.empty(
+                N, bs, H_per_rank, D + lpd,
+                dtype=self.dcp_dtype, device=self.device,
+            ),
+            "recv_combined": torch.empty(
+                N, bs, H_per_rank, D + lpd,
+                dtype=self.dcp_dtype, device=self.device,
+            ),
+            # fp32 staging buffers for LSE pack/unpack
+            "send_lse": torch.empty(
+                N, bs, H_per_rank,
+                dtype=torch.float32, device=self.device,
+            ),
+            "recv_lse": torch.empty(
+                N, bs, H_per_rank,
+                dtype=torch.float32, device=self.device,
+            ),
+        }
+        self.dcp_cuda_graph_buffers_per_bs[bs] = buffers
+        self.dcp_cuda_graph_buffers = buffers
 
     def _init_dcp_decode_metadata(self, metadata: FlashAttentionMetadata, device):
         """Build DCP-filtered page_table and cache_seqlens for local KV shard.
