@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    prepare_server_args,
+    validate_dcp_model_layout,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,6 +33,165 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+
+class TestTpaAndDcpArgs(unittest.TestCase):
+    def test_prepare_server_args_accepts_attention_tpa_alias(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--tp-size",
+                "16",
+                "--dcp-size",
+                "4",
+                "--attn-tp-size",
+                "4",
+            ]
+        )
+        self.assertEqual(server_args.tp_size, 16)
+        self.assertEqual(server_args.dcp_size, 4)
+        self.assertEqual(server_args.attention_tensor_parallel_size, 4)
+        self.assertTrue(server_args.is_attention_tpa_enabled())
+
+    def test_dcp_size_falls_back_to_env(self):
+        with patch.dict("os.environ", {"SGLANG_DCP": "4"}, clear=False):
+            server_args = ServerArgs(model_path="dummy", tp_size=8)
+            server_args._handle_context_parallelism()
+            self.assertEqual(server_args.dcp_size, 4)
+
+    def test_phase1_tpa_accepts_matching_layout(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=16,
+            dcp_size=4,
+            attention_tensor_parallel_size=4,
+        )
+        server_args._handle_context_parallelism()
+        self.assertTrue(server_args.is_attention_tpa_enabled())
+        self.assertEqual(server_args.get_attention_tp_size(), 4)
+
+    def test_phase1_tpa_rejects_attention_cp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=16,
+            dcp_size=4,
+            attention_tensor_parallel_size=4,
+            attn_cp_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "does not support --attention-context-parallel-size > 1"):
+            server_args._handle_context_parallelism()
+
+    def test_phase1_tpa_rejects_wrong_dcp_ratio(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=16,
+            dcp_size=2,
+            attention_tensor_parallel_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "must equal --tp-size / --attention-tensor-parallel-size"):
+            server_args._handle_context_parallelism()
+
+    def test_phase1_tpa_accepts_a2a_flag(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=16,
+            dcp_size=4,
+            attention_tensor_parallel_size=4,
+            dcp_comm_backend="a2a",
+        )
+        server_args._handle_context_parallelism()
+        self.assertEqual(server_args.dcp_comm_backend, "a2a")
+
+    def test_phase1_tpa_disables_piecewise_cuda_graph(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=16,
+            dcp_size=4,
+            attention_tensor_parallel_size=4,
+        )
+        with patch.object(
+            ServerArgs,
+            "get_model_config",
+            return_value=MagicMock(
+                is_piecewise_cuda_graph_disabled_model=False,
+                is_multimodal=False,
+            ),
+        ):
+            server_args._handle_piecewise_cuda_graph()
+        self.assertTrue(server_args.disable_piecewise_cuda_graph)
+
+
+class TestDcpModelLayoutValidation(unittest.TestCase):
+    def test_plain_dcp_rejects_when_tp_does_not_replicate_kv_heads(self):
+        with self.assertRaisesRegex(ValueError, "Invalid plain DCP config"):
+            validate_dcp_model_layout(
+                tp_size=2,
+                attention_tp_size=2,
+                dcp_size=2,
+                attention_tpa_enabled=False,
+                num_attention_heads=16,
+                num_key_value_heads=8,
+                is_mla=False,
+            )
+
+    def test_plain_dcp_rejects_when_dcp_exceeds_kv_replication(self):
+        with self.assertRaisesRegex(ValueError, "largest supported plain DCP size"):
+            validate_dcp_model_layout(
+                tp_size=16,
+                attention_tp_size=16,
+                dcp_size=4,
+                attention_tpa_enabled=False,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                is_mla=False,
+            )
+
+    def test_plain_dcp_accepts_matching_kv_replication(self):
+        validate_dcp_model_layout(
+            tp_size=4,
+            attention_tp_size=4,
+            dcp_size=2,
+            attention_tpa_enabled=False,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            is_mla=False,
+        )
+
+    def test_tpa_accepts_same_head_layout(self):
+        validate_dcp_model_layout(
+            tp_size=2,
+            attention_tp_size=1,
+            dcp_size=2,
+            attention_tpa_enabled=True,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            is_mla=False,
+        )
+
+    def test_tpa_rejects_non_divisible_kv_head_layout(self):
+        with self.assertRaisesRegex(ValueError, "does not evenly split num_key_value_heads"):
+            validate_dcp_model_layout(
+                tp_size=12,
+                attention_tp_size=4,
+                dcp_size=3,
+                attention_tpa_enabled=True,
+                num_attention_heads=48,
+                num_key_value_heads=10,
+                is_mla=False,
+            )
+
+    def test_tpa_rejects_mla_models(self):
+        with self.assertRaisesRegex(ValueError, "supports only standard KV-head attention models"):
+            validate_dcp_model_layout(
+                tp_size=8,
+                attention_tp_size=4,
+                dcp_size=2,
+                attention_tpa_enabled=True,
+                num_attention_heads=128,
+                num_key_value_heads=1,
+                is_mla=True,
+            )
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

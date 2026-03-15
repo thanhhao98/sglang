@@ -3178,6 +3178,9 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
+    if server_args.is_attention_tpa_enabled():
+        return True
+
     assert server_args.moe_dense_tp_size in [1, None]
     if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:

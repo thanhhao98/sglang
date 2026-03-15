@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import math
+import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -13,9 +17,15 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_group,
     get_dcp_size_from_env,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dcp_layout import build_dcp_local_page_table
 from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
-from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
+from sglang.srt.layers.attention.utils import (
+    cp_lse_ag_out_allreduce,
+    cp_lse_ag_out_rs,
+)
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -40,6 +50,8 @@ from sglang.jit_kernel.flash_attention_v4 import (
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -352,6 +364,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self.tp_rank = model_runner.tp_rank
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -381,6 +394,30 @@ class FlashAttentionBackend(AttentionBackend):
         # DCP (Decode Context Parallelism) settings
         self.dcp_size = get_dcp_size_from_env()
         self.dcp_comm_backend = model_runner.server_args.dcp_comm_backend
+        self.enable_tpa = model_runner.server_args.is_attention_tpa_enabled()
+        if self.enable_tpa:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            expected_attn_tp = get_attention_tp_size()
+            first_qkv_proj = next(
+                (
+                    module
+                    for module in model_runner.model.modules()
+                    if isinstance(module, QKVParallelLinear)
+                ),
+                None,
+            )
+            if first_qkv_proj is None or first_qkv_proj.tp_size != expected_attn_tp:
+                raise ValueError(
+                    "Phase-1 TPA currently supports only model families that already "
+                    "shard attention projections with get_attention_tp_size()."
+                )
+            if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
+                logger.info(
+                    "TPA+DCP requested with --dcp-comm-backend=a2a. "
+                    "Ranks already share the same heads in TPA mode, so the runtime "
+                    "uses the same-head LSE merge path instead of the old head-shuffling A2A reducer."
+                )
         if self.dcp_size > 1:
             from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -391,6 +428,10 @@ class FlashAttentionBackend(AttentionBackend):
             self.dcp_head_dim = model_runner.model_config.head_dim
             self.dcp_v_head_dim = model_runner.model_config.v_head_dim
             self.dcp_dtype = model_runner.dtype
+
+        self.dcp_debug_dir = envs.SGLANG_DCP_DEBUG_DIR.get()
+        self.dcp_debug_layer = envs.SGLANG_DCP_DEBUG_LAYER.get()
+        self._dcp_debug_dumped = set()
 
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
@@ -420,6 +461,101 @@ class FlashAttentionBackend(AttentionBackend):
             )
             else 0
         )
+
+    def _maybe_dump_dcp_decode_debug(
+        self,
+        *,
+        layer: RadixAttention,
+        metadata: FlashAttentionMetadata,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        q_local: torch.Tensor,
+        q_kernel: torch.Tensor,
+        o_pre_merge: torch.Tensor,
+        o_final: torch.Tensor,
+        softmax_lse: Optional[torch.Tensor],
+        lse_2d: Optional[torch.Tensor],
+        use_dcp: bool,
+        use_tpa_dcp: bool,
+    ) -> None:
+        if self.dcp_debug_dir is None or layer.layer_id != self.dcp_debug_layer:
+            return
+
+        dump_key = (
+            layer.layer_id,
+            bool(use_dcp),
+            bool(use_tpa_dcp),
+            self.dcp_comm_backend,
+        )
+        if dump_key in self._dcp_debug_dumped:
+            return
+        self._dcp_debug_dumped.add(dump_key)
+
+        os.makedirs(self.dcp_debug_dir, exist_ok=True)
+        dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        stem = (
+            f"layer{layer.layer_id}"
+            f"_tp{self.tp_rank}"
+            f"_dcp{dcp_rank}"
+            f"_{'tpa' if use_tpa_dcp else 'plain'}"
+            f"_{'dcp' if use_dcp else 'baseline'}"
+            f"_{self.dcp_comm_backend}"
+        )
+
+        def _to_cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor.detach().cpu()
+
+        payload = {
+            "layer_id": layer.layer_id,
+            "tp_rank": self.tp_rank,
+            "dcp_rank": dcp_rank,
+            "dcp_size": self.dcp_size,
+            "dcp_comm_backend": self.dcp_comm_backend,
+            "use_dcp": use_dcp,
+            "use_tpa_dcp": use_tpa_dcp,
+            "page_size": self.page_size,
+            "global_cache_seqlens": _to_cpu(metadata.cache_seqlens_int32),
+            "local_cache_seqlens": _to_cpu(cache_seqlens),
+            "global_page_table": _to_cpu(metadata.page_table),
+            "local_page_table": _to_cpu(page_table),
+            "q_local": _to_cpu(q_local),
+            "q_kernel": _to_cpu(q_kernel),
+            "o_pre_merge": _to_cpu(o_pre_merge),
+            "o_final": _to_cpu(o_final),
+            "softmax_lse_raw": _to_cpu(softmax_lse),
+            "softmax_lse_2d": _to_cpu(lse_2d),
+        }
+        torch.save(payload, os.path.join(self.dcp_debug_dir, f"{stem}.pt"))
+
+        summary = {
+            "layer_id": layer.layer_id,
+            "tp_rank": self.tp_rank,
+            "dcp_rank": dcp_rank,
+            "dcp_size": self.dcp_size,
+            "dcp_comm_backend": self.dcp_comm_backend,
+            "use_dcp": use_dcp,
+            "use_tpa_dcp": use_tpa_dcp,
+            "global_cache_seqlens": payload["global_cache_seqlens"].tolist()
+            if payload["global_cache_seqlens"] is not None
+            else None,
+            "local_cache_seqlens": payload["local_cache_seqlens"].tolist()
+            if payload["local_cache_seqlens"] is not None
+            else None,
+            "global_page_table_preview": payload["global_page_table"][:1].tolist()
+            if payload["global_page_table"] is not None
+            else None,
+            "local_page_table_preview": payload["local_page_table"][:1].tolist()
+            if payload["local_page_table"] is not None
+            else None,
+            "q_local_shape": list(q_local.shape),
+            "q_kernel_shape": list(q_kernel.shape),
+            "o_pre_merge_shape": list(o_pre_merge.shape),
+            "o_final_shape": list(o_final.shape),
+        }
+        with open(os.path.join(self.dcp_debug_dir, f"{stem}.json"), "w") as f:
+            json.dump(summary, f, indent=2)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -1099,7 +1235,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -1148,6 +1284,7 @@ class FlashAttentionBackend(AttentionBackend):
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
         use_dcp = self.dcp_size > 1
+        use_tpa_dcp = use_dcp and self.enable_tpa
         use_cascade_attn = (
             forward_batch.spec_info is not None
             and self.topk > 1
@@ -1262,11 +1399,18 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
-                q_reshaped = q.contiguous().view(
+                q_local = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+                q_reshaped = q_local
 
-                if use_dcp:
+                if use_tpa_dcp and layer.tp_q_head_num != self.dcp_num_heads_per_tp:
+                    raise ValueError(
+                        "Phase-1 TPA requires a model family that already shards attention "
+                        "with get_attention_tp_size()."
+                    )
+
+                if use_dcp and not use_tpa_dcp:
                     q_reshaped = get_dcp_group().all_gather(
                         q_reshaped.contiguous(), dim=1
                     )
@@ -1290,9 +1434,42 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
                 if need_lse:
-                    o, softmax_lse, *rest = result
+                    o = result[0] if isinstance(result, tuple) else result
+                    softmax_lse = None
+                    if isinstance(result, tuple):
+                        B_out = o.shape[0]
+                        H_out = q_reshaped.shape[1]
+                        for item in result[1:]:
+                            if not torch.is_tensor(item):
+                                continue
+                            if item.ndim == 3 and item.shape[-1] == 1:
+                                if set(item.shape[:2]) == {B_out, H_out}:
+                                    softmax_lse = item
+                                    break
+                            elif item.ndim == 2 and item.shape in (
+                                (B_out, H_out),
+                                (H_out, B_out),
+                            ):
+                                softmax_lse = item
+                                break
+                    if softmax_lse is None:
+                        result_shapes = []
+                        if isinstance(result, tuple):
+                            for item in result[1:]:
+                                if torch.is_tensor(item):
+                                    result_shapes.append(tuple(item.shape))
+                                else:
+                                    result_shapes.append(type(item).__name__)
+                        raise RuntimeError(
+                            "FlashAttention decode requested LSE for DCP, but the backend "
+                            f"did not return a usable LSE tensor. fa_impl_ver={self.fa_impl_ver}, "
+                            f"result_extras={result_shapes}"
+                        )
                 else:
                     o = result
+                    softmax_lse = None
+                o_pre_merge = o
+                lse_2d = None
 
                 if use_cascade_attn:
                     o_expand, softmax_lse_expand, *rest_expand = (
@@ -1333,7 +1510,12 @@ class FlashAttentionBackend(AttentionBackend):
                         lse_2d = softmax_lse.T.contiguous()
                     else:
                         lse_2d = softmax_lse.view(B_out, H_out)
-                    if self.dcp_comm_backend == "a2a":
+                    # FlashAttention returns natural-log LSE, while the
+                    # cp_lse_* correction helpers use exp2/log2 math.
+                    lse_base2 = lse_2d / math.log(2.0)
+                    if use_tpa_dcp:
+                        o = cp_lse_ag_out_allreduce(o, lse_base2, get_dcp_group())
+                    elif self.dcp_comm_backend == "a2a":
                         o = dcp_a2a_lse_reduce(
                             o, lse_2d, get_dcp_group(),
                             is_lse_base_on_e=True,
@@ -1342,7 +1524,21 @@ class FlashAttentionBackend(AttentionBackend):
                             ),
                         )
                     else:
-                        o = cp_lse_ag_out_rs(o, lse_2d, get_dcp_group())
+                        o = cp_lse_ag_out_rs(o, lse_base2, get_dcp_group())
+                self._maybe_dump_dcp_decode_debug(
+                    layer=layer,
+                    metadata=metadata,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    q_local=q_local,
+                    q_kernel=q_reshaped,
+                    o_pre_merge=o_pre_merge,
+                    o_final=o,
+                    softmax_lse=softmax_lse,
+                    lse_2d=lse_2d,
+                    use_dcp=use_dcp,
+                    use_tpa_dcp=use_tpa_dcp,
+                )
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
@@ -1426,22 +1622,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_lse_expand.T.contiguous(),
                 )
 
-        if use_dcp:
-            # FA3 LSE shape varies by mode:
-            #   [B, H, S] for batch mode (S=1 for decode)
-            #   [H, total_q] for varlen/cu_seqlens mode
-            # Normalize to [B, H] for DCP reduce.
-            B_out = o.shape[0]
-            H_out = layer.tp_q_head_num
-            if softmax_lse.ndim == 3:
-                lse_2d = softmax_lse.squeeze(-1)  # [B, H, 1] -> [B, H]
-            elif softmax_lse.shape == (H_out, B_out):
-                lse_2d = softmax_lse.T.contiguous()  # [H, B] -> [B, H]
-            else:
-                lse_2d = softmax_lse.view(B_out, H_out)
-            return o.view(-1, H_out * layer.v_head_dim), lse_2d
-
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
@@ -2348,28 +2529,15 @@ class FlashAttentionBackend(AttentionBackend):
         full_seqlens = metadata.cache_seqlens_int32  # [B]
         B = full_seqlens.shape[0]
 
-        local_seqlens = ((full_seqlens - dcp_rank - 1) // N + 1).clamp(min=0)
-
-        global_pt = metadata.page_table  # [B, max_pages] (page indices, already strided)
-        max_global_pages = global_pt.shape[1]
-
-        # Compute local page count per request
-        max_local_tokens = local_seqlens.max().item()
-        max_local_pages = (max_local_tokens + self.page_size - 1) // self.page_size
-
-        # Build local page table by selecting every N-th page and converting to local
-        # Global virtual token pos `dcp_rank + j*N` maps to global page `(dcp_rank + j*N) // page_size`
-        # Local token index j maps to local page `j // page_size`
-        # We need: for each local page p, find the global page that contains the p-th local token
-        local_pt = torch.zeros(B, max_local_pages, dtype=torch.int32, device=device)
-
-        for p in range(max_local_pages):
-            local_token_start = p * self.page_size
-            global_token_pos = dcp_rank + local_token_start * N
-            global_page_idx = global_token_pos // self.page_size
-            if global_page_idx < max_global_pages:
-                global_page_val = global_pt[:, min(global_page_idx, max_global_pages - 1)]
-                local_pt[:, p] = global_page_val // N
+        local_pt, local_seqlens = build_dcp_local_page_table(
+            global_page_table=metadata.page_table,
+            full_seqlens=full_seqlens,
+            max_seq_len_k=metadata.max_seq_len_k,
+            page_size=self.page_size,
+            dcp_rank=dcp_rank,
+            dcp_size=N,
+        )
+        max_local_pages = local_pt.shape[1]
 
         # Use pre-allocated buffers if available (CUDA graph mode)
         cg_meta = self.decode_cuda_graph_metadata

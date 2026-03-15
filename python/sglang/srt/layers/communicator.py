@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
+    attn_tp_all_reduce,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
     dp_reduce_scatter_tensor,
@@ -433,6 +434,7 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        use_attention_tpa = get_global_server_args().is_attention_tpa_enabled()
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -446,7 +448,12 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                if (
+                if use_attention_tpa:
+                    hidden_states = attn_tp_all_reduce(hidden_states)
+                    hidden_states, residual = self.input_layernorm(
+                        hidden_states, residual
+                    )
+                elif (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
@@ -582,16 +589,26 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        allow_reduce_scatter = self.allow_reduce_scatter
+        if get_global_server_args().is_attention_tpa_enabled():
+            # TPA keeps attention outputs replicated across DCP peers, so the
+            # full-TP reduce-scatter shortcut is not layout-safe here.
+            allow_reduce_scatter = False
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
+            allow_reduce_scatter=allow_reduce_scatter,
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
+            return False
+        if get_global_server_args().is_attention_tpa_enabled():
+            # The MoE/MLP reduce-scatter shortcut assumes full-TP tensor layout.
+            # In TPA mode, attention uses a smaller TP group, so keep the
+            # regular postprocess path instead of mixing group sizes here.
             return False
         if (
             self._communicate_summable_tensor_pair_fn
@@ -609,6 +626,8 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if get_global_server_args().is_attention_tpa_enabled():
+            return False
         if (
             is_dp_attention_enabled()
             and self._speculative_algo is not None
@@ -863,17 +882,27 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states = layernorm(hidden_states)
         else:
             handled = False
+            use_attention_tp_reduce = get_global_server_args().is_attention_tpa_enabled()
             if (
+                not use_attention_tp_reduce
+                and (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                )
+                and hasattr(layernorm, "forward_with_allreduce_fusion")
+            ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
                 handled = True
 
             if not handled:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if use_attention_tp_reduce:
+                    # In TPA mode, attention outputs are duplicated across DCP peers
+                    # and only need to be summed across the smaller attention-TP group.
+                    hidden_states = attn_tp_all_reduce(hidden_states)
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
