@@ -1126,7 +1126,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         )
         if (
             not self.is_layer_sparse
-            and self.attn_tp_size > 1
+            and get_tensor_model_parallel_world_size() > 1
             and not use_reduce_scatter
             and not should_allreduce_fusion
         ):

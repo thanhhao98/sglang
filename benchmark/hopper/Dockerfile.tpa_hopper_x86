@@ -1,0 +1,16 @@
+ARG BASE_IMAGE=lmsysorg/sglang:dev
+FROM ${BASE_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /sgl-workspace/sglang
+
+# Bake the current source tree into the image so smoke and perf both run
+# against the exact same code, not a mutable NFS mount.
+COPY . /sgl-workspace/sglang
+
+RUN python3 -m pip uninstall -y sglang || true \
+    && python3 -m pip install grpcio-tools \
+    && python3 -m pip install -e /sgl-workspace/sglang/python/ --no-deps --no-build-isolation
+

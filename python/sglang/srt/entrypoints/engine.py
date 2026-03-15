@@ -1312,12 +1312,11 @@ def _compute_parallelism_ranks(
     server_args: ServerArgs, tp_rank: int
 ) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
     # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+    attn_tp_size = server_args.get_attention_tp_size()
     attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
     moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
     moe_ep_rank = (

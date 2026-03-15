@@ -158,6 +158,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
     set_global_server_args_for_scheduler,
+    validate_dcp_model_layout,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -388,6 +389,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Model-specific adjustment
         self.model_specific_adjustment()
+        validate_dcp_model_layout(
+            tp_size=self.tp_size,
+            attention_tp_size=self.server_args.get_attention_tp_size(),
+            dcp_size=self.server_args.dcp_size,
+            attention_tpa_enabled=self.server_args.is_attention_tpa_enabled(),
+            num_attention_heads=self.model_config.num_attention_heads,
+            num_key_value_heads=self.model_config.num_key_value_heads,
+            is_mla=self.model_config.attention_arch == AttentionArch.MLA,
+        )
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -916,6 +926,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
+                attention_tensor_parallel_size=self.server_args.attention_tensor_parallel_size,
+                decode_context_model_parallel_size=self.server_args.dcp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 decode_context_parallel_size=self.server_args.dcp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
@@ -1898,6 +1910,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_attention_backend_str,
             self.decode_attention_backend_str,
         ) = self.server_args.get_attention_backends()
+
+        if self.server_args.is_attention_tpa_enabled():
+            allowed_tpa_backends = {"fa3", "fa4"}
+            if (
+                self.prefill_attention_backend_str not in allowed_tpa_backends
+                or self.decode_attention_backend_str not in allowed_tpa_backends
+            ):
+                raise ValueError(
+                    "Phase-1 TPA currently supports only FlashAttention backends (fa3/fa4)."
+                )
 
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
