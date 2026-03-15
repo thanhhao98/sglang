@@ -184,6 +184,11 @@ def dcp_lse_combine_triton(
 # ---------------------------------------------------------------------------
 
 
+def _lse_pack_dim(output_dtype: torch.dtype) -> int:
+    """Number of output-dtype elements needed to store one fp32 LSE value."""
+    return torch.finfo(torch.float32).bits // torch.finfo(output_dtype).bits
+
+
 def dcp_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -193,7 +198,10 @@ def dcp_a2a_lse_reduce(
 ) -> torch.Tensor:
     """A2A-based DCP reduce: exchange head partials, then local combine.
 
-    Replaces cp_lse_ag_out_rs() when --dcp-comm-backend=a2a.
+    Fuses output + LSE into a single all_to_all call by packing fp32 LSE
+    as reinterpreted output-dtype elements along the D dimension:
+      combined = [N, B, H_per_rank, D + lse_pack_dim]
+    This halves the NCCL calls (1 instead of 2 per layer, 27 fewer per step).
 
     Args:
         cp_attn_out: [B, H, D]  attention output (all heads, local KV shard)
@@ -201,8 +209,8 @@ def dcp_a2a_lse_reduce(
         cp_group:    DCP GroupCoordinator
         is_lse_base_on_e: True for FlashAttention (base-e), False for FlashInfer (base-2)
         cuda_graph_buffers: Pre-allocated buffers for CUDA graph mode.
-            Keys: send_output, recv_output, send_lse, recv_lse
-            (max-sized [N, max_bs, H_per_rank, D] / [N, max_bs, H_per_rank])
+            Keys: send_combined, recv_combined  [N, bs, H_per_rank, D+lse_pack_dim]
+                  send_lse, recv_lse            [N, bs, H_per_rank] fp32 staging
 
     Returns:
         [B, H_local, D] combined attention output for this rank's local heads.
@@ -213,37 +221,67 @@ def dcp_a2a_lse_reduce(
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
     H_per_rank = H // N
+    out_dtype = cp_attn_out.dtype
+    lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
     # Reshape [B, H, D] -> [N, B, H/N, D] — split heads across ranks
     reshaped_out = cp_attn_out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
     reshaped_lse = cp_attn_lse.view(B, N, H_per_rank).permute(1, 0, 2)
 
     if cuda_graph_buffers is not None:
-        # CUDA graph path: write into pre-allocated buffers at fixed addresses.
-        # Each CUDA graph is captured per batch size, so B is constant for
-        # a given graph.  We operate on the full [N, max_bs, ...] buffer to
-        # keep NCCL chunk boundaries and data pointers stable across replays,
-        # and only read the first B rows from the recv buffer afterward.
-        send_buf = cuda_graph_buffers["send_output"]
-        recv_buf = cuda_graph_buffers["recv_output"]
-        send_lse_buf = cuda_graph_buffers["send_lse"]
-        recv_lse_buf = cuda_graph_buffers["recv_lse"]
+        # CUDA graph path with pre-allocated fused buffers.
+        send_combined = cuda_graph_buffers["send_combined"]
+        recv_combined = cuda_graph_buffers["recv_combined"]
+        send_lse_stg = cuda_graph_buffers["send_lse"]
+        recv_lse_stg = cuda_graph_buffers["recv_lse"]
 
-        send_buf[:, :B, :, :].copy_(reshaped_out)
-        send_lse_buf[:, :B, :].copy_(reshaped_lse)
+        # Pack output into [:D] columns
+        send_combined[:, :B, :, :D].copy_(reshaped_out)
+        # Pack LSE: fp32 → view as output dtype → copy into [D:] columns
+        send_lse_stg[:, :B, :].copy_(reshaped_lse)
+        send_combined[:, :, :, D:].copy_(
+            send_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd)
+        )
 
-        cp_group.all_to_all_single(recv_buf.view(-1), send_buf.view(-1))
-        cp_group.all_to_all_single(recv_lse_buf.view(-1), send_lse_buf.view(-1))
+        # Single fused all_to_all
+        cp_group.all_to_all_single(
+            recv_combined.view(-1), send_combined.view(-1)
+        )
 
-        recv_output = recv_buf[:, :B, :, :].contiguous()
-        recv_lse = recv_lse_buf[:, :B, :].contiguous()
+        # Unpack output (non-contiguous view — Triton handles strides)
+        recv_output = recv_combined[:, :B, :, :D]
+        # Unpack LSE: copy [D:] columns back to fp32 staging buffer
+        recv_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd).copy_(
+            recv_combined[:, :, :, D:]
+        )
+        recv_lse = recv_lse_stg[:, :B, :]
     else:
-        send_output = reshaped_out.contiguous()
-        recv_output = torch.empty_like(send_output)
-        send_lse = reshaped_lse.contiguous()
-        recv_lse = torch.empty_like(send_lse)
-        cp_group.all_to_all_single(recv_output.view(-1), send_output.view(-1))
-        cp_group.all_to_all_single(recv_lse.view(-1), send_lse.view(-1))
+        # Eager path: allocate fused buffer on the fly
+        send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
+        send_combined = torch.empty(
+            N, B, H_per_rank, D + lpd, dtype=out_dtype,
+            device=cp_attn_out.device,
+        )
+        recv_combined = torch.empty_like(send_combined)
+
+        send_combined[:, :, :, :D].copy_(reshaped_out)
+        send_combined[:, :, :, D:].copy_(
+            send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
+        )
+
+        cp_group.all_to_all_single(
+            recv_combined.view(-1), send_combined.view(-1)
+        )
+
+        recv_output = recv_combined[:, :, :, :D]
+        recv_lse_stg = torch.empty(
+            N, B, H_per_rank, dtype=torch.float32,
+            device=cp_attn_out.device,
+        )
+        recv_lse_stg.view(out_dtype).view(N, B, H_per_rank, lpd).copy_(
+            recv_combined[:, :, :, D:]
+        )
+        recv_lse = recv_lse_stg
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
