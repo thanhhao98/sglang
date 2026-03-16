@@ -1148,6 +1148,16 @@ class DeepseekV2AttentionMLA(
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+
+        # DCP replicate Q: use tp_size=1 for Q and kv_b projections so each
+        # rank holds all heads, eliminating the AllGather Q during decode.
+        dcp_replicate = (
+            get_dcp_world_size() > 1
+            and get_global_server_args().dcp_replicate_q_proj
+        )
+        q_tp_rank = 0 if dcp_replicate else attn_tp_rank
+        q_tp_size = 1 if dcp_replicate else attn_tp_size
+        self.dcp_replicate_q_proj = dcp_replicate
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1173,8 +1183,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=q_tp_rank,
+                tp_size=q_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1183,8 +1193,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=q_tp_rank,
+                tp_size=q_tp_size,
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -1221,8 +1231,8 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=q_tp_rank,
+            tp_size=q_tp_size,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -1532,10 +1542,12 @@ class DeepseekV2AttentionMLA(
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
+            # With replicated Q, projection outputs all heads; prefill only needs local heads.
+            proj_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             if self.use_nsa:
                 q_lora = self.q_a_layernorm(q)
                 q = self.q_b_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
+                    -1, proj_q_heads, self.qk_head_dim
                 )
                 _ = self.indexer(
                     x=hidden_states,
@@ -1555,7 +1567,7 @@ class DeepseekV2AttentionMLA(
                     None,
                     None,
                 )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj(q)[0].view(-1, proj_q_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
 
                 q, _, _, _ = fused_rms_fp8_group_quant(
@@ -1570,15 +1582,24 @@ class DeepseekV2AttentionMLA(
                     res1=None,
                     output_unquantized_inp1=False,
                 )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj(q)[0].view(-1, proj_q_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj(q)[0].view(-1, proj_q_heads, self.qk_head_dim)
+
+            # Prefill only needs local heads — slice replicated Q back down.
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                q = q[:, start:start + self.num_local_heads, :].contiguous()
 
         else:
+            proj_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
+                -1, proj_q_heads, self.qk_head_dim
             )
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                q = q[:, start:start + self.num_local_heads, :].contiguous()
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1666,7 +1687,11 @@ class DeepseekV2AttentionMLA(
             )[0]
         else:
             kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        kv_proj_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+        kv = kv.view(-1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim)
+        if self.dcp_replicate_q_proj:
+            start = get_attention_tp_rank() * self.num_local_heads
+            kv = kv[:, start:start + self.num_local_heads, :].contiguous()
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
 
@@ -1774,10 +1799,12 @@ class DeepseekV2AttentionMLA(
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            num_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
         else:
+            num_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
+                -1, num_q_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -1786,12 +1813,13 @@ class DeepseekV2AttentionMLA(
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
+        bmm_head_count = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
             q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                (bmm_head_count, aligned_m, self.kv_lora_rank)
             )
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (q_nope_val, q_nope_scale),
@@ -1882,15 +1910,21 @@ class DeepseekV2AttentionMLA(
         # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
         if get_dcp_world_size() > 1:
             if forward_batch.forward_mode.is_decode():
-                # if forward_batch.forward_mode is decode, gather q
-                with use_symmetric_memory(get_dcp_group()):
-                    combined = torch.cat([q_pe, q_nope_out], dim=-1)
-                gathered = get_dcp_group().all_gather(combined, dim=-2)
-                d_pe = q_pe.size(-1)
-                d_nope = q_nope_out.size(-1)
-                q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+                if not self.dcp_replicate_q_proj:
+                    # AllGather Q: each rank has local heads, gather to all heads
+                    with use_symmetric_memory(get_dcp_group()):
+                        combined = torch.cat([q_pe, q_nope_out], dim=-1)
+                    gathered = get_dcp_group().all_gather(combined, dim=-2)
+                    d_pe = q_pe.size(-1)
+                    d_nope = q_nope_out.size(-1)
+                    q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+                else:
+                    # Q already has all H heads from replicated weights.
+                    # Make contiguous since AllGather (skipped) normally does this.
+                    q_nope_out = q_nope_out.contiguous()
+                    q_pe = q_pe.contiguous()
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
+                # for extend (not mixed), gather kv
                 cache_k_nope, cache_k_rope = (
                     forward_batch.token_to_kv_pool.get_mla_kv_buffer(
                         self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
@@ -1914,6 +1948,12 @@ class DeepseekV2AttentionMLA(
                 ] = k_pe
             else:
                 logger.warn(f"not supported forward_mode {forward_batch.forward_mode}")
+            # For non-decode modes with replicated Q, slice back to local heads
+            # since attn_mqa (not attn_mqa_for_dcp_decode) expects num_local_heads.
+            if self.dcp_replicate_q_proj and not forward_batch.forward_mode.is_decode():
+                start = get_attention_tp_rank() * self.num_local_heads
+                q_nope_out = q_nope_out[:, start:start + self.num_local_heads, :].contiguous()
+                q_pe = q_pe[:, start:start + self.num_local_heads, :].contiguous()
         return (
             q_pe,
             k_pe,
@@ -3412,6 +3452,31 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         self.do_load_weights(weights, is_nextn)
+        self._slice_replicated_w_vc()
+
+    def _slice_replicated_w_vc(self):
+        """When dcp_replicate_q_proj is enabled, kv_b_proj is replicated (tp_size=1)
+        so w_kc and w_vc both have num_heads entries. w_kc needs all heads for the
+        Q absorption BMM, but w_vc is used after the DCP combine (which reduces to
+        num_local_heads), so slice w_vc back to local heads."""
+        if not (get_dcp_world_size() > 1 and get_global_server_args().dcp_replicate_q_proj):
+            return
+        attn_tp_rank = get_attention_tp_rank()
+        for layer in self.model.layers:
+            if not hasattr(layer, "self_attn"):
+                continue
+            self_attn = layer.self_attn
+            if not hasattr(self_attn, "w_vc") or self_attn.w_vc is None:
+                continue
+            start = attn_tp_rank * self_attn.num_local_heads
+            end = start + self_attn.num_local_heads
+            self_attn.w_vc = torch.nn.Parameter(
+                self_attn.w_vc[start:end].contiguous(), requires_grad=False
+            )
+            if hasattr(self_attn, "w_scale_v") and self_attn.w_scale_v is not None:
+                self_attn.w_scale_v = torch.nn.Parameter(
+                    self_attn.w_scale_v[start:end].contiguous(), requires_grad=False
+                )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

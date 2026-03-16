@@ -1319,7 +1319,7 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                if use_dcp:
+                if use_dcp and not get_global_server_args().dcp_replicate_q_proj:
                     q_reshaped = get_dcp_group().all_gather(
                         q_reshaped.contiguous(), dim=1
                     )
