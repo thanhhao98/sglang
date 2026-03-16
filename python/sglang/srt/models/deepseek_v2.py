@@ -2508,9 +2508,15 @@ class DeepseekV2AttentionMLA(
                 kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
                 k_pe = self._all_gather_dcp_kv_cache(k_pe)
             kv = self.kv_b_proj(kv_a_normed)[0]
+            # With replicated kv_b_proj (tp_size=1), output has all heads;
+            # slice back to local heads for the MHA attention.
+            kv_proj_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                -1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim
             )
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                kv = kv[:, start:start + self.num_local_heads, :].contiguous()
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
@@ -2524,7 +2530,10 @@ class DeepseekV2AttentionMLA(
                 device=v.device,
             )
             k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            # k_pe has 1 KV head (MQA); expand to match num_local_heads
+            k[..., self.qk_nope_head_dim :] = k_pe.expand_as(
+                k[..., self.qk_nope_head_dim :]
+            )
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             tmp_output = torch.empty_like(accum_output)
