@@ -1,75 +1,65 @@
 # FA3 DCP Performance Investigation
 
 ## Problem Statement
-FA3 DCP decode is ~31% slower than FlashInfer DCP at low concurrency (14.91ms vs 11.38ms TPOT at cc1), despite identical performance without DCP (~9.5ms both).
+FA3 DCP decode is ~31% slower than FlashInfer DCP at low concurrency (14.91ms vs 11.38ms TPOT at cc1), despite identical performance without DCP (~9.5ms both). CC512 throughput also lower (2300 vs 3144 tok/s).
 
 ## Root Cause Analysis
 
-### Identified Bottleneck: `_init_dcp_decode_metadata` (flashattention_backend.py:2479-2529)
+### Issue 1 (DECODE): `_init_dcp_decode_metadata` Python for-loop
+**File**: `flashattention_backend.py:2479-2529`
 
-Called every decode step, this function had a **Python for-loop** (lines 2512-2518) iterating over `max_local_pages`, launching GPU tensor ops one-by-one from Python. Each iteration did `global_pt[:, idx]` and `local_pt[:, p] = ...` - individual GPU kernel launches from Python.
+Called every decode step, this function had a Python `for p in range(max_local_pages)` loop launching individual GPU tensor ops per iteration. FlashInfer's equivalent (`filter_seq_indices` in flashinfer_mla_backend.py:747-770) was fully vectorized.
 
-FlashInfer's equivalent (`filter_seq_indices` in flashinfer_mla_backend.py:747-770) is fully vectorized with `torch.arange` + masking.
+**Fix**: Replaced for-loop with single vectorized `torch.arange` + advanced indexing operation.
+**Result**: TPOT dropped from 14.91ms to 11.29ms (24% improvement), matching FlashInfer's 11.38ms.
 
-### Why it converges at high concurrency
-At cc256+, actual attention computation dominates and the per-step metadata overhead becomes a smaller fraction.
+### Issue 2 (TTFT/THROUGHPUT): mem_fraction_static difference
+FA3 used `MEM_FRAC=0.80` (OOMs at 0.85 due to FA3's larger CUDA graph workspace), while FlashInfer used `MEM_FRAC=0.85`. This 5% less KV cache capacity meant:
+- Fewer concurrent requests could be held
+- More queuing at high concurrency → higher TTFT
+- Lower throughput at cc512
 
-### TTFT gap at cc256
-Partially due to decode overhead cascading into request queuing. Still remains after fix (9118ms vs 1975ms for FlashInfer) - likely a separate prefill-related issue.
+**Fix**: Increased to `MEM_FRAC=0.83` (max before OOM for FA3).
+**Result**: cc256 TTFT dropped from 9118ms to 1977ms (matching FlashInfer's 1975ms). cc512 throughput improved from 2566 to 2947 (vs FlashInfer's 3144).
 
-## Fix Applied
-**Commit**: `854945558` on `debug/fa3-dcp-vectorize`
+## Final Benchmark Results (H100, DCP8)
 
-Replaced Python for-loop with vectorized tensor operations:
-```python
-# Before (slow): Python loop with per-iteration GPU ops
-for p in range(max_local_pages):
-    local_token_start = p * self.page_size
-    global_token_pos = dcp_rank + local_token_start * N
-    global_page_idx = global_token_pos // self.page_size
-    if global_page_idx < max_global_pages:
-        global_page_val = global_pt[:, min(global_page_idx, max_global_pages - 1)]
-        local_pt[:, p] = global_page_val // N
+### Accuracy: 0.800 GSM8K (all configs pass)
 
-# After (fast): Single vectorized operation
-p_indices = torch.arange(max_local_pages, device=device)
-global_token_positions = dcp_rank + (p_indices * self.page_size) * N
-global_page_indices = global_token_positions // self.page_size
-valid_mask = global_page_indices < max_global_pages
-global_page_indices_clamped = global_page_indices.clamp(max=max_global_pages - 1)
-local_pt = global_pt[:, global_page_indices_clamped] // N
-```
+### TPOT (ms) Comparison
+| cc | FA3 Before | FA3 A2A Fix | FA3 AGRS Fix | FlashInfer A2A | FlashInfer AGRS |
+|----|-----------|-------------|--------------|----------------|-----------------|
+| 1 | 14.91 | **11.29** | **11.07** | 11.38 | 11.12 |
+| 2 | 17.48 | **12.53** | **12.29** | 12.48 | 12.20 |
+| 4 | 21.23 | **14.51** | **14.20** | 14.34 | 14.02 |
+| 8 | 25.17 | **17.31** | **16.92** | 17.35 | 16.83 |
+| 16 | 31.14 | **22.75** | **22.09** | 22.95 | 22.09 |
+| 64 | 52.13 | **43.37** | **43.00** | 44.08 | 43.59 |
+| 256 | 92.42 | **83.43** | **83.33** | 91.53 | 91.44 |
+| 512 | 94.47 | **85.11** | **85.03** | 119.00 | 120.37 |
 
-Note: `.max().item()` was kept because removing it (using upper bound) caused OOM during CUDA graph capture - FA3 kernel allocates workspace proportional to page table size.
+### Throughput (tok/s) with mem_frac fix
+| cc | FA3 Before (0.80) | FA3 After (0.83) | FlashInfer (0.85) |
+|----|-------------------|-------------------|-------------------|
+| 1 | 65.52 | **87.40** | 86.66 |
+| 64 | 1102.43 | **1339.18** | 1320.90 |
+| 256 | 2261.56 | **2566.99** | 2558.00 |
+| 512 | 2300.07 | **2947.66** | 3144.00 |
 
-## Benchmark Results (H100, DCP8 A2A)
+### TTFT (ms) with mem_frac fix
+| cc | FA3 Before (0.80) | FA3 After (0.83) | FlashInfer (0.85) |
+|----|-------------------|-------------------|-------------------|
+| 1 | 122.53 | **116.98** | 116.43 |
+| 256 | 9888.89 | **1977.25** | 1975.93 |
+| 512 | 89558.20 | **46154.50** | 28397.40 |
 
-### Accuracy: PASS (0.800 GSM8K, same as baseline)
+## Summary
+1. **Decode latency (TPOT)**: Fully resolved. FA3 now matches or beats FlashInfer across all concurrency levels.
+2. **Throughput at cc1-cc256**: Fully resolved. FA3 matches FlashInfer.
+3. **Throughput at cc512**: Reduced gap from 27% to 6.2%. Remaining gap is due to FA3 needing 2% less mem_frac (0.83 vs 0.85) because of larger CUDA graph workspace.
+4. **TTFT at cc256**: Fully resolved (1977ms vs 1975ms).
+5. **TTFT at cc512**: Improved from 89558ms to 46154ms (vs FlashInfer 28397ms). Remaining gap is the mem_frac difference.
 
-### TPOT (ms) - Decode latency per token
-| cc | FA3 Before | FA3 After | FlashInfer | Improvement |
-|----|-----------|-----------|------------|-------------|
-| 1 | 14.91 | **11.29** | 11.38 | 24.3% |
-| 2 | 17.48 | **12.53** | 12.48 | 28.3% |
-| 4 | 21.23 | **14.51** | 14.34 | 31.7% |
-| 8 | 25.17 | **17.31** | 17.35 | 31.2% |
-| 16 | 31.14 | **22.75** | 22.95 | 27.0% |
-| 64 | 52.13 | **43.37** | 44.08 | 16.8% |
-| 256 | 92.42 | **83.43** | 91.53 | 9.7% |
-| 512 | 94.47 | **85.11** | 119.00 | 9.9% |
-
-### Output Throughput (tok/s)
-| cc | FA3 Before | FA3 After | FlashInfer | Improvement |
-|----|-----------|-----------|------------|-------------|
-| 1 | 65.52 | **87.19** | 86.66 | 33.1% |
-| 64 | 1102.43 | **1340.38** | 1320.90 | 21.6% |
-| 256 | 2261.56 | **2534.97** | 2558.00 | 12.1% |
-| 512 | 2300.07 | **2566.73** | 3144.00 | 11.6% |
-
-### Conclusion
-FA3 DCP now **matches or beats FlashInfer DCP** across all concurrency levels for decode performance. The remaining TTFT gap at cc256+ is a separate issue likely related to FA3 prefill handling with DCP.
-
-## Remaining Issue: TTFT at high concurrency
-- FA3 DCP cc256 TTFT: 9118ms (was 9888ms, improved ~8%)
-- FlashInfer DCP cc256 TTFT: 1975ms
-- This 4.6x gap may be related to FA3's prefill path not using `dcp_kv_buffer` (FlashInfer does at flashinfer_mla_backend.py:583-584)
+## Commits
+- `854945558` - vectorize `_init_dcp_decode_metadata` (main fix)
+- `b14d63261` - benchmark scripts for 0.83 mem_frac testing
