@@ -1395,7 +1395,7 @@ class FlashAttentionBackend(AttentionBackend):
                             ),
                         )
                     else:
-                        o = cp_lse_ag_out_rs(o, lse_2d, get_dcp_group())
+                        o = cp_lse_ag_out_rs(o, lse_2d, get_dcp_group(), is_lse_base_on_e=True)
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(

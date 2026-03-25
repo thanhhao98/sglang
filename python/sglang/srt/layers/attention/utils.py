@@ -676,6 +676,7 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    IS_BASE_E: tl.constexpr,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -710,9 +711,14 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
     lse -= lse_max
-    lse_exp = tl.exp2(lse)
-    lse_acc = tl.sum(lse_exp, axis=0)
-    lse = tl.log2(lse_acc)
+    if IS_BASE_E:
+        lse_exp = tl.exp(lse)
+        lse_acc = tl.sum(lse_exp, axis=0)
+        lse = tl.log(lse_acc)
+    else:
+        lse_exp = tl.exp2(lse)
+        lse_acc = tl.sum(lse_exp, axis=0)
+        lse = tl.log2(lse_acc)
     lse += lse_max
 
     lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
@@ -736,7 +742,10 @@ def _correct_attn_cp_out_kernel(
         -float("inf"),
         lse_finally,
     )
-    factor = tl.exp2(lse_finally)
+    if IS_BASE_E:
+        factor = tl.exp(lse_finally)
+    else:
+        factor = tl.exp2(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
 
@@ -744,7 +753,8 @@ def _correct_attn_cp_out_kernel(
 
 
 def correct_attn_out(
-    out: torch.Tensor, lses: torch.Tensor, cp_rank: int
+    out: torch.Tensor, lses: torch.Tensor, cp_rank: int,
+    is_lse_base_on_e: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -752,6 +762,7 @@ def correct_attn_out(
         out: Tensor of shape [ B, H, D ]
         lses: Tensor of shape [ N, B, H ]
         cp_rank: Current rank in the context-parallel group
+        is_lse_base_on_e: True if LSE uses base-e (FA3), False for base-2 (FlashInfer)
 
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
@@ -800,6 +811,7 @@ def correct_attn_out(
         cp_rank,
         HEAD_DIM=D,
         N_ROUNDED=N,
+        IS_BASE_E=is_lse_base_on_e,
     )
     return out, lse
 
@@ -808,10 +820,12 @@ def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
+    is_lse_base_on_e: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
+    is_lse_base_on_e: True if LSE uses base-e (FA3), False for base-2 (FlashInfer)
     """
     if cp_group.world_size == 1:
         return cp_attn_out
@@ -819,6 +833,6 @@ def cp_lse_ag_out_rs(
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group)
+    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, is_lse_base_on_e)
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
