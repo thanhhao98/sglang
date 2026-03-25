@@ -1267,7 +1267,6 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
         if get_dcp_world_size() > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
                 self.num_local_heads * get_dcp_world_size(),
@@ -1881,7 +1880,6 @@ class DeepseekV2AttentionMLA(
                 layer_id=self.layer_id,
             )
 
-        # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
         if get_dcp_world_size() > 1:
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
@@ -1951,7 +1949,6 @@ class DeepseekV2AttentionMLA(
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            # TODO(augusto.yjh) 返回lse, correct attn_output
             if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
