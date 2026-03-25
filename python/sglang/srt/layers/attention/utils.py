@@ -743,21 +743,8 @@ def _correct_attn_cp_out_kernel(
     tl.store(new_output_ptr + output_offsets, output)
 
 
-class CPTritonContext:
-    """The CPTritonContext is used to avoid recompilation of the Triton JIT."""
-
-    def __init__(self):
-        self.inner_kernel = None
-
-    def call_kernel(self, kernel, grid, *regular_args, **const_args):
-        if self.inner_kernel is None:
-            self.inner_kernel = kernel[grid](*regular_args, **const_args)
-        else:
-            self.inner_kernel[grid](*regular_args)
-
-
 def correct_attn_out(
-    out: torch.Tensor, lses: torch.Tensor, cp_rank: int, ctx: CPTritonContext
+    out: torch.Tensor, lses: torch.Tensor, cp_rank: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -765,14 +752,10 @@ def correct_attn_out(
         out: Tensor of shape [ B, H, D ]
         lses: Tensor of shape [ N, B, H ]
         cp_rank: Current rank in the context-parallel group
-        ctx: Triton context to avoid recompilation
 
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
     """
-    if ctx is None:
-        ctx = CPTritonContext()
-
     # --- Normalize to 3D views ---
     if out.ndim == 4 and out.shape[1] == 1:
         out = out.squeeze(1)
@@ -802,10 +785,8 @@ def correct_attn_out(
         (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
     )
 
-    # Kernel launch config
     grid = (B, H, 1)
-
-    regular_args = (
+    _correct_attn_cp_out_kernel[grid](
         out,
         out,
         lses,
@@ -817,10 +798,9 @@ def correct_attn_out(
         l_sB,
         l_sH,
         cp_rank,
+        HEAD_DIM=D,
+        N_ROUNDED=N,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
-
-    ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
 
 
@@ -828,7 +808,6 @@ def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
-    ctx: CPTritonContext = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -837,12 +816,9 @@ def cp_lse_ag_out_rs(
     if cp_group.world_size == 1:
         return cp_attn_out
 
-    if ctx is None:
-        ctx = CPTritonContext()
-
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
+    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group)
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
