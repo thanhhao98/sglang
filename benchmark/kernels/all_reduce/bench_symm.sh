@@ -18,8 +18,19 @@ export NCCL_GRAPH_MIXING_SUPPORT=0
 export NCCL_CUMEM_ENABLE=1
 export NCCL_NVLS_ENABLE=2
 
-torchrun  --nproc_per_node $PER_NODE_GPU \
+echo "===== Symmetric Memory AllGather/ReduceScatter Benchmark ====="
+python -m torch.distributed.run  --nproc_per_node $PER_NODE_GPU \
           --nnodes $WORLD_SIZE \
           --node_rank $RANK \
           --master_addr $MASTER_ADDR \
           --master_port $MASTER_PORT benchmark_symm_mem.py
+
+echo ""
+echo "===== DCP Communication Benchmark: A2A vs AG+RS ====="
+python -m torch.distributed.run  --nproc_per_node $PER_NODE_GPU \
+          --nnodes $WORLD_SIZE \
+          --node_rank $RANK \
+          --master_addr $MASTER_ADDR \
+          --master_port $MASTER_PORT benchmark_a2a.py \
+          --num-heads 16 --head-dim 512 \
+          --batch-sizes 1,4,16,64,256
