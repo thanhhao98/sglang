@@ -1127,6 +1127,14 @@ class DeepseekV2AttentionMLA(
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+
+        dcp_replicate = (
+            get_dcp_world_size() > 1
+            and get_global_server_args().dcp_replicate_q_proj
+        )
+        q_tp_rank = 0 if dcp_replicate else attn_tp_rank
+        q_tp_size = 1 if dcp_replicate else attn_tp_size
+        self.dcp_replicate_q_proj = dcp_replicate
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1152,8 +1160,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=q_tp_rank,
+                tp_size=q_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1162,8 +1170,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=q_tp_rank,
+                tp_size=q_tp_size,
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -1200,8 +1208,8 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=q_tp_rank,
+            tp_size=q_tp_size,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -2251,6 +2259,31 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         self.do_load_weights(weights, is_nextn)
+        self._slice_replicated_w_vc()
+
+    def _slice_replicated_w_vc(self):
+        """When dcp_replicate_q_proj is enabled, kv_b_proj is replicated (tp_size=1)
+        so w_kc and w_vc both have num_heads entries. w_kc needs all heads for the
+        Q absorption BMM, but w_vc is used after the DCP combine (which reduces to
+        num_local_heads), so slice w_vc back to local heads."""
+        if not (get_dcp_world_size() > 1 and get_global_server_args().dcp_replicate_q_proj):
+            return
+        attn_tp_rank = get_attention_tp_rank()
+        for layer in self.model.layers:
+            if not hasattr(layer, "self_attn"):
+                continue
+            self_attn = layer.self_attn
+            if not hasattr(self_attn, "w_vc") or self_attn.w_vc is None:
+                continue
+            start = attn_tp_rank * self_attn.num_local_heads
+            end = start + self_attn.num_local_heads
+            self_attn.w_vc = torch.nn.Parameter(
+                self_attn.w_vc[start:end].contiguous(), requires_grad=False
+            )
+            if hasattr(self_attn, "w_scale_v") and self_attn.w_scale_v is not None:
+                self_attn.w_scale_v = torch.nn.Parameter(
+                    self_attn.w_scale_v[start:end].contiguous(), requires_grad=False
+                )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

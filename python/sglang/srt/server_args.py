@@ -442,6 +442,7 @@ class ServerArgs:
     moe_dp_size: int = 1
     dcp_size: int = 1
     dcp_comm_backend: str = "ag_rs"
+    dcp_replicate_q_proj: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -2595,6 +2596,8 @@ class ServerArgs:
 
         if self.dcp_comm_backend == "a2a" and self.dcp_size <= 1:
             raise ValueError("--dcp-comm-backend a2a requires --dcp-size > 1")
+        if self.dcp_replicate_q_proj and self.dcp_size <= 1:
+            raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1")
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -4054,6 +4057,13 @@ class ServerArgs:
             choices=["ag_rs", "a2a"],
             help="DCP communication backend: ag_rs (AllGather+ReduceScatter) "
             "or a2a (All-to-All exchange + local Triton combine).",
+        )
+        parser.add_argument(
+            "--dcp-replicate-q-proj",
+            action="store_true",
+            default=ServerArgs.dcp_replicate_q_proj,
+            help="Replicate Q projection weights across DCP ranks to eliminate "
+            "the AllGather Q operation during decode (trades memory for latency).",
         )
         parser.add_argument(
             "--pipeline-parallel-size",

@@ -9,6 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
@@ -116,6 +117,7 @@ class DeepseekMHAForwardMixin:
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
+            proj_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             if self.use_nsa:
                 # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
@@ -138,12 +140,12 @@ class DeepseekMHAForwardMixin:
                         output_unquantized_inp1=True,
                     )
                     q = self.q_b_proj(q_quanted)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
+                        -1, proj_q_heads, self.qk_head_dim
                     )
                 else:
                     q_lora = self.q_a_layernorm(q)
                     q = self.q_b_proj(q_lora)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
+                        -1, proj_q_heads, self.qk_head_dim
                     )
                 _ = self.indexer(
                     x=hidden_states,
@@ -163,7 +165,7 @@ class DeepseekMHAForwardMixin:
                     None,
                     None,
                 )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj(q)[0].view(-1, proj_q_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
 
                 q, _, _, _ = fused_rms_fp8_group_quant(
@@ -178,15 +180,23 @@ class DeepseekMHAForwardMixin:
                     res1=None,
                     output_unquantized_inp1=False,
                 )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj(q)[0].view(-1, proj_q_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj(q)[0].view(-1, proj_q_heads, self.qk_head_dim)
+
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                q = q[:, start:start + self.num_local_heads, :].contiguous()
 
         else:
+            proj_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
+                -1, proj_q_heads, self.qk_head_dim
             )
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                q = q[:, start:start + self.num_local_heads, :].contiguous()
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -291,9 +301,13 @@ class DeepseekMHAForwardMixin:
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]
+            kv_proj_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                -1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim
             )
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                kv = kv[:, start:start + self.num_local_heads, :].contiguous()
             k_nope = kv[..., : self.qk_nope_head_dim]
             v = kv[..., self.qk_nope_head_dim :]
 
@@ -417,9 +431,13 @@ class DeepseekMHAForwardMixin:
                 kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
                 k_pe = self._all_gather_dcp_kv_cache(k_pe)
             kv = self.kv_b_proj(kv_a_normed)[0]
+            kv_proj_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                -1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim
             )
+            if self.dcp_replicate_q_proj:
+                start = get_attention_tp_rank() * self.num_local_heads
+                kv = kv[:, start:start + self.num_local_heads, :].contiguous()
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
@@ -433,7 +451,9 @@ class DeepseekMHAForwardMixin:
                 device=v.device,
             )
             k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            k[..., self.qk_nope_head_dim :] = k_pe.expand_as(
+                k[..., self.qk_nope_head_dim :]
+            )
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             tmp_output = torch.empty_like(accum_output)
