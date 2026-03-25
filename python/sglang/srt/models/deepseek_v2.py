@@ -2024,10 +2024,11 @@ class DeepseekV2AttentionMLA(
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
-        # TODO(augusto.yjh) all gather lse，订正attn_output
-        # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
         if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
-            # Note(wh): make sure input tensors use nccl allocator
+            # FA3/FA4 return base-e LSE; FlashInfer returns base-2 LSE
+            is_base_e = self.current_attention_backend in ("fa3", "fa4")
+            if is_base_e:
+                lse = lse / 0.6931471805599453  # ln(2): convert base-e → base-2 for AG+RS kernel
             with use_symmetric_memory(get_dcp_group()):
                 attn_output = attn_output.view(
                     -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
