@@ -1543,8 +1543,13 @@ decode_context_parallel_size: Optional[int] = None
 def get_dcp_size_from_env():
     global decode_context_parallel_size
     if decode_context_parallel_size is None:
-        decode_context_parallel_size = int(os.getenv("SGLANG_DCP", 1))
+        decode_context_parallel_size = 1
     return decode_context_parallel_size
+
+
+def set_dcp_size(size: int):
+    global decode_context_parallel_size
+    decode_context_parallel_size = size
 
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1834,6 +1839,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
@@ -2006,22 +2012,22 @@ def initialize_model_parallel(
         )
 
     # build decode context parallel groups
-    decode_context_model_parallel_size = get_dcp_size_from_env()
-    if decode_context_model_parallel_size > 1:
+    set_dcp_size(decode_context_parallel_size)
+    if decode_context_parallel_size > 1:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
-                f"DCP enabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+                f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
     else:
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
-                f"DCP disabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
     assert (
-        tensor_model_parallel_size % decode_context_model_parallel_size == 0
-    ), f"{tensor_model_parallel_size} must be divisible by decode_context_model_parallel_size"
+        tensor_model_parallel_size % decode_context_parallel_size == 0
+    ), f"{tensor_model_parallel_size} must be divisible by decode_context_parallel_size"
     num_decode_context_model_parallel_groups: int = (
-        world_size // decode_context_model_parallel_size
+        world_size // decode_context_parallel_size
     )
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
@@ -2029,8 +2035,8 @@ def initialize_model_parallel(
     for i in range(num_decode_context_model_parallel_groups):
         ranks = list(
             range(
-                i * decode_context_model_parallel_size,
-                (i + 1) * decode_context_model_parallel_size,
+                i * decode_context_parallel_size,
+                (i + 1) * decode_context_parallel_size,
             )
         )
         group_ranks.append(ranks)

@@ -440,6 +440,7 @@ class ServerArgs:
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
+    dcp_size: int = 1
     dcp_comm_backend: str = "ag_rs"
 
     # Multi-node distributed serving
@@ -2592,10 +2593,9 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
-        dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
-        if self.dcp_comm_backend == "a2a" and dcp_size <= 1:
+        if self.dcp_comm_backend == "a2a" and self.dcp_size <= 1:
             raise ValueError(
-                "--dcp-comm-backend a2a requires SGLANG_DCP > 1"
+                "--dcp-comm-backend a2a requires --dcp-size > 1"
             )
 
     def _handle_data_parallelism(self):
@@ -4042,6 +4042,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
+        )
+        parser.add_argument(
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="The decode context parallelism size.",
         )
         parser.add_argument(
             "--dcp-comm-backend",

@@ -3529,9 +3529,8 @@ def configure_scheduler(
         prefix += f" MOE_DP{moe_dp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
-    dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
-    if dcp_size > 1:
-        dcp_rank = tp_rank % dcp_size
+    if server_args.dcp_size > 1:
+        dcp_rank = tp_rank % server_args.dcp_size
         prefix += f" DCP{dcp_rank}"
     if server_args.ep_size > 1:
         prefix += f" EP{moe_ep_rank}"

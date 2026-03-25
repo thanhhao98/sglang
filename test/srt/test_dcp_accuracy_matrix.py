@@ -115,7 +115,6 @@ def wait_for_server(timeout=600):
 def start_server(model, backend, dcp_comm, cuda_graph_enabled):
     """Launch sglang server as a subprocess."""
     env = os.environ.copy()
-    env["SGLANG_DCP"] = str(NUM_GPUS)
     env["SGLANG_DCP_SYMM_ONLY"] = "true"
     env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
@@ -125,6 +124,7 @@ def start_server(model, backend, dcp_comm, cuda_graph_enabled):
         "--host", "0.0.0.0", "--port", str(PORT),
         "--trust-remote-code",
         "--tp-size", str(NUM_GPUS),
+        "--dcp-size", str(NUM_GPUS),
         "--mem-fraction-static", "0.80",
         "--chunked-prefill-size", "32768",
         "--context-length", "262144",
