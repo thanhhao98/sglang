@@ -2499,23 +2499,27 @@ class FlashAttentionBackend(AttentionBackend):
         global_pt = metadata.page_table  # [B, max_pages] (page indices, already strided)
         max_global_pages = global_pt.shape[1]
 
-        # Compute local page count per request
-        max_local_tokens = local_seqlens.max().item()
-        max_local_pages = (max_local_tokens + self.page_size - 1) // self.page_size
+        # Use a static upper bound to avoid GPU-CPU sync from .item().
+        # Max possible local tokens = ceil(max_context_len / dcp_size).
+        max_local_tokens_ub = (self.max_context_len + N - 1) // N
+        max_local_pages = (max_local_tokens_ub + self.page_size - 1) // self.page_size
+        # Clamp to actual global page table size
+        max_local_pages = min(max_local_pages, max_global_pages)
 
-        # Build local page table by selecting every N-th page and converting to local
-        # Global virtual token pos `dcp_rank + j*N` maps to global page `(dcp_rank + j*N) // page_size`
-        # Local token index j maps to local page `j // page_size`
-        # We need: for each local page p, find the global page that contains the p-th local token
-        local_pt = torch.zeros(B, max_local_pages, dtype=torch.int32, device=device)
-
-        for p in range(max_local_pages):
-            local_token_start = p * self.page_size
-            global_token_pos = dcp_rank + local_token_start * N
-            global_page_idx = global_token_pos // self.page_size
-            if global_page_idx < max_global_pages:
-                global_page_val = global_pt[:, min(global_page_idx, max_global_pages - 1)]
-                local_pt[:, p] = global_page_val // N
+        # Vectorized page table construction (replaces Python for-loop).
+        # For each local page p, find the global page containing its first token:
+        #   local_token_start = p * page_size
+        #   global_token_pos = dcp_rank + local_token_start * N
+        #   global_page_idx = global_token_pos // page_size
+        p_indices = torch.arange(max_local_pages, device=device)
+        global_token_positions = dcp_rank + (p_indices * self.page_size) * N
+        global_page_indices = global_token_positions // self.page_size
+        valid_mask = global_page_indices < max_global_pages
+        global_page_indices_clamped = global_page_indices.clamp(max=max_global_pages - 1)
+        local_pt = global_pt[:, global_page_indices_clamped] // N
+        # Zero out entries beyond valid global pages
+        if not valid_mask.all():
+            local_pt[:, ~valid_mask] = 0
 
         # Use pre-allocated buffers if available (CUDA graph mode)
         cg_meta = self.decode_cuda_graph_metadata
