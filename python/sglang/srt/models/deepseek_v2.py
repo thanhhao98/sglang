@@ -2040,8 +2040,6 @@ class DeepseekV2AttentionMLA(
                     is_lse_base_on_e=is_base_e,
                 )
             else:
-                if is_base_e:
-                    lse = lse / 0.6931471805599453  # ln(2): convert base-e → base-2 for AG+RS kernel
                 with use_symmetric_memory(get_dcp_group()):
                     attn_output = attn_output.view(
                         -1,
@@ -2049,7 +2047,9 @@ class DeepseekV2AttentionMLA(
                         self.kv_lora_rank,
                     ).clone(memory_format=torch.contiguous_format)
                     lse = lse.clone(memory_format=torch.contiguous_format)
-                attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
+                attn_output = cp_lse_ag_out_rs(
+                    attn_output, lse, get_dcp_group(), is_lse_base_on_e=is_base_e
+                )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
