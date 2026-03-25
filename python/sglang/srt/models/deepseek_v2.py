@@ -71,6 +71,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.utils import (
     concat_and_cast_mha_k_triton,
     cp_lse_ag_out_rs,
@@ -2027,14 +2028,28 @@ class DeepseekV2AttentionMLA(
         if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
             # FA3/FA4 return base-e LSE; FlashInfer returns base-2 LSE
             is_base_e = self.current_attention_backend in ("fa3", "fa4")
-            if is_base_e:
-                lse = lse / 0.6931471805599453  # ln(2): convert base-e → base-2 for AG+RS kernel
-            with use_symmetric_memory(get_dcp_group()):
+            if get_global_server_args().dcp_comm_backend == "a2a":
                 attn_output = attn_output.view(
                     -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
-                ).clone(memory_format=torch.contiguous_format)
-                lse = lse.clone(memory_format=torch.contiguous_format)
-            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
+                ).contiguous()
+                lse = lse.contiguous()
+                attn_output = dcp_a2a_lse_reduce(
+                    attn_output,
+                    lse,
+                    get_dcp_group(),
+                    is_lse_base_on_e=is_base_e,
+                )
+            else:
+                if is_base_e:
+                    lse = lse / 0.6931471805599453  # ln(2): convert base-e → base-2 for AG+RS kernel
+                with use_symmetric_memory(get_dcp_group()):
+                    attn_output = attn_output.view(
+                        -1,
+                        self.num_local_heads * get_dcp_world_size(),
+                        self.kv_lora_rank,
+                    ).clone(memory_format=torch.contiguous_format)
+                    lse = lse.clone(memory_format=torch.contiguous_format)
+                attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
