@@ -619,7 +619,6 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.real_allocator.free(free_index)
 
     def filter_local_indices(self, indices):
-        # TODO write a triton kernel to make this faster
         indices = (
             indices[indices % self.dcp_world_size == self.dcp_rank]
             // self.dcp_world_size

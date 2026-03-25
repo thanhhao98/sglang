@@ -2557,7 +2557,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if not skip_attn_backend_init:
-            # TODO (augusto.yjh) prepare for dcp
             if get_dcp_world_size() > 1:
                 # dcp_kv_buffer tokens' layout
                 # [ rank0_r1.prefix_tokens, rank0_r2.prefix_tokens,
