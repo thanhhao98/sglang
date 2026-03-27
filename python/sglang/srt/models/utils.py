@@ -272,14 +272,23 @@ class AutoWeightsLoader:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
-    return (
+    enabled = (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
+    if not enabled:
+        return False
 
+    # TPA narrows the attention shard width below the full TP width. The fused
+    # RoPE+KV-store path still assumes the full-TP layout, so keep it on the
+    # conservative save_kv_cache path until that kernel path is validated for TPA.
+    from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+    return get_attention_tp_size() == get_tensor_model_parallel_world_size()
 
 def create_fused_set_kv_buffer_arg(
     value: torch.Tensor,

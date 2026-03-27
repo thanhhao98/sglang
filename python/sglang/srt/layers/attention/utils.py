@@ -1573,3 +1573,29 @@ def cp_lse_ag_out_rs(
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
+
+
+def cp_lse_ag_out_allreduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: CPTritonContext = None,
+):
+    """
+    Merge DCP partial attention outputs when every rank already owns the same heads.
+
+    In this layout, ranks differ only by which KV stripe they stored, so we correct
+    the local partial output with the gathered LSE values and then sum the corrected
+    outputs across the whole group.
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    if ctx is None:
+        ctx = CPTritonContext()
+
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
+    return cp_group.all_reduce(out)

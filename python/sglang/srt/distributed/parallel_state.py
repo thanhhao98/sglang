@@ -1497,16 +1497,18 @@ _DCP: Optional[GroupCoordinator] = None
 decode_context_parallel_size: Optional[int] = None
 
 
-def get_dcp_size_from_env():
+def set_dcp_size(dcp_size: int):
     global decode_context_parallel_size
-    if decode_context_parallel_size is None:
-        decode_context_parallel_size = 1
-    return decode_context_parallel_size
+    decode_context_parallel_size = dcp_size
 
 
-def set_dcp_size(size: int):
+def get_dcp_size():
     global decode_context_parallel_size
-    decode_context_parallel_size = size
+    if decode_context_parallel_size is not None:
+        return decode_context_parallel_size
+    if _DCP is not None:
+        return _DCP.world_size
+    return 1
 
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1796,6 +1798,8 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
+    attention_tensor_parallel_size: Optional[int] = None,
+    decode_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
@@ -1902,7 +1906,9 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    attn_tp_size = attention_tensor_parallel_size or (
+        tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    )
 
     global _ATTN_CP
     assert (
@@ -1910,6 +1916,19 @@ def initialize_model_parallel(
     ), "attention context model parallel group is already initialized"
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
+    elif attn_cp_size == 1:
+        # When attention context parallelism is disabled, each rank should
+        # still have a valid singleton CP group. The generic layout formula
+        # below assumes attn_tp_size * attn_cp_size * attn_dp_size covers the
+        # full TP width, which is no longer true once phase-1 TPA reserves part
+        # of TP for DCP.
+        group_ranks = [[rank] for rank in range(world_size)]
+        _ATTN_CP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="attn_cp",
+        )
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
@@ -1944,18 +1963,39 @@ def initialize_model_parallel(
         _ATTN_TP = _TP
     else:
         group_ranks = []
-        for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
-                st = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + cp_dp_combined_idx * attn_tp_size
-                )
-                en = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + (cp_dp_combined_idx + 1) * attn_tp_size
-                )
-                ranks = list(range(st, en))
-                group_ranks.append(ranks)
+        if attention_tensor_parallel_size is not None:
+            assert attn_cp_size == 1, "Phase-1 TPA does not support attention CP"
+            assert attn_dp_size == 1, "Phase-1 TPA does not support attention DP"
+            assert (
+                tensor_model_parallel_size
+                == attention_tensor_parallel_size * decode_context_model_parallel_size
+            ), (
+                "Phase-1 TPA requires tp_size == attention_tensor_parallel_size * dcp_size"
+            )
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                tp_group_base = tp_group_idx * tensor_model_parallel_size
+                for dcp_rank in range(decode_context_model_parallel_size):
+                    ranks = list(
+                        range(
+                            tp_group_base + dcp_rank,
+                            tp_group_base + tensor_model_parallel_size,
+                            decode_context_model_parallel_size,
+                        )
+                    )
+                    group_ranks.append(ranks)
+        else:
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
+                    st = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + cp_dp_combined_idx * attn_tp_size
+                    )
+                    en = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + (cp_dp_combined_idx + 1) * attn_tp_size
+                    )
+                    ranks = list(range(st, en))
+                    group_ranks.append(ranks)
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2166,10 +2206,10 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size,
-            expert_model_parallel_size,
-            pipeline_model_parallel_size,
-            backend,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            backend=backend,
         )
         return
 
@@ -2187,8 +2227,8 @@ def ensure_model_parallel_initialized(
 
     dcp_world_size = get_dcp_group().world_size
     assert (
-        dcp_world_size == get_dcp_size_from_env()
-    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+        dcp_world_size == get_dcp_size()
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size()=}"
 
 
 def model_parallel_is_initialized():
@@ -2361,6 +2401,10 @@ def destroy_model_parallel():
     global _DCP
     if _DCP:
         _DCP.destroy()
+    _DCP = None
+
+    global decode_context_parallel_size
+    decode_context_parallel_size = None
 
 
 def destroy_distributed_environment():

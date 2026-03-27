@@ -23,12 +23,19 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_dcp_rank,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -118,20 +125,23 @@ class Qwen2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        full_tp_rank = get_tensor_model_parallel_rank()
+        full_tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         if head_dim is not None:
             self.head_dim = head_dim
         else:
@@ -141,6 +151,26 @@ class Qwen2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.use_full_tp_attention_handoff = False
+        self.full_tp_local_num_heads = self.num_heads
+
+        if (
+            get_global_server_args().is_attention_tpa_enabled()
+            and full_tp_size > attn_tp_size
+            and self.total_num_heads % full_tp_size == 0
+        ):
+            dcp_size = full_tp_size // attn_tp_size
+            full_tp_local_num_heads = self.total_num_heads // full_tp_size
+            if self.num_heads % dcp_size == 0:
+                self.use_full_tp_attention_handoff = True
+                self.full_tp_local_num_heads = full_tp_local_num_heads
+
+        o_proj_tp_rank = (
+            full_tp_rank if self.use_full_tp_attention_handoff else attn_tp_rank
+        )
+        o_proj_tp_size = (
+            full_tp_size if self.use_full_tp_attention_handoff else attn_tp_size
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -149,6 +179,8 @@ class Qwen2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=True,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -156,6 +188,9 @@ class Qwen2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=o_proj_tp_rank,
+            tp_size=o_proj_tp_size,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -176,6 +211,11 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        if self.use_full_tp_attention_handoff:
+            self.attn.set_output_head_partition(
+                self.full_tp_local_num_heads,
+                get_dcp_rank() * self.full_tp_local_num_heads,
+            )
 
     def forward(
         self,
@@ -232,6 +272,24 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=False,
+            is_previous_layer_sparse=False,
+            is_next_layer_sparse=False,
+        )
+        if self.self_attn.use_full_tp_attention_handoff:
+            # Once attention hands off full-TP-shaped outputs, the residual after
+            # post-attention layernorm is also full-TP shaped. Keep that stronger
+            # layout instead of scattering back to the legacy TP-attn contract.
+            self.layer_scatter_modes.middle_residual_mode = ScatterMode.FULL
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            use_full_tp_attention_handoff=self.self_attn.use_full_tp_attention_handoff,
+        )
 
     def forward(
         self,
@@ -241,20 +299,28 @@ class Qwen2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states,
+            residual,
+            forward_batch,
         )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
         hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
         return hidden_states, residual
 
 

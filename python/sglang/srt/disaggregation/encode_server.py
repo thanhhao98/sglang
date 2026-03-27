@@ -215,7 +215,10 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
+        initialize_model_parallel(
+            tensor_model_parallel_size=server_args.tp_size,
+            decode_context_model_parallel_size=server_args.dcp_size,
+        )
         initialize_dp_attention(server_args, self.model_config)
 
         self.model = get_model(
