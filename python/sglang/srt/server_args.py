@@ -119,6 +119,76 @@ QUANTIZATION_CHOICES = [
     "quark_int4fp8_moe",
 ]
 
+
+def validate_dcp_model_layout(
+    *,
+    tp_size: int,
+    attention_tp_size: int,
+    dcp_size: int,
+    attention_tpa_enabled: bool,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    is_mla: bool,
+) -> None:
+    """Fail fast when DCP/TPA cannot produce a same-head layout for this model.
+
+    Plain DCP only works when TP already creates replicated KV-head shards.
+    TPA changes the attention layout, so it has its own head divisibility rules.
+    """
+
+    if is_mla:
+        if attention_tpa_enabled:
+            raise ValueError(
+                "Phase-1 TPA currently supports only standard KV-head attention models. "
+                "MLA models already use a different DCP layout."
+            )
+        return
+
+    if attention_tpa_enabled:
+        if num_attention_heads % attention_tp_size != 0:
+            raise ValueError(
+                "Invalid TPA config: "
+                f"attention-tensor-parallel-size={attention_tp_size} does not evenly "
+                f"split num_attention_heads={num_attention_heads}."
+            )
+        if num_key_value_heads >= attention_tp_size:
+            if num_key_value_heads % attention_tp_size != 0:
+                raise ValueError(
+                    "Invalid TPA config: "
+                    f"attention-tensor-parallel-size={attention_tp_size} does not evenly "
+                    f"split num_key_value_heads={num_key_value_heads}."
+                )
+        elif attention_tp_size % num_key_value_heads != 0:
+            raise ValueError(
+                "Invalid TPA config: "
+                f"attention-tensor-parallel-size={attention_tp_size} must be a multiple "
+                f"of num_key_value_heads={num_key_value_heads} when TP replicates KV heads."
+            )
+        return
+
+    if dcp_size <= 1:
+        return
+
+    if attention_tp_size < num_key_value_heads:
+        raise ValueError(
+            "Invalid plain DCP config: "
+            f"tp={tp_size}, effective_attention_tp={attention_tp_size}, dcp={dcp_size}, "
+            f"num_key_value_heads={num_key_value_heads}. "
+            "This model would split KV heads across ranks instead of giving DCP peers "
+            "copies of the same KV heads, so plain DCP cannot stripe one head across "
+            "different token positions."
+        )
+
+    max_plain_dcp_size = attention_tp_size // num_key_value_heads
+    if dcp_size > max_plain_dcp_size:
+        raise ValueError(
+            "Invalid plain DCP config: "
+            f"tp={tp_size}, effective_attention_tp={attention_tp_size}, dcp={dcp_size}, "
+            f"num_key_value_heads={num_key_value_heads}. "
+            f"The largest supported plain DCP size for this model is {max_plain_dcp_size}, "
+            "because TP only creates that many copies of each KV head."
+        )
+
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -436,7 +506,9 @@ class ServerArgs:
     load_balance_method: str = "auto"
 
     attn_cp_size: int = 1
+    attention_tensor_parallel_size: Optional[int] = None
     moe_dp_size: int = 1
+    dcp_size: int = 1
     dcp_comm_backend: str = "ag_rs"
 
     # Multi-node distributed serving
@@ -1085,6 +1157,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 17. Phase-1 TPA
+        if self.is_attention_tpa_enabled():
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
@@ -2442,11 +2517,57 @@ class ServerArgs:
                     self.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
 
-        dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
-        if self.dcp_comm_backend == "a2a" and dcp_size <= 1:
+        if self.attention_tensor_parallel_size is not None:
+            if self.attention_tensor_parallel_size <= 0:
+                raise ValueError("--attention-tensor-parallel-size must be positive")
+            if self.attention_tensor_parallel_size >= self.tp_size:
+                if self.attention_tensor_parallel_size == self.tp_size:
+                    self.attention_tensor_parallel_size = None
+                else:
+                    raise ValueError(
+                        "--attention-tensor-parallel-size must be less than or equal to --tp-size"
+                    )
+
+        if self.dcp_size <= 0:
+            raise ValueError("--dcp-size must be positive")
+
+        if self.dcp_size > 1 and self.tp_size % self.dcp_size != 0:
+            raise ValueError("--tp-size must be divisible by --dcp-size")
+
+        if self.dcp_comm_backend == "a2a" and self.dcp_size <= 1:
             raise ValueError(
-                "--dcp-comm-backend a2a requires SGLANG_DCP > 1"
+                "--dcp-comm-backend a2a requires --dcp-size > 1"
             )
+
+        if self.attention_tensor_parallel_size is not None:
+            if self.tp_size % self.attention_tensor_parallel_size != 0:
+                raise ValueError(
+                    "--tp-size must be divisible by --attention-tensor-parallel-size"
+                )
+            if self.attn_cp_size > 1:
+                raise ValueError(
+                    "Phase-1 TPA does not support --attention-context-parallel-size > 1"
+                )
+            if self.enable_dp_attention:
+                raise ValueError("Phase-1 TPA does not support DP attention")
+            if self.pp_size > 1:
+                raise ValueError("Phase-1 TPA does not support pipeline parallelism")
+            expected_dcp = self.tp_size // self.attention_tensor_parallel_size
+            if self.dcp_size != expected_dcp:
+                raise ValueError(
+                    "--dcp-size must equal --tp-size / --attention-tensor-parallel-size "
+                    f"for phase-1 TPA (expected {expected_dcp}, got {self.dcp_size})"
+                )
+
+    def is_attention_tpa_enabled(self) -> bool:
+        return self.attention_tensor_parallel_size is not None
+
+    def get_attention_tp_size(self) -> int:
+        if self.attention_tensor_parallel_size is not None:
+            return self.attention_tensor_parallel_size
+
+        attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+        return self.tp_size // attn_dp_size // self.attn_cp_size
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -3751,11 +3872,24 @@ class ServerArgs:
             help="The attention context parallelism size.",
         )
         parser.add_argument(
+            "--attention-tensor-parallel-size",
+            "--attn-tp-size",
+            type=int,
+            default=ServerArgs.attention_tensor_parallel_size,
+            help="Phase-1 TPA: use a smaller tensor-parallel size for attention while keeping the rest of the model on full TP.",
+        )
+        parser.add_argument(
             "--moe-data-parallel-size",
             "--moe-dp-size",
             type=int,
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
+        )
+        parser.add_argument(
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="Decode-context parallel size.",
         )
         parser.add_argument(
             "--dcp-comm-backend",

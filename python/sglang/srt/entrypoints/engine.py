@@ -1076,10 +1076,9 @@ def _set_envs_and_config(server_args: ServerArgs):
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
     if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
-        dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
-        if dcp_size > 1:
+        if server_args.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
@@ -1221,12 +1220,11 @@ def _compute_parallelism_ranks(
     server_args: ServerArgs, tp_rank: int
 ) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
     # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+    attn_tp_size = server_args.get_attention_tp_size()
     attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
     moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
     moe_ep_rank = (
