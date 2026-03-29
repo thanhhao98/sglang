@@ -101,9 +101,7 @@ class TestDCPCascadeGuard(CustomTestCase):
         for dcp_size in [2, 3, 4, 8, 16]:
             with self.subTest(dcp_size=dcp_size):
                 self.assertFalse(
-                    self._decode_cascade(
-                        dcp_size=dcp_size, has_spec_info=True, topk=4
-                    )
+                    self._decode_cascade(dcp_size=dcp_size, has_spec_info=True, topk=4)
                 )
 
     def test_extend_all_dcp_sizes_block_cascade(self):

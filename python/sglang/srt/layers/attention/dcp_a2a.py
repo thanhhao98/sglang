@@ -69,9 +69,7 @@ def _dcp_lse_combine_kernel(
         (lse_max != lse_max) | (lse_max == float("inf")), -float("inf"), lse_max
     )
     for i in tl.static_range(1, N):
-        lse_i = tl.load(recv_lse_ptr + lse_base + i * recv_lse_stride_N).to(
-            tl.float32
-        )
+        lse_i = tl.load(recv_lse_ptr + lse_base + i * recv_lse_stride_N).to(tl.float32)
         lse_i = tl.where(
             (lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i
         )
@@ -84,9 +82,7 @@ def _dcp_lse_combine_kernel(
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
 
     for i in tl.static_range(N):
-        lse_i = tl.load(recv_lse_ptr + lse_base + i * recv_lse_stride_N).to(
-            tl.float32
-        )
+        lse_i = tl.load(recv_lse_ptr + lse_base + i * recv_lse_stride_N).to(tl.float32)
         lse_i = tl.where(
             (lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i
         )
@@ -244,9 +240,7 @@ def dcp_a2a_lse_reduce(
         )
 
         # Single fused all_to_all
-        cp_group.all_to_all_single(
-            recv_combined.view(-1), send_combined.view(-1)
-        )
+        cp_group.all_to_all_single(recv_combined.view(-1), send_combined.view(-1))
 
         # Unpack output (non-contiguous view — Triton handles strides)
         recv_output = recv_combined[:, :B, :, :D]
@@ -259,7 +253,11 @@ def dcp_a2a_lse_reduce(
         # Eager path: allocate fused buffer on the fly
         send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
         send_combined = torch.empty(
-            N, B, H_per_rank, D + lpd, dtype=out_dtype,
+            N,
+            B,
+            H_per_rank,
+            D + lpd,
+            dtype=out_dtype,
             device=cp_attn_out.device,
         )
         recv_combined = torch.empty_like(send_combined)
@@ -269,13 +267,14 @@ def dcp_a2a_lse_reduce(
             send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
         )
 
-        cp_group.all_to_all_single(
-            recv_combined.view(-1), send_combined.view(-1)
-        )
+        cp_group.all_to_all_single(recv_combined.view(-1), send_combined.view(-1))
 
         recv_output = recv_combined[:, :, :, :D]
         recv_lse_stg = torch.empty(
-            N, B, H_per_rank, dtype=torch.float32,
+            N,
+            B,
+            H_per_rank,
+            dtype=torch.float32,
             device=cp_attn_out.device,
         )
         recv_lse_stg.view(out_dtype).view(N, B, H_per_rank, lpd).copy_(

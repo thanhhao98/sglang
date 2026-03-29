@@ -1,25 +1,43 @@
-: <<'result_in_h800'
-| msg_size   |   [AllGather] torch eager time |   [AllGather] pynccl symm graph time |   [ReduceScatter] pynccl eager time |   [ReduceScatter] pynccl symm graph time |
-|------------|--------------------------------|--------------------------------------|-------------------------------------|------------------------------------------|
-| 2.0 KiB    |                        33.7312 |                              2.88258 |                             34.1088 |                                  2.8155  |
-| 4.0 KiB    |                        27.4848 |                              2.97794 |                             29.6736 |                                  2.92332 |
-| 8.0 KiB    |                        25.6896 |                              3.43691 |                             25.8368 |                                  3.08607 |
-| 16.0 KiB   |                        60.4384 |                              4.94141 |                             25.28   |                                  3.14567 |
-| 32.0 KiB   |                        25.5264 |                              5.3824  |                             31.664  |                                  3.36464 |
-| 64.0 KiB   |                        26.8    |                              7.09412 |                             29.5456 |                                  3.61114 |
-result_in_h800
+#!/bin/bash
+# Benchmark symmetric-memory collectives: AllGather, ReduceScatter, All-to-All.
+#
+# Usage:
+#   bash bench_symm.sh              # 8 GPUs, all ops
+#   bash bench_symm.sh 4            # 4 GPUs, all ops
+#   bash bench_symm.sh 8 ag rs      # 8 GPUs, AG + RS only
+#
+# Results (H100 8-GPU, bf16, 500 iters, graph-loop=100):
+#
+# | msg_size   |   AG eager (us) |   AG symm graph (us) |   RS eager (us) |   RS symm graph (us) |   A2A eager (us) |   A2A symm graph (us) |
+# |------------|-----------------|----------------------|-----------------|----------------------|------------------|-----------------------|
+# | 2.0 KiB    |           14.57 |                 2.68 |           16.06 |                 2.82 |            18.34 |                  5.45 |
+# | 4.0 KiB    |           14.58 |                 2.84 |           17.48 |                 2.86 |            17.87 |                  5.51 |
+# | 8.0 KiB    |           14.42 |                 3.11 |           15.82 |                 3.00 |            17.84 |                  5.57 |
+# | 16.0 KiB   |           14.03 |                 4.70 |           18.66 |                 3.01 |            17.70 |                  5.57 |
+# | 32.0 KiB   |           14.37 |                 5.07 |           18.74 |                 3.25 |            17.90 |                  6.25 |
+# | 64.0 KiB   |           15.94 |                 5.35 |           15.89 |                 3.41 |            24.99 |                  6.82 |
+# | 128.0 KiB  |           18.14 |                 6.90 |           17.12 |                 4.24 |            21.18 |                  7.00 |
+#
+# Symm-mem CUDA graph speedup over torch eager:
+#   AllGather:     2.6-5.4x
+#   ReduceScatter: 4.0-6.2x
+#   All-to-All:    3.0-3.6x
 
-export PER_NODE_GPU=8
-export WORLD_SIZE=1
-export RANK=0
-export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=12345
+set -euo pipefail
+
+NGPU=${1:-8}
+shift 2>/dev/null || true
+OPS="${@:-ag rs a2a}"
+
 export NCCL_GRAPH_MIXING_SUPPORT=0
 export NCCL_CUMEM_ENABLE=1
 export NCCL_NVLS_ENABLE=2
 
-torchrun  --nproc_per_node $PER_NODE_GPU \
-          --nnodes $WORLD_SIZE \
-          --node_rank $RANK \
-          --master_addr $MASTER_ADDR \
-          --master_port $MASTER_PORT benchmark_symm_mem.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+torchrun --nproc_per_node "$NGPU" \
+    "$SCRIPT_DIR/benchmark_symm_mem.py" \
+    --ops $OPS \
+    --warmup 10 \
+    --iters 1000 \
+    --graph-loop 100

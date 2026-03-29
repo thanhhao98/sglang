@@ -9,8 +9,8 @@ Step 2: Simulate DCP by sharding KV across N virtual ranks, running
 import unittest
 
 import torch
-
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -120,9 +120,7 @@ def shard_kv_for_dcp(
         for p in range(local_pages_per_seq):
             local_page_table[b, p] = b * local_pages_per_seq + p
 
-    local_seqlens = torch.tensor(
-        local_tokens_per_seq, dtype=torch.int32, device=device
-    )
+    local_seqlens = torch.tensor(local_tokens_per_seq, dtype=torch.int32, device=device)
     return k_local, v_local, local_page_table, local_seqlens
 
 
@@ -143,9 +141,7 @@ class TestFA3MLASingleGPU(CustomTestCase):
         q_rope = torch.randn(
             B, 1, H_q, d_rope, device=self.device, dtype=torch.bfloat16
         )
-        qv = torch.randn(
-            B, 1, H_q, d_nope, device=self.device, dtype=torch.bfloat16
-        )
+        qv = torch.randn(B, 1, H_q, d_nope, device=self.device, dtype=torch.bfloat16)
 
         k_cache, v_cache, _ = build_kv_cache(
             B * seq_len, H_kv, d_rope, d_nope, page_size, self.device
@@ -170,9 +166,7 @@ class TestFA3MLASingleGPU(CustomTestCase):
         q_rope = torch.randn(
             B, 1, H_q, d_rope, device=self.device, dtype=torch.bfloat16
         )
-        qv = torch.randn(
-            B, 1, H_q, d_nope, device=self.device, dtype=torch.bfloat16
-        )
+        qv = torch.randn(B, 1, H_q, d_nope, device=self.device, dtype=torch.bfloat16)
         k_cache, v_cache, _ = build_kv_cache(
             B * seq_len, H_kv, d_rope, d_nope, page_size, self.device
         )
@@ -208,9 +202,7 @@ class TestFA3MLASimulatedDCP(CustomTestCase):
         q_rope = torch.randn(
             B, 1, H_q, d_rope, device=self.device, dtype=torch.bfloat16
         )
-        qv = torch.randn(
-            B, 1, H_q, d_nope, device=self.device, dtype=torch.bfloat16
-        )
+        qv = torch.randn(B, 1, H_q, d_nope, device=self.device, dtype=torch.bfloat16)
 
         total_tokens = B * seq_len
         k_full, v_full, _ = build_kv_cache(

@@ -2594,9 +2594,7 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
         if self.dcp_comm_backend == "a2a" and self.dcp_size <= 1:
-            raise ValueError(
-                "--dcp-comm-backend a2a requires --dcp-size > 1"
-            )
+            raise ValueError("--dcp-comm-backend a2a requires --dcp-size > 1")
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

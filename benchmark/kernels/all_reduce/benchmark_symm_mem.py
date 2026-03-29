@@ -1,407 +1,273 @@
-import os
-from contextlib import nullcontext
-from typing import List
+"""
+Benchmark symmetric-memory collectives: AllGather, ReduceScatter, All-to-All.
+
+Compares torch.distributed eager vs PyNccl symmetric-memory CUDA graph for each
+collective across a sweep of message sizes.
+
+Usage:
+    torchrun --nproc_per_node=8 benchmark_symm_mem.py
+    torchrun --nproc_per_node=8 benchmark_symm_mem.py --warmup 10 --iters 200
+    torchrun --nproc_per_node=4 benchmark_symm_mem.py --ops ag rs a2a
+"""
+
+import argparse
+from typing import Dict, List
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     SymmetricMemoryContext,
 )
-from sglang.srt.distributed.device_communicators.torch_symm_mem import (
-    TorchSymmMemCommunicator,
-)
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
-    set_torch_symm_mem_all_reduce,
-)
-
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
 
-def torch_allgather(
-    torch_output: torch.Tensor, torch_input: torch.Tensor, group: ProcessGroup
-) -> torch.Tensor:
-    dist.all_gather_into_tensor(torch_output, torch_input, group=group)
-
-
-def torch_reduce_scatter(
-    output_tensor: torch.Tensor, input_tensor: torch.Tensor, group: ProcessGroup
-) -> torch.Tensor:
-    dist.reduce_scatter_tensor(
-        output_tensor,
-        input_tensor,
-        group=group,
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Benchmark symmetric-memory collectives across message sizes."
     )
-    return output_tensor
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations.")
+    parser.add_argument(
+        "--iters", type=int, default=1000, help="Benchmark iterations per size."
+    )
+    parser.add_argument(
+        "--graph-loop",
+        type=int,
+        default=100,
+        help="Ops per CUDA graph replay (amortizes launch overhead).",
+    )
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        default=["ag", "rs", "a2a"],
+        choices=["ag", "rs", "a2a"],
+        help="Which collectives to benchmark.",
+    )
+    parser.add_argument(
+        "--min-exp", type=int, default=10, help="Min message size as 2^N bytes."
+    )
+    parser.add_argument(
+        "--max-exp", type=int, default=16, help="Max message size as 2^N bytes."
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16", "fp32"],
+        help="Data type for tensors.",
+    )
+    return parser.parse_args()
 
 
-def _bench_eager_time_w_out(func, output, inp_randn, warmup_loop=2, test_loop=10):
-    eager_input = inp_randn.clone()
+def get_dtype(name: str) -> torch.dtype:
+    return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[name]
 
-    for _ in range(warmup_loop):
+
+def human_size(nbytes: int) -> str:
+    for unit in ["B", "KiB", "MiB", "GiB"]:
+        if nbytes < 1024.0 or unit == "GiB":
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+    return f"{nbytes:.1f} GiB"
+
+
+def bench_eager(func, output, inp, warmup: int, iters: int) -> float:
+    """Benchmark an eager collective. Returns average latency in microseconds."""
+    eager_input = inp.clone()
+    for _ in range(warmup):
         func(output, eager_input)
     torch.cuda.synchronize()
     dist.barrier()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
-    start_event.record()
-    for _ in range(test_loop):
+    start.record()
+    for _ in range(iters):
         func(output, eager_input)
-    end_event.record()
+    end.record()
     torch.cuda.synchronize()
-    func_cost_us = start_event.elapsed_time(end_event) / test_loop * 1000
-
-    return output, func_cost_us
+    return start.elapsed_time(end) / iters * 1000  # ms -> us
 
 
-def pynccl_allgather_symmetric(
-    pynccl_output: torch.Tensor,
-    pynccl_input: torch.Tensor,
-    pynccl_comm: PyNcclCommunicator,
-) -> torch.Tensor:
-    pynccl_comm.all_gather(pynccl_output, pynccl_input)
-    return pynccl_output
+def bench_symm_graph(
+    func, output, inp, group, warmup: int, iters: int, graph_loop: int
+) -> float:
+    """Benchmark a collective with symmetric memory + CUDA graph. Returns avg us."""
+    with SymmetricMemoryContext(group):
+        graph_input = inp.clone()
+        graph_output = output.clone()
 
-
-def pynccl_reduce_scatter_symmetric(
-    pynccl_output: torch.Tensor,
-    pynccl_input: torch.Tensor,
-    pynccl_comm: PyNcclCommunicator,
-) -> torch.Tensor:
-    pynccl_comm.reduce_scatter(pynccl_output, pynccl_input)
-    return pynccl_output
-
-
-def _bench_graph_time_w_out_symm(
-    func, out, inp_randn, warmup_loop=10, graph_loop=100, test_loop=1000
-):
-    with SymmetricMemoryContext(get_tensor_model_parallel_group()):
-        graph_input = inp_randn.clone()
-        graph_out = out.clone()
-
-    with graph_capture() as graph_capture_context:
+    with graph_capture() as ctx:
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=graph_capture_context.stream):
+        with torch.cuda.graph(graph, stream=ctx.stream):
             for _ in range(graph_loop):
-                func_output = func(graph_out, graph_input)
+                func(graph_output, graph_input)
 
     graph.replay()
-    func_output = graph_out.clone()
 
-    for _ in range(warmup_loop):
+    for _ in range(warmup):
         graph.replay()
     torch.cuda.synchronize()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
     latencies: List[float] = []
-    for _ in range(test_loop):
+    for _ in range(iters):
         torch.cuda.synchronize()
         dist.barrier()
-        start_event.record()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         graph.replay()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    func_cost_us = sum(latencies) / len(latencies) / graph_loop * 1000
+        end.record()
+        end.synchronize()
+        latencies.append(start.elapsed_time(end))
+
     graph.reset()
-    return func_output, func_cost_us
+    return sum(latencies) / len(latencies) / graph_loop * 1000  # ms -> us
 
 
-def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:
-    dist.all_reduce(torch_input, group=group)
-    return torch_input
-
-
-def torch_symm_mem_allreduce(
-    torch_symm_mem_input: torch.Tensor, torch_symm_mem_comm: TorchSymmMemCommunicator
-) -> torch.Tensor:
-    return torch_symm_mem_comm.all_reduce(torch_symm_mem_input)
-
-
-def pynccl_allreduce(
-    pynccl_input: torch.Tensor, pynccl_comm: PyNcclCommunicator
-) -> torch.Tensor:
-    pynccl_comm.all_reduce(pynccl_input)
-    return pynccl_input
-
-
-# def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
-#     graph_input = inp_randn.clone()
-#     with graph_capture() as graph_capture_context:
-#         graph = torch.cuda.CUDAGraph()
-#         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-#             for _ in range(graph_loop):
-#                 graph_out = func(graph_input)
-
-#     graph.replay()
-#     func_output = graph_out.clone()
-
-#     for _ in range(warmup_loop):
-#         graph.replay()
-#     torch.cuda.synchronize()
-
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     end_event = torch.cuda.Event(enable_timing=True)
-
-#     latencies: List[float] = []
-#     for _ in range(test_loop):
-#         torch.cuda.synchronize()
-#         dist.barrier()
-#         start_event.record()
-#         graph.replay()
-#         end_event.record()
-#         end_event.synchronize()
-#         latencies.append(start_event.elapsed_time(end_event))
-#     func_cost_us = sum(latencies) / len(latencies) / graph_loop * 1000
-#     graph.reset()
-#     return func_output, func_cost_us
-
-
-# def _bench_graph_time_symm(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
-#     with SymmetricMemoryContext(get_tensor_model_parallel_group()):
-#         graph_input = inp_randn.clone()
-
-#     with graph_capture() as graph_capture_context:
-#         graph = torch.cuda.CUDAGraph()
-#         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-#             for _ in range(graph_loop):
-#                 graph_out = func(graph_input)
-
-#     graph.replay()
-#     func_output = graph_out.clone()
-
-#     for _ in range(warmup_loop):
-#         graph.replay()
-#     torch.cuda.synchronize()
-
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     end_event = torch.cuda.Event(enable_timing=True)
-
-#     latencies: List[float] = []
-#     for _ in range(test_loop):
-#         torch.cuda.synchronize()
-#         dist.barrier()
-#         start_event.record()
-#         graph.replay()
-#         end_event.record()
-#         end_event.synchronize()
-#         latencies.append(start_event.elapsed_time(end_event))
-#     func_cost_us = sum(latencies) / len(latencies) / graph_loop * 1000
-#     graph.reset()
-#     return func_output, func_cost_us
-
-
-# def _bench_eager_time(func, inp_randn, warmup_loop=2, test_loop=10):
-#     eager_input = inp_randn.clone()
-#     eager_output = func(eager_input)
-#     func_output = eager_output.clone()
-
-#     for _ in range(warmup_loop):
-#         func(eager_input)
-#     torch.cuda.synchronize()
-
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     end_event = torch.cuda.Event(enable_timing=True)
-#     torch.cuda.synchronize()
-#     start_event.record()
-#     for _ in range(test_loop):
-#         func(eager_input)
-#     end_event.record()
-#     torch.cuda.synchronize()
-#     func_cost_us = start_event.elapsed_time(end_event) / test_loop * 1000
-
-#     return func_output, func_cost_us
-
-
-def get_torch_prof_ctx(do_prof: bool):
-    ctx = (
-        torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=True,
-            with_stack=True,
-        )
-        if do_prof
-        else nullcontext()
-    )
-    return ctx
-
-
-def human_readable_size(size, decimal_places=1):
-    for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
-        if size < 1024.0 or unit == "PiB":
-            break
-        size /= 1024.0
-    return f"{size:.{decimal_places}f} {unit}"
-
-
-try:
-    from tabulate import tabulate
-except ImportError:
-    print("tabulate not installed, skipping table printing")
-    tabulate = None
-
-
-def print_markdown_table(data):
-    if tabulate is not None:
-        print(tabulate(data, headers="keys", tablefmt="github"))
+def print_table(data: List[Dict[str, str]]):
+    if not data:
         return
-    headers = data[0].keys()
-    header_row = "| " + " | ".join(headers) + " |"
-    separator = "| " + " | ".join(["---"] * len(headers)) + " |"
-    rows = []
-    for item in data:
-        row = "| " + " | ".join(str(item[key]) for key in headers) + " |"
-        rows.append(row)
-    markdown_table = "\n".join([header_row, separator] + rows)
-    print(markdown_table)
+    try:
+        from tabulate import tabulate
+
+        print(tabulate(data, headers="keys", tablefmt="github", floatfmt=".2f"))
+    except ImportError:
+        headers = list(data[0].keys())
+        print("| " + " | ".join(headers) + " |")
+        print("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in data:
+            print("| " + " | ".join(str(row[h]) for h in headers) + " |")
+
+
+def main():
+    args = parse_args()
+    dtype = get_dtype(args.dtype)
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(rank % 8)
+    device = torch.cuda.current_device()
+
+    init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank % 8)
+    initialize_model_parallel(tensor_model_parallel_size=world_size)
+
+    tp_group = get_tensor_model_parallel_group()
+    nccl_group = tp_group.device_group
+    pynccl_comm: PyNcclCommunicator = tp_group.pynccl_comm
+    dist.barrier()
+
+    results: List[Dict] = []
+
+    for exp in range(args.min_exp, args.max_exp + 1):
+        sz = 2**exp
+        if sz * dtype.itemsize > 2**24:
+            break
+
+        inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+        row: Dict = {"msg_size": human_size(inp.nbytes)}
+
+        # -- AllGather --
+        if "ag" in args.ops:
+            ag_out = torch.empty(sz * world_size, dtype=dtype, device=device)
+
+            eager_us = bench_eager(
+                lambda o, i: dist.all_gather_into_tensor(o, i, group=nccl_group),
+                ag_out,
+                inp,
+                args.warmup,
+                args.iters,
+            )
+            graph_us = bench_symm_graph(
+                lambda o, i: pynccl_comm.all_gather(o, i),
+                ag_out,
+                inp,
+                tp_group,
+                args.warmup,
+                args.iters,
+                args.graph_loop,
+            )
+
+            row["AG eager (us)"] = f"{eager_us:.2f}"
+            row["AG symm graph (us)"] = f"{graph_us:.2f}"
+
+            if rank == 0:
+                print(f"AG sz={sz}: eager={eager_us:.2f}us graph={graph_us:.2f}us")
+
+        # -- ReduceScatter --
+        if "rs" in args.ops:
+            rs_out = torch.empty(sz // world_size, dtype=dtype, device=device)
+
+            eager_us = bench_eager(
+                lambda o, i: dist.reduce_scatter_tensor(o, i, group=nccl_group),
+                rs_out,
+                inp,
+                args.warmup,
+                args.iters,
+            )
+            graph_us = bench_symm_graph(
+                lambda o, i: pynccl_comm.reduce_scatter(o, i),
+                rs_out,
+                inp,
+                tp_group,
+                args.warmup,
+                args.iters,
+                args.graph_loop,
+            )
+
+            row["RS eager (us)"] = f"{eager_us:.2f}"
+            row["RS symm graph (us)"] = f"{graph_us:.2f}"
+
+            if rank == 0:
+                print(f"RS sz={sz}: eager={eager_us:.2f}us graph={graph_us:.2f}us")
+
+        # -- All-to-All --
+        if "a2a" in args.ops:
+            a2a_out = torch.empty_like(inp)
+
+            eager_us = bench_eager(
+                lambda o, i: dist.all_to_all_single(o, i, group=nccl_group),
+                a2a_out,
+                inp,
+                args.warmup,
+                args.iters,
+            )
+            graph_us = bench_symm_graph(
+                lambda o, i: pynccl_comm.all_to_all_single(o, i),
+                a2a_out,
+                inp,
+                tp_group,
+                args.warmup,
+                args.iters,
+                args.graph_loop,
+            )
+
+            row["A2A eager (us)"] = f"{eager_us:.2f}"
+            row["A2A symm graph (us)"] = f"{graph_us:.2f}"
+
+            if rank == 0:
+                print(f"A2A sz={sz}: eager={eager_us:.2f}us graph={graph_us:.2f}us")
+
+        results.append(row)
+
+    if rank == 0:
+        print("\n=== Results ===")
+        print_table(results)
+
+    dist.barrier()
+    # Skip dist.destroy_process_group() -- symmetric memory + NCCL cleanup
+    # order causes segfaults; torchrun handles process lifecycle.
 
 
 if __name__ == "__main__":
-    import logging
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    world, world_size = dist.group.WORLD, dist.get_world_size()
-    rank = dist.get_rank()
-    torch.cuda.set_device(rank % 8)
-    device = torch.cuda.current_device()
-    set_torch_symm_mem_all_reduce(True)
-    init_distributed_environment(
-        world_size=world_size,
-        rank=rank,
-        local_rank=rank % 8,
-    )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
-    group = get_tensor_model_parallel_group().device_group
-    cpu_group = get_tensor_model_parallel_group().cpu_group
-    pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
-    torch_symm_mem_comm = get_tensor_model_parallel_group().torch_symm_mem_comm
-    dist.barrier()
-    profile = False
-    dtype = torch.bfloat16
-    ctx = get_torch_prof_ctx(profile)
-    result = []
-
-    with ctx:
-        if IS_CI:
-            i_range = range(10, 11)
-        else:
-            i_range = range(10, 16)
-        for i in i_range:
-            sz = 2**i
-            if sz * dtype.itemsize > 2**24:
-                break
-            inp_randn = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
-
-            # bench all_gather
-            ag_output_size = sz * world_size
-            ag_output_tensor = torch.empty(
-                (ag_output_size,), dtype=dtype, device=device
-            )
-            torch_eager_ag_output, torch_eager_ag_time = _bench_eager_time_w_out(
-                lambda out, inp: torch_allgather(out, inp, group),
-                ag_output_tensor,
-                inp_randn,
-            )
-            pynccl_symm_ag_output, pynccl_symm_ag_graph_time = (
-                _bench_graph_time_w_out_symm(
-                    lambda out, inp: pynccl_allgather_symmetric(out, inp, pynccl_comm),
-                    ag_output_tensor,
-                    inp_randn,
-                )
-            )
-            torch.testing.assert_close(torch_eager_ag_output, pynccl_symm_ag_output)
-
-            # bench reduce_scatter
-            rs_output_size = sz // world_size
-            rs_output_tensor = torch.empty(
-                (rs_output_size,), dtype=dtype, device=device
-            )
-            torch_eager_rs_output, torch_eager_rs_time = _bench_eager_time_w_out(
-                lambda out, inp: torch_reduce_scatter(out, inp, group),
-                rs_output_tensor,
-                inp_randn,
-            )
-            pynccl_symm_rs_output, pynccl_symm_rs_graph_time = (
-                _bench_graph_time_w_out_symm(
-                    lambda out, inp: pynccl_reduce_scatter_symmetric(
-                        out, inp, pynccl_comm
-                    ),
-                    rs_output_tensor,
-                    inp_randn,
-                )
-            )
-            torch.testing.assert_close(torch_eager_rs_output, pynccl_symm_rs_output)
-
-            #         torch_eager_output, torch_eager_time = _bench_eager_time(
-            #             lambda inp: torch_allreduce(inp, group), inp_randn
-            #         )
-            #         symm_mem_eager_output, symm_mem_eager_time = _bench_eager_time(
-            #             lambda inp: torch_symm_mem_allreduce(inp, torch_symm_mem_comm),
-            #             inp_randn,
-            #         )
-            #         symm_mem_graph_output, symm_mem_graph_time = _bench_graph_time(
-            #             lambda inp: torch_symm_mem_allreduce(inp, torch_symm_mem_comm),
-            #             inp_randn,
-            #         )
-            #         # since pynccl is inplace op, this return result is not correct if graph loop > 1
-            #         pynccl_ar_output, pynccl_graph_time = _bench_graph_time(
-            #             lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
-            #         )
-
-            #         pynccl_symm_ar_output, pynccl_symm_graph_time = _bench_graph_time_symm(
-            #             lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
-            #         )
-
-            #         # print(f"{torch_eager_output=}", flush=True)
-            #         # print(f"{symm_mem_graph_output=}", flush=True)
-            #         # print(f"{pynccl_ar_output=}", flush=True)
-            #         # print(f"{pynccl_symm_ar_output=}", flush=True)
-            #         torch.testing.assert_close(torch_eager_output, symm_mem_graph_output)
-            #         torch.testing.assert_close(torch_eager_output, symm_mem_eager_output)
-            #         # torch.testing.assert_close(torch_eager_output, pynccl_ar_output)
-            #         # torch.testing.assert_close(torch_eager_output, pynccl_symm_ar_output)
-
-            result.append(
-                {
-                    "msg_size": human_readable_size(inp_randn.nbytes),
-                    # "symm mem eager time": symm_mem_eager_time,
-                    # "symm mem graph time": symm_mem_graph_time,
-                    # "pynccl graph time": pynccl_graph_time,
-                    "[AllGather] torch eager time": torch_eager_ag_time,
-                    "[AllGather] pynccl symm graph time": pynccl_symm_ag_graph_time,
-                    "[ReduceScatter] pynccl eager time": torch_eager_rs_time,
-                    "[ReduceScatter] pynccl symm graph time": pynccl_symm_rs_graph_time,
-                }
-            )
-            if rank == 0:
-                print(f"sz={sz}, dtype={dtype}: correctness check PASS!")
-    if rank == 0:
-        print_markdown_table(result)
-    if profile:
-        prof_dir = f"prof/torch_symm_mem"
-        os.makedirs(prof_dir, exist_ok=True)
-        ctx.export_chrome_trace(f"{prof_dir}/trace_rank{dist.get_rank()}.json.gz")
+    main()

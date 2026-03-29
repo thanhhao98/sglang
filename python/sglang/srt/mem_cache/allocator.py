@@ -155,9 +155,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if local_count > len(self.free_pages):
                 return None
 
-            result = torch.full(
-                (need_size,), -1, dtype=torch.int64, device=self.device
-            )
+            result = torch.full((need_size,), -1, dtype=torch.int64, device=self.device)
             result[local_mask] = self.free_pages[:local_count]
             self.free_pages = self.free_pages[local_count:]
             return result

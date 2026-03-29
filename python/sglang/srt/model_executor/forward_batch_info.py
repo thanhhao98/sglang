@@ -54,7 +54,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (  # noqa: F401
     ForwardBatchDeepSeekMHAMixin,
     create_chunked_prefix_cache_kv_indices,
 )

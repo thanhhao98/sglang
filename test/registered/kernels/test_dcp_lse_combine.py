@@ -38,9 +38,7 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
 
         torch.manual_seed(42)
 
-        partial_outputs = torch.randn(
-            N, B, H_local, D, device=self.device, dtype=dtype
-        )
+        partial_outputs = torch.randn(N, B, H_local, D, device=self.device, dtype=dtype)
         if is_base_e:
             partial_lses = torch.randn(
                 N, B, H_local, device=self.device, dtype=torch.float32

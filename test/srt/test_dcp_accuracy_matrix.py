@@ -32,25 +32,26 @@ BASE_URL = f"http://127.0.0.1:{PORT}"
 MODEL = "deepseek-ai/DeepSeek-V2-Lite"
 
 REQUEST_TYPES = {
-    "prefill_only":  {"input": 2048, "output": 1},
-    "decode_heavy":  {"input": 32,   "output": 512},
-    "mixed":         {"input": 512,  "output": 256},
+    "prefill_only": {"input": 2048, "output": 1},
+    "decode_heavy": {"input": 32, "output": 512},
+    "mixed": {"input": 512, "output": 256},
 }
 
 # DCP KV sharding is wired in deepseek_v2.py, so all DCP tests use DeepSeek-V2-Lite.
 # Server configs: (model, backend, dcp_comm, cuda_graph)
 SERVER_CONFIGS = [
     # FA3 first (exercises flashattention_backend.py DCP path)
-    (MODEL, "fa3",        "a2a",   False),
-    (MODEL, "fa3",        "ag_rs", False),
-    (MODEL, "fa3",        "a2a",   True),
-    (MODEL, "fa3",        "ag_rs", True),
+    (MODEL, "fa3", "a2a", False),
+    (MODEL, "fa3", "ag_rs", False),
+    (MODEL, "fa3", "a2a", True),
+    (MODEL, "fa3", "ag_rs", True),
     # FlashInfer (exercises deepseek_v2.py DCP path)
     (MODEL, "flashinfer", "ag_rs", True),
     (MODEL, "flashinfer", "ag_rs", False),
-    (MODEL, "flashinfer", "a2a",   False),
-    (MODEL, "flashinfer", "a2a",   True),
+    (MODEL, "flashinfer", "a2a", False),
+    (MODEL, "flashinfer", "a2a", True),
 ]
+
 
 def _build_scenarios():
     scenarios = []
@@ -66,6 +67,7 @@ def _build_scenarios():
             scenarios.append((sid, model, backend, dcp_comm, cuda_graph, req_type))
     return scenarios
 
+
 SCENARIOS = _build_scenarios()
 
 
@@ -75,13 +77,23 @@ def log(msg):
 
 def generate(prompt, max_tokens, temperature=0):
     """Send a generate request via curl (avoids requests dependency)."""
-    payload = json.dumps({
-        "text": prompt,
-        "sampling_params": {"max_new_tokens": max_tokens, "temperature": temperature},
-    })
+    payload = json.dumps(
+        {
+            "text": prompt,
+            "sampling_params": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+            },
+        }
+    )
     cmd = [
-        "curl", "-s", "-H", "Content-Type: application/json",
-        f"{BASE_URL}/generate", "-d", payload,
+        "curl",
+        "-s",
+        "-H",
+        "Content-Type: application/json",
+        f"{BASE_URL}/generate",
+        "-d",
+        payload,
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -102,7 +114,9 @@ def wait_for_server(timeout=600):
         try:
             result = subprocess.run(
                 ["curl", "-s", f"{BASE_URL}/get_model_info"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode == 0 and "model_path" in result.stdout:
                 return True
@@ -119,30 +133,47 @@ def start_server(model, backend, dcp_comm, cuda_graph_enabled):
     env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
     cmd = [
-        sys.executable, "-m", "sglang.launch_server",
-        "--model-path", model,
-        "--host", "0.0.0.0", "--port", str(PORT),
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        model,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(PORT),
         "--trust-remote-code",
-        "--tp-size", str(NUM_GPUS),
-        "--dcp-size", str(NUM_GPUS),
-        "--mem-fraction-static", "0.80",
-        "--chunked-prefill-size", "32768",
-        "--context-length", "262144",
-        "--attention-backend", backend,
+        "--tp-size",
+        str(NUM_GPUS),
+        "--dcp-size",
+        str(NUM_GPUS),
+        "--mem-fraction-static",
+        "0.80",
+        "--chunked-prefill-size",
+        "32768",
+        "--context-length",
+        "262144",
+        "--attention-backend",
+        backend,
         "--disable-radix-cache",
         "--enable-symm-mem",
-        "--dcp-comm-backend", dcp_comm,
+        "--dcp-comm-backend",
+        dcp_comm,
     ]
 
     if not cuda_graph_enabled:
         cmd.append("--disable-cuda-graph")
 
     model_short = model.split("/")[-1]
-    log(f"  Starting server: model={model_short} backend={backend} "
-        f"dcp={dcp_comm} cuda_graph={cuda_graph_enabled}")
+    log(
+        f"  Starting server: model={model_short} backend={backend} "
+        f"dcp={dcp_comm} cuda_graph={cuda_graph_enabled}"
+    )
     proc = subprocess.Popen(
-        cmd, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
     return proc
@@ -161,7 +192,8 @@ def stop_server(proc):
         try:
             out = subprocess.check_output(
                 ["ps", "--ppid", str(parent_pid), "-o", "pid=", "--no-headers"],
-                text=True, timeout=5,
+                text=True,
+                timeout=5,
             )
             for line in out.strip().splitlines():
                 child = int(line.strip())
@@ -195,7 +227,7 @@ def run_request_type(req_type):
     output_len = cfg["output"]
 
     prompt = "Hello " * (input_len // 2)
-    prompt = prompt[:input_len * 4]
+    prompt = prompt[: input_len * 4]
 
     text, err = generate(prompt, output_len)
     if err:
@@ -232,7 +264,9 @@ def main():
     scenario_idx = 0
     for (model, backend, dcp_comm, cuda_graph), scenario_list in server_configs.items():
         model_short = model.split("/")[-1]
-        log(f"=== Server: {model_short} / {backend} / {dcp_comm} / cuda_graph={cuda_graph} ===")
+        log(
+            f"=== Server: {model_short} / {backend} / {dcp_comm} / cuda_graph={cuda_graph} ==="
+        )
         proc = start_server(model, backend, dcp_comm, cuda_graph)
 
         if not wait_for_server():

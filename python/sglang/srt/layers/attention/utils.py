@@ -753,7 +753,9 @@ def _correct_attn_cp_out_kernel(
 
 
 def correct_attn_out(
-    out: torch.Tensor, lses: torch.Tensor, cp_rank: int,
+    out: torch.Tensor,
+    lses: torch.Tensor,
+    cp_rank: int,
     is_lse_base_on_e: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
@@ -833,6 +835,8 @@ def cp_lse_ag_out_rs(
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, is_lse_base_on_e)
+    out, _ = correct_attn_out(
+        cp_attn_out, lses, cp_group.rank_in_group, is_lse_base_on_e
+    )
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out

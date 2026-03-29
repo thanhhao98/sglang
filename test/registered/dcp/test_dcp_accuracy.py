@@ -63,8 +63,7 @@ def _run_gsm8k(test_case, label):
 
     if is_in_ci():
         write_github_step_summary(
-            f"### test_gsm8k ({label})\n"
-            f'{metrics["accuracy"]=:.3f}\n'
+            f"### test_gsm8k ({label})\n" f'{metrics["accuracy"]=:.3f}\n'
         )
     test_case.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 

@@ -1447,9 +1447,7 @@ class GroupCoordinator:
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_to_all_single(output, input)
         else:
-            torch.distributed.all_to_all_single(
-                output, input, group=self.device_group
-            )
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def destroy(self):
         if self.device_group is not None:

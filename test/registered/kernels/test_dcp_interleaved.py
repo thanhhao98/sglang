@@ -191,12 +191,12 @@ class TestDCPInterleavedTokenAllocator(CustomTestCase):
                 else:
                     self.assertEqual(indices[pos].item(), -1)
 
-            self.assertEqual(initial_available - allocator.available_size(), expected_count)
+            self.assertEqual(
+                initial_available - allocator.available_size(), expected_count
+            )
 
             allocated_indices = indices[indices >= 0]
-            self.assertEqual(
-                len(torch.unique(allocated_indices)), expected_count
-            )
+            self.assertEqual(len(torch.unique(allocated_indices)), expected_count)
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -404,9 +404,7 @@ class TestDCPInterleavedPagedAllocator(CustomTestCase):
 
             allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
-            self.assertEqual(
-                len(torch.unique(allocated_indices)), expected_count
-            )
+            self.assertEqual(len(torch.unique(allocated_indices)), expected_count)
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -458,9 +456,7 @@ class TestDCPInterleavedPagedAllocator(CustomTestCase):
             allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
             if expected_count > 0:
-                self.assertEqual(
-                    len(torch.unique(allocated_indices)), expected_count
-                )
+                self.assertEqual(len(torch.unique(allocated_indices)), expected_count)
 
 
 if __name__ == "__main__":

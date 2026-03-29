@@ -1202,9 +1202,7 @@ class FlashAttentionBackend(AttentionBackend):
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
         use_dcp = self.dcp_size > 1
         use_cascade_attn = (
-            forward_batch.spec_info is not None
-            and self.topk > 1
-            and not use_dcp
+            forward_batch.spec_info is not None and self.topk > 1 and not use_dcp
         )
         need_lse = use_cascade_attn or use_dcp
 
@@ -1388,14 +1386,18 @@ class FlashAttentionBackend(AttentionBackend):
                         lse_2d = softmax_lse.view(B_out, H_out)
                     if self.dcp_comm_backend == "a2a":
                         o = dcp_a2a_lse_reduce(
-                            o, lse_2d, get_dcp_group(),
+                            o,
+                            lse_2d,
+                            get_dcp_group(),
                             is_lse_base_on_e=True,
                             cuda_graph_buffers=getattr(
                                 self, "dcp_cuda_graph_buffers", None
                             ),
                         )
                     else:
-                        o = cp_lse_ag_out_rs(o, lse_2d, get_dcp_group(), is_lse_base_on_e=True)
+                        o = cp_lse_ag_out_rs(
+                            o, lse_2d, get_dcp_group(), is_lse_base_on_e=True
+                        )
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
@@ -1435,7 +1437,9 @@ class FlashAttentionBackend(AttentionBackend):
                 v_cache=c_kv_cache,
                 qv=q_nope,
                 page_table=dcp_pt if dcp_pt is not None else metadata.page_table,
-                cache_seqlens=dcp_sl if dcp_sl is not None else metadata.cache_seqlens_int32,
+                cache_seqlens=(
+                    dcp_sl if dcp_sl is not None else metadata.cache_seqlens_int32
+                ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=None if use_dcp else metadata.cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
@@ -1564,10 +1568,15 @@ class FlashAttentionBackend(AttentionBackend):
         if self.dcp_size > 1:
             max_local_pages = (max_num_pages + self.dcp_size - 1) // self.dcp_size
             self.decode_cuda_graph_metadata["dcp_page_table"] = torch.zeros(
-                max_bs, max_local_pages, dtype=torch.int32, device=self.device,
+                max_bs,
+                max_local_pages,
+                dtype=torch.int32,
+                device=self.device,
             )
             self.decode_cuda_graph_metadata["dcp_cache_seqlens"] = torch.zeros(
-                max_bs, dtype=torch.int32, device=self.device,
+                max_bs,
+                dtype=torch.int32,
+                device=self.device,
             )
 
         if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
@@ -2451,26 +2460,43 @@ class FlashAttentionBackend(AttentionBackend):
 
         buffers = {
             "q_gathered": torch.empty(
-                bs, H_all, self.dcp_head_dim,
-                dtype=self.dcp_dtype, device=self.device,
+                bs,
+                H_all,
+                self.dcp_head_dim,
+                dtype=self.dcp_dtype,
+                device=self.device,
             ),
             # Fused output+LSE buffer: [N, bs, H_per_rank, D + lse_pack_dim]
             "send_combined": torch.empty(
-                N, bs, H_per_rank, D + lpd,
-                dtype=self.dcp_dtype, device=self.device,
+                N,
+                bs,
+                H_per_rank,
+                D + lpd,
+                dtype=self.dcp_dtype,
+                device=self.device,
             ),
             "recv_combined": torch.empty(
-                N, bs, H_per_rank, D + lpd,
-                dtype=self.dcp_dtype, device=self.device,
+                N,
+                bs,
+                H_per_rank,
+                D + lpd,
+                dtype=self.dcp_dtype,
+                device=self.device,
             ),
             # fp32 staging buffers for LSE pack/unpack
             "send_lse": torch.empty(
-                N, bs, H_per_rank,
-                dtype=torch.float32, device=self.device,
+                N,
+                bs,
+                H_per_rank,
+                dtype=torch.float32,
+                device=self.device,
             ),
             "recv_lse": torch.empty(
-                N, bs, H_per_rank,
-                dtype=torch.float32, device=self.device,
+                N,
+                bs,
+                H_per_rank,
+                dtype=torch.float32,
+                device=self.device,
             ),
         }
         self.dcp_cuda_graph_buffers_per_bs[bs] = buffers
@@ -2496,7 +2522,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         local_seqlens = ((full_seqlens - dcp_rank - 1) // N + 1).clamp(min=0)
 
-        global_pt = metadata.page_table  # [B, max_pages] (page indices, already strided)
+        global_pt = (
+            metadata.page_table
+        )  # [B, max_pages] (page indices, already strided)
         max_global_pages = global_pt.shape[1]
 
         # Compute local page count per request
@@ -2521,9 +2549,7 @@ class FlashAttentionBackend(AttentionBackend):
             if not valid_mask.all():
                 local_pt[:, ~valid_mask] = 0
         else:
-            local_pt = torch.zeros(
-                B, 0, dtype=torch.int32, device=device
-            )
+            local_pt = torch.zeros(B, 0, dtype=torch.int32, device=device)
 
         # Use pre-allocated buffers if available (CUDA graph mode)
         cg_meta = self.decode_cuda_graph_metadata

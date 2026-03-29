@@ -31,8 +31,9 @@ class TestDCPCommBackendConfig(unittest.TestCase):
 
     def test_field_exists(self):
         """Verify the dcp_comm_backend field exists on ServerArgs dataclass."""
-        from sglang.srt.server_args import ServerArgs
         import dataclasses
+
+        from sglang.srt.server_args import ServerArgs
 
         fields = {f.name for f in dataclasses.fields(ServerArgs)}
         self.assertIn("dcp_comm_backend", fields)
@@ -53,17 +54,16 @@ class TestLSECombineTritonVsCPU(unittest.TestCase):
         """Run Triton combine and compare against CPU reference."""
         torch.manual_seed(42)
 
-        partial_outputs = torch.randn(
-            N, B, H_local, D, device=self.device, dtype=dtype
-        )
+        partial_outputs = torch.randn(N, B, H_local, D, device=self.device, dtype=dtype)
         if is_base_e:
             partial_lses = torch.randn(
                 N, B, H_local, device=self.device, dtype=torch.float32
             )
         else:
-            partial_lses = torch.randn(
-                N, B, H_local, device=self.device, dtype=torch.float32
-            ) * 5.0
+            partial_lses = (
+                torch.randn(N, B, H_local, device=self.device, dtype=torch.float32)
+                * 5.0
+            )
 
         cpu_result = _lse_weighted_combine_cpu(
             partial_outputs.cpu(),
