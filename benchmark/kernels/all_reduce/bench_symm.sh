@@ -26,7 +26,7 @@
 set -euo pipefail
 
 NGPU=${1:-8}
-shift 2>/dev/null || true
+shift 1 2>/dev/null || true
 OPS="${@:-ag rs a2a}"
 
 export NCCL_GRAPH_MIXING_SUPPORT=0
