@@ -9,8 +9,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -117,7 +117,9 @@ class DeepseekMHAForwardMixin:
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
-            proj_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+            proj_q_heads = (
+                self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+            )
             if self.use_nsa:
                 # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
@@ -187,16 +189,16 @@ class DeepseekMHAForwardMixin:
 
             if self.dcp_replicate_q_proj:
                 start = get_attention_tp_rank() * self.num_local_heads
-                q = q[:, start:start + self.num_local_heads, :].contiguous()
+                q = q[:, start : start + self.num_local_heads, :].contiguous()
 
         else:
-            proj_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
-            q = self.q_proj(hidden_states)[0].view(
-                -1, proj_q_heads, self.qk_head_dim
+            proj_q_heads = (
+                self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             )
+            q = self.q_proj(hidden_states)[0].view(-1, proj_q_heads, self.qk_head_dim)
             if self.dcp_replicate_q_proj:
                 start = get_attention_tp_rank() * self.num_local_heads
-                q = q[:, start:start + self.num_local_heads, :].contiguous()
+                q = q[:, start : start + self.num_local_heads, :].contiguous()
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -301,13 +303,13 @@ class DeepseekMHAForwardMixin:
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]
-            kv_proj_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
-            kv = kv.view(
-                -1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim
+            kv_proj_heads = (
+                self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             )
+            kv = kv.view(-1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim)
             if self.dcp_replicate_q_proj:
                 start = get_attention_tp_rank() * self.num_local_heads
-                kv = kv[:, start:start + self.num_local_heads, :].contiguous()
+                kv = kv[:, start : start + self.num_local_heads, :].contiguous()
             k_nope = kv[..., : self.qk_nope_head_dim]
             v = kv[..., self.qk_nope_head_dim :]
 
@@ -431,13 +433,13 @@ class DeepseekMHAForwardMixin:
                 kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
                 k_pe = self._all_gather_dcp_kv_cache(k_pe)
             kv = self.kv_b_proj(kv_a_normed)[0]
-            kv_proj_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
-            kv = kv.view(
-                -1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim
+            kv_proj_heads = (
+                self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             )
+            kv = kv.view(-1, kv_proj_heads, self.qk_nope_head_dim + self.v_head_dim)
             if self.dcp_replicate_q_proj:
                 start = get_attention_tp_rank() * self.num_local_heads
-                kv = kv[:, start:start + self.num_local_heads, :].contiguous()
+                kv = kv[:, start : start + self.num_local_heads, :].contiguous()
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 

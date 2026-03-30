@@ -1129,8 +1129,7 @@ class DeepseekV2AttentionMLA(
         self.num_local_heads = num_heads // attn_tp_size
 
         dcp_replicate = (
-            get_dcp_world_size() > 1
-            and get_global_server_args().dcp_replicate_q_proj
+            get_dcp_world_size() > 1 and get_global_server_args().dcp_replicate_q_proj
         )
         q_tp_rank = 0 if dcp_replicate else attn_tp_rank
         q_tp_size = 1 if dcp_replicate else attn_tp_size
@@ -2266,7 +2265,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         so w_kc and w_vc both have num_heads entries. w_kc needs all heads for the
         Q absorption BMM, but w_vc is used after the DCP combine (which reduces to
         num_local_heads), so slice w_vc back to local heads."""
-        if not (get_dcp_world_size() > 1 and get_global_server_args().dcp_replicate_q_proj):
+        if not (
+            get_dcp_world_size() > 1 and get_global_server_args().dcp_replicate_q_proj
+        ):
             return
         attn_tp_rank = get_attention_tp_rank()
         for layer in self.model.layers:

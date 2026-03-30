@@ -13,8 +13,8 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -184,12 +184,14 @@ class DeepseekMLAForwardMixin:
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                num_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+                num_q_heads = (
+                    self.num_heads
+                    if self.dcp_replicate_q_proj
+                    else self.num_local_heads
+                )
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, num_q_heads, self.qk_head_dim
-                    )
+                    q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
                 topk_indices = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
@@ -200,7 +202,11 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                num_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+                num_q_heads = (
+                    self.num_heads
+                    if self.dcp_replicate_q_proj
+                    else self.num_local_heads
+                )
                 q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
                 if q_lora is not None:
                     topk_indices = self.indexer(
@@ -211,10 +217,10 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
         else:
-            num_q_heads = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
-            q = self.q_proj(hidden_states)[0].view(
-                -1, num_q_heads, self.qk_head_dim
+            num_q_heads = (
+                self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
             )
+            q = self.q_proj(hidden_states)[0].view(-1, num_q_heads, self.qk_head_dim)
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
@@ -222,7 +228,9 @@ class DeepseekMLAForwardMixin:
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        bmm_head_count = self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+        bmm_head_count = (
+            self.num_heads if self.dcp_replicate_q_proj else self.num_local_heads
+        )
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -353,8 +361,10 @@ class DeepseekMLAForwardMixin:
                 ] = k_pe
             if self.dcp_replicate_q_proj and not forward_batch.forward_mode.is_decode():
                 start = get_attention_tp_rank() * self.num_local_heads
-                q_nope_out = q_nope_out[:, start:start + self.num_local_heads, :].contiguous()
-                q_pe = q_pe[:, start:start + self.num_local_heads, :].contiguous()
+                q_nope_out = q_nope_out[
+                    :, start : start + self.num_local_heads, :
+                ].contiguous()
+                q_pe = q_pe[:, start : start + self.num_local_heads, :].contiguous()
 
         return (
             q_pe,
