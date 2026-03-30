@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    SymmetricMemoryContext,
+)
 from sglang.srt.distributed.parallel_state import (
     get_dcp_group,
     get_dcp_size_from_env,
@@ -2458,47 +2461,48 @@ class FlashAttentionBackend(AttentionBackend):
         D = self.dcp_v_head_dim
         lpd = _lse_pack_dim(self.dcp_dtype)
 
-        buffers = {
-            "q_gathered": torch.empty(
-                bs,
-                H_all,
-                self.dcp_head_dim,
-                dtype=self.dcp_dtype,
-                device=self.device,
-            ),
-            # Fused output+LSE buffer: [N, bs, H_per_rank, D + lse_pack_dim]
-            "send_combined": torch.empty(
-                N,
-                bs,
-                H_per_rank,
-                D + lpd,
-                dtype=self.dcp_dtype,
-                device=self.device,
-            ),
-            "recv_combined": torch.empty(
-                N,
-                bs,
-                H_per_rank,
-                D + lpd,
-                dtype=self.dcp_dtype,
-                device=self.device,
-            ),
-            # fp32 staging buffers for LSE pack/unpack
-            "send_lse": torch.empty(
-                N,
-                bs,
-                H_per_rank,
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            "recv_lse": torch.empty(
-                N,
-                bs,
-                H_per_rank,
-                dtype=torch.float32,
-                device=self.device,
-            ),
-        }
+        with SymmetricMemoryContext(get_dcp_group()):
+            buffers = {
+                "q_gathered": torch.empty(
+                    bs,
+                    H_all,
+                    self.dcp_head_dim,
+                    dtype=self.dcp_dtype,
+                    device=self.device,
+                ),
+                # Fused output+LSE buffer: [N, bs, H_per_rank, D + lse_pack_dim]
+                "send_combined": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    D + lpd,
+                    dtype=self.dcp_dtype,
+                    device=self.device,
+                ),
+                "recv_combined": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    D + lpd,
+                    dtype=self.dcp_dtype,
+                    device=self.device,
+                ),
+                # fp32 staging buffers for LSE pack/unpack
+                "send_lse": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "recv_lse": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            }
         self.dcp_cuda_graph_buffers_per_bs[bs] = buffers
         self.dcp_cuda_graph_buffers = buffers
 

@@ -114,7 +114,6 @@ class TestDCPAccuracyFlashInferA2A(CustomTestCase):
             "flashinfer",
             "--mem-fraction-static",
             "0.85",
-            "--disable-cuda-graph",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -179,7 +178,6 @@ class TestDCPAccuracyFA3A2A(CustomTestCase):
             "fa3",
             "--mem-fraction-static",
             "0.83",
-            "--disable-cuda-graph",
         ]
         cls.process = popen_launch_server(
             cls.model,
