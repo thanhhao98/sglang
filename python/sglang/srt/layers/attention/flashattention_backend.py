@@ -2531,8 +2531,8 @@ class FlashAttentionBackend(AttentionBackend):
         )  # [B, max_pages] (page indices, already strided)
         max_global_pages = global_pt.shape[1]
 
-        # Compute local page count per request
-        max_local_tokens = local_seqlens.max().item()
+        # Derive max_local_pages from max_seq_len_k (already on CPU) to avoid
+        max_local_tokens = (metadata.max_seq_len_k - dcp_rank - 1) // N + 1
         max_local_pages = (max_local_tokens + self.page_size - 1) // self.page_size
 
         # Vectorized page table construction (replaces Python for-loop).
