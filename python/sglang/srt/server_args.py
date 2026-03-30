@@ -189,6 +189,7 @@ def validate_dcp_model_layout(
             "because TP only creates that many copies of each KV head."
         )
 
+
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
 
 ATTENTION_BACKEND_CHOICES = [

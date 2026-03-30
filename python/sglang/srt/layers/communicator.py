@@ -892,12 +892,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states = layernorm(hidden_states)
         else:
             handled = False
-            use_attention_tp_reduce = get_global_server_args().is_attention_tpa_enabled()
+            use_attention_tp_reduce = (
+                get_global_server_args().is_attention_tpa_enabled()
+            )
             if (
                 not use_attention_tp_reduce
                 and (
-                apply_aiter_all_reduce_fusion(hidden_states)
-                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                    apply_aiter_all_reduce_fusion(hidden_states)
+                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 )
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
             ):

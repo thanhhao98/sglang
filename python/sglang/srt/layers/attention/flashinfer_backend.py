@@ -21,14 +21,20 @@ from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
     is_in_piecewise_cuda_graph,
 )
+from sglang.srt.distributed import get_dcp_group, get_dcp_world_size
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    cp_lse_ag_out_allreduce,
+    cp_lse_ag_out_rs,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -151,6 +157,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.page_size = model_runner.page_size
+        self._dcp_comm_backend = model_runner.server_args.dcp_comm_backend
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -894,18 +901,56 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
+        dcp_size = get_dcp_world_size()
+        use_dcp = dcp_size > 1
+        server_args = get_global_server_args()
+        use_tpa_dcp = use_dcp and server_args.is_attention_tpa_enabled()
+        need_lse = use_dcp
+
+        q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if use_dcp and not use_tpa_dcp and not server_args.dcp_replicate_q_proj:
+            q_reshaped = get_dcp_group().all_gather(q_reshaped.contiguous(), dim=1)
+
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_reshaped,
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
+            return_lse=need_lse,
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        if need_lse:
+            o, lse = o
+
+            B_out = o.shape[0]
+            H_out = q_reshaped.shape[1]
+            if lse.ndim == 3:
+                lse_2d = lse.squeeze(-1)
+            elif lse.shape == (H_out, B_out):
+                lse_2d = lse.T.contiguous()
+            else:
+                lse_2d = lse.view(B_out, H_out)
+
+            if use_tpa_dcp:
+                o = cp_lse_ag_out_allreduce(o, lse_2d, get_dcp_group())
+            elif self._dcp_comm_backend == "a2a":
+                from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+
+                o = dcp_a2a_lse_reduce(
+                    o,
+                    lse_2d,
+                    get_dcp_group(),
+                    is_lse_base_on_e=False,
+                    cuda_graph_buffers=getattr(self, "dcp_cuda_graph_buffers", None),
+                )
+            else:
+                o = cp_lse_ag_out_rs(o, lse_2d, get_dcp_group(), is_lse_base_on_e=False)
+
+        num_heads_out = layer.tp_q_head_num
+        return o.view(-1, num_heads_out * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:

@@ -2014,9 +2014,7 @@ def initialize_model_parallel(
             assert (
                 tensor_model_parallel_size
                 == attention_tensor_parallel_size * decode_context_model_parallel_size
-            ), (
-                "Phase-1 TPA requires tp_size == attention_tensor_parallel_size * dcp_size"
-            )
+            ), "Phase-1 TPA requires tp_size == attention_tensor_parallel_size * dcp_size"
             for tp_group_idx in range(num_tensor_model_parallel_groups):
                 tp_group_base = tp_group_idx * tensor_model_parallel_size
                 for dcp_rank in range(decode_context_model_parallel_size):

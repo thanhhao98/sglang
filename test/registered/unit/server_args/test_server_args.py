@@ -83,7 +83,9 @@ class TestTpaAndDcpArgs(unittest.TestCase):
             attention_tensor_parallel_size=4,
             attn_cp_size=2,
         )
-        with self.assertRaisesRegex(ValueError, "does not support --attention-context-parallel-size > 1"):
+        with self.assertRaisesRegex(
+            ValueError, "does not support --attention-context-parallel-size > 1"
+        ):
             server_args._handle_context_parallelism()
 
     def test_phase1_tpa_rejects_wrong_dcp_ratio(self):
@@ -93,7 +95,9 @@ class TestTpaAndDcpArgs(unittest.TestCase):
             dcp_size=2,
             attention_tensor_parallel_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "must equal --tp-size / --attention-tensor-parallel-size"):
+        with self.assertRaisesRegex(
+            ValueError, "must equal --tp-size / --attention-tensor-parallel-size"
+        ):
             server_args._handle_context_parallelism()
 
     def test_phase1_tpa_accepts_a2a_flag(self):
@@ -174,7 +178,9 @@ class TestDcpModelLayoutValidation(unittest.TestCase):
         )
 
     def test_tpa_rejects_non_divisible_kv_head_layout(self):
-        with self.assertRaisesRegex(ValueError, "does not evenly split num_key_value_heads"):
+        with self.assertRaisesRegex(
+            ValueError, "does not evenly split num_key_value_heads"
+        ):
             validate_dcp_model_layout(
                 tp_size=12,
                 attention_tp_size=4,
@@ -186,7 +192,9 @@ class TestDcpModelLayoutValidation(unittest.TestCase):
             )
 
     def test_tpa_rejects_mla_models(self):
-        with self.assertRaisesRegex(ValueError, "supports only standard KV-head attention models"):
+        with self.assertRaisesRegex(
+            ValueError, "supports only standard KV-head attention models"
+        ):
             validate_dcp_model_layout(
                 tp_size=8,
                 attention_tp_size=4,
