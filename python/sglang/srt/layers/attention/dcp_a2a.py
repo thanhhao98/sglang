@@ -107,7 +107,7 @@ def _dcp_lse_combine_kernel(
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
     )
-    tl.store(out_ptr + out_offsets, acc.to(tl.load(recv_output_ptr).dtype))
+    tl.store(out_ptr + out_offsets, acc.to(out_ptr.dtype.element_ty))
 
     if RETURN_LSE:
         if IS_BASE_E:
@@ -172,7 +172,7 @@ def dcp_lse_combine_triton(
         IS_BASE_E=is_lse_base_on_e,
         RETURN_LSE=return_lse,
     )
-    return out, out_lse if return_lse else None
+    return out, (out_lse if return_lse else None)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +216,7 @@ def dcp_a2a_lse_reduce(
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
+    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16

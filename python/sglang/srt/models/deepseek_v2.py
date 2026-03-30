@@ -1525,7 +1525,7 @@ class DeepseekV2AttentionMLA(
                 dtype=kv_a.dtype,
                 device=kv_a.device,
             )
-        idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
+        idxs = torch.arange(kv_a.shape[0] * dcp_world_size, device=kv_a.device)
         mask = idxs % dcp_world_size == dcp_rank
         gathered_kv_a[mask] = kv_a
         return get_dcp_group().all_reduce(gathered_kv_a)
