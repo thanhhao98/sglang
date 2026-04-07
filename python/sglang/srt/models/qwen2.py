@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -98,13 +99,13 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, use_reduce_scatter: bool = False):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
         return x
 
 
@@ -289,6 +290,9 @@ class Qwen2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             use_full_tp_attention_handoff=self.self_attn.use_full_tp_attention_handoff,
+            allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            layer_id=layer_id,
         )
 
     def forward(
@@ -317,7 +321,10 @@ class Qwen2DecoderLayer(nn.Module):
             residual,
             forward_batch,
         )
-        hidden_states = self.mlp(hidden_states)
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(hidden_states, use_reduce_scatter=use_reduce_scatter)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -440,6 +447,33 @@ class Qwen2Model(nn.Module):
                 }
             )
         else:
+            # Helix RS: AllGather scattered tokens back to full batch for LM head.
+            if (
+                get_global_server_args().is_helix_reduce_scatter_enabled()
+                and forward_batch.forward_mode.is_decode()
+            ):
+                import math
+
+                num_actual_tokens = forward_batch.input_ids.shape[0]
+                tp_size = get_tensor_model_parallel_world_size()
+                chunk_size = math.ceil(num_actual_tokens / tp_size)
+                padded_total = chunk_size * tp_size
+                full_hidden = hidden_states.new_empty(
+                    padded_total, hidden_states.shape[1]
+                )
+                get_tp_group().all_gather_into_tensor(
+                    full_hidden, hidden_states
+                )
+                hidden_states = full_hidden[:num_actual_tokens]
+                if residual is not None:
+                    full_residual = residual.new_empty(
+                        padded_total, residual.shape[1]
+                    )
+                    get_tp_group().all_gather_into_tensor(
+                        full_residual, residual
+                    )
+                    residual = full_residual[:num_actual_tokens]
+
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)

@@ -1092,6 +1092,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            layer_id=layer_id,
         )
 
     def forward(

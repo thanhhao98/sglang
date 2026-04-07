@@ -519,6 +519,7 @@ class ServerArgs:
     moe_dp_size: int = 1
     dcp_size: int = 1
     dcp_comm_backend: str = "ag_rs"
+    enable_helix_reduce_scatter: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -2755,8 +2756,29 @@ class ServerArgs:
                     f"for phase-1 TPA (expected {expected_dcp}, got {self.dcp_size})"
                 )
 
+        if self.enable_helix_reduce_scatter:
+            if not self.is_attention_tpa_enabled():
+                raise ValueError(
+                    "--enable-helix-reduce-scatter requires TPA "
+                    "(--attention-tensor-parallel-size)"
+                )
+            if self.dcp_size <= 1:
+                raise ValueError(
+                    "--enable-helix-reduce-scatter requires --dcp-size > 1"
+                )
+            # Force A2A backend — ReduceScatter requires unique heads per rank
+            if self.dcp_comm_backend != "a2a":
+                self.dcp_comm_backend = "a2a"
+
     def is_attention_tpa_enabled(self) -> bool:
         return self.attention_tensor_parallel_size is not None
+
+    def is_helix_reduce_scatter_enabled(self) -> bool:
+        return (
+            self.is_attention_tpa_enabled()
+            and self.dcp_size > 1
+            and self.enable_helix_reduce_scatter
+        )
 
     def get_attention_tp_size(self) -> int:
         if self.attention_tensor_parallel_size is not None:
@@ -4286,6 +4308,13 @@ class ServerArgs:
             choices=["ag_rs", "a2a"],
             help="DCP communication backend: ag_rs (AllGather+ReduceScatter) "
             "or a2a (All-to-All exchange + local Triton combine).",
+        )
+        parser.add_argument(
+            "--enable-helix-reduce-scatter",
+            action="store_true",
+            default=ServerArgs.enable_helix_reduce_scatter,
+            help="Enable Helix-style ReduceScatter after o_proj for DCP+TPA mode. "
+            "Reduces post-attention communication by ~50%% and MLP compute by tp_size/attn_tp_size.",
         )
         parser.add_argument(
             "--pipeline-parallel-size",

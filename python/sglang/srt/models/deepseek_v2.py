@@ -47,6 +47,8 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1133,8 +1135,21 @@ class DeepseekV2AttentionMLA(
         if self.nsa_enable_prefill_cp and self.use_nsa:
             self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
+
+        # Helix ReduceScatter: reshard projections to full TP size so each
+        # rank gets unique heads after DCP A2A, enabling ReduceScatter after o_proj.
+        self.helix_rs = get_global_server_args().is_helix_reduce_scatter_enabled()
+        if self.helix_rs:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            proj_tp_rank = get_tensor_model_parallel_rank()
+            proj_tp_size = get_tensor_model_parallel_world_size()
+        else:
+            proj_tp_rank = attn_tp_rank
+            proj_tp_size = attn_tp_size
+
         assert num_heads % attn_tp_size == 0
-        self.num_local_heads = num_heads // attn_tp_size
+        self.num_local_heads = num_heads // proj_tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1160,8 +1175,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1170,8 +1185,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -1230,8 +1245,8 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=proj_tp_rank,
+            tp_size=proj_tp_size,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -1241,8 +1256,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=proj_tp_rank,
+            tp_size=proj_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -1694,6 +1709,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
+                layer_id=layer_id,
             )
 
     def _detect_gfx95_quant_format(self) -> str:
@@ -2111,6 +2127,33 @@ class DeepseekV2Model(nn.Module):
                 }
             )
         else:
+            # Helix RS: AllGather scattered tokens back to full batch for LM head.
+            if (
+                get_global_server_args().is_helix_reduce_scatter_enabled()
+                and forward_batch.forward_mode.is_decode()
+            ):
+                import math
+
+                num_actual_tokens = forward_batch.input_ids.shape[0]
+                tp_size = get_tensor_model_parallel_world_size()
+                chunk_size = math.ceil(num_actual_tokens / tp_size)
+                padded_total = chunk_size * tp_size
+                full_hidden = hidden_states.new_empty(
+                    padded_total, hidden_states.shape[1]
+                )
+                get_tp_group().all_gather_into_tensor(
+                    full_hidden, hidden_states
+                )
+                hidden_states = full_hidden[:num_actual_tokens]
+                if residual is not None:
+                    full_residual = residual.new_empty(
+                        padded_total, residual.shape[1]
+                    )
+                    get_tp_group().all_gather_into_tensor(
+                        full_residual, residual
+                    )
+                    residual = full_residual[:num_actual_tokens]
+
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
