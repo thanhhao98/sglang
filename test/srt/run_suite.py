@@ -15,6 +15,7 @@ suites = {
     # All CUDA tests migrated to test/registered/
     "__not_in_ci__": [
         TestFile("ascend/test_embed_interpolate_unittest.py"),
+        TestFile("test_dcp_interleaved_storage.py", 5),
     ],
 }
 
