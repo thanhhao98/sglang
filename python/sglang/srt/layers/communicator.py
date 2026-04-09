@@ -1052,9 +1052,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     else:
                         residual = context.helix_saved_residual
                     if hidden_states.shape[0] != 0:
-                        hidden_states, residual = layernorm(
-                            hidden_states, residual
-                        )
+                        if residual is not None:
+                            hidden_states, residual = layernorm(
+                                hidden_states, residual
+                            )
+                        else:
+                            hidden_states = layernorm(hidden_states)
                 elif use_attention_tp_reduce:
                     # In TPA mode, attention outputs are duplicated across DCP peers
                     # and only need to be summed across the smaller attention-TP group.
