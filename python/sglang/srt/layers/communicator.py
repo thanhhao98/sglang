@@ -390,8 +390,7 @@ class LayerCommunicator:
         self._context.attention_outputs_are_tpa_replicated = (
             get_global_server_args().is_attention_tpa_enabled()
             and not self.use_full_tp_attention_handoff
-            # When helix RS is enabled but doesn't activate (B < attn_tp_size),
-            # outputs are still TPA-replicated and need attn_tp AllReduce.
+            and not helix_rs  # Helix RS: handled by ReduceScatter or explicit fallback
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
@@ -1067,6 +1066,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 elif use_attention_tp_reduce:
                     # In TPA mode, attention outputs are duplicated across DCP peers
                     # and only need to be summed across the smaller attention-TP group.
+                    hidden_states = attn_tp_all_reduce(hidden_states)
+                elif context.use_helix_reduce_scatter:
+                    # Helix RS fallback (B < attn_tp_size): o_proj is sharded by
+                    # attn_tp (no handoff), so use attn_tp AllReduce.
                     hidden_states = attn_tp_all_reduce(hidden_states)
                 else:
                     # use_full_tp_attention_handoff or standard TP: o_proj is
