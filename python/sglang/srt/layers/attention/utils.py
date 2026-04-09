@@ -1579,7 +1579,7 @@ def cp_lse_ag_out_allreduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
-    ctx: CPTritonContext = None,
+    is_lse_base_on_e: bool = False,
 ):
     """
     Merge DCP partial attention outputs when every rank already owns the same heads.
@@ -1591,11 +1591,8 @@ def cp_lse_ag_out_allreduce(
     if cp_group.world_size == 1:
         return cp_attn_out
 
-    if ctx is None:
-        ctx = CPTritonContext()
-
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
+    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, is_lse_base_on_e)
     return cp_group.all_reduce(out)

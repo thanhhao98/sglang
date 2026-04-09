@@ -1006,6 +1006,8 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
 
         output_heads, _ = self._get_output_head_partition(layer)
+        if o.ndim == 3 and output_heads != o.shape[1]:
+            o = self._apply_output_head_partition(o, layer)
         return o.reshape(-1, output_heads * layer.v_head_dim)
 
     def forward_decode(
@@ -1484,16 +1486,19 @@ class FlashAttentionBackend(AttentionBackend):
 
             # TPA-specific DCP A2A buffers (narrower head count)
             if getattr(self, "tpa_dcp_a2a_heads_per_rank", None) is not None:
+                from sglang.srt.layers.attention.dcp_a2a import _lse_pack_dim
+
                 N = self.dcp_size
                 H_per_rank = self.tpa_dcp_a2a_heads_per_rank
                 D = self.dcp_v_head_dim
+                lpd = _lse_pack_dim(self.dcp_dtype)
                 self.tpa_dcp_cuda_graph_buffers = {
-                    "send_output": torch.empty(
-                        N, max_bs, H_per_rank, D,
+                    "send_combined": torch.empty(
+                        N, max_bs, H_per_rank, D + lpd,
                         dtype=self.dcp_dtype, device=self.device,
                     ),
-                    "recv_output": torch.empty(
-                        N, max_bs, H_per_rank, D,
+                    "recv_combined": torch.empty(
+                        N, max_bs, H_per_rank, D + lpd,
                         dtype=self.dcp_dtype, device=self.device,
                     ),
                     "send_lse": torch.empty(

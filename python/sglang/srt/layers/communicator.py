@@ -1039,9 +1039,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     # and only need to be summed across the smaller attention-TP group.
                     hidden_states = attn_tp_all_reduce(hidden_states)
                 else:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
+                    # use_full_tp_attention_handoff or standard TP: o_proj is
+                    # sharded across the full TP group, so reduce across all ranks.
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if not (
                     context.use_helix_reduce_scatter
                     and forward_batch.forward_mode.is_decode()
