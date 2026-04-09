@@ -38,12 +38,15 @@ COMMON_ARGS="--model-path $MODEL --host 0.0.0.0 --port $PORT \
 
 CONCURRENCIES=(1 2 4 8 16 32 64 128 256 512)
 
-# Config format: NAME|BACKEND|MEM_FRAC|DCP_SIZE|DCP_COMM|ATTN_TP_SIZE
-# ATTN_TP_SIZE=0 means no TPA flag
+# Config format: NAME|BACKEND|MEM_FRAC|DCP_SIZE|DCP_COMM|ATTN_TP_SIZE|HELIX_RS
+# ATTN_TP_SIZE=0 means no TPA flag, HELIX_RS=1 enables --enable-helix-reduce-scatter
 CONFIGS=(
-    "tp8_fa3|fa3|0.85|0||0"
-    "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0"
-    "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4"
+    "tp8_fa3|fa3|0.85|0||0|0"
+    "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
+    "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
+    # NOTE: helix RS is disabled — ReduceScatter changes tensor sizes during decode,
+    # causing shape mismatches in layernorm (residual vs input). Needs further work.
+    # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
 )
 
 wait_for_server() {
@@ -97,6 +100,7 @@ start_server() {
     local dcp="$4"
     local dcp_comm="$5"
     local attn_tp="$6"
+    local helix_rs="$7"
 
     local extra_args=""
     if [ "$dcp" -gt 0 ]; then
@@ -105,10 +109,13 @@ start_server() {
     if [ "$attn_tp" -gt 0 ]; then
         extra_args="${extra_args} --attention-tensor-parallel-size ${attn_tp}"
     fi
+    if [ "$helix_rs" -eq 1 ]; then
+        extra_args="${extra_args} --enable-helix-reduce-scatter --disable-cuda-graph"
+    fi
 
     echo "======================================================="
     echo "Starting: ${cfg_name}"
-    echo "  backend=${backend}  mem=${mem_frac}  dcp=${dcp}  comm=${dcp_comm}  attn_tp=${attn_tp}"
+    echo "  backend=${backend}  mem=${mem_frac}  dcp=${dcp}  comm=${dcp_comm}  attn_tp=${attn_tp}  helix_rs=${helix_rs}"
     echo "======================================================="
 
     eval "${COMMON_ENV} python3 -m sglang.launch_server ${COMMON_ARGS} \
@@ -121,13 +128,13 @@ start_server() {
 
 # ---- Main loop ----
 for cfg in "${CONFIGS[@]}"; do
-    IFS='|' read -r CFG_NAME BACKEND MEM_FRAC DCP DCP_COMM ATTN_TP <<< "$cfg"
+    IFS='|' read -r CFG_NAME BACKEND MEM_FRAC DCP DCP_COMM ATTN_TP HELIX_RS <<< "$cfg"
 
     OUTPUT_DIR="${BASE_OUTPUT}/${CFG_NAME}"
     mkdir -p "$OUTPUT_DIR"
 
     kill_server
-    start_server "$CFG_NAME" "$BACKEND" "$MEM_FRAC" "$DCP" "$DCP_COMM" "$ATTN_TP"
+    start_server "$CFG_NAME" "$BACKEND" "$MEM_FRAC" "$DCP" "$DCP_COMM" "$ATTN_TP" "$HELIX_RS"
 
     if ! wait_for_server; then
         echo "Skipping ${CFG_NAME} due to server start failure"
