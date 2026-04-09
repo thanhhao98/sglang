@@ -17,6 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -302,18 +303,44 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Debug: log intermediate tensors for helix RS comparison
+        _dbg = False
+        if (
+            os.environ.get("SGLANG_HELIX_DEBUG") == "1"
+            and self.self_attn.attn.layer_id == 0
+        ):
+            if not hasattr(self, "_helix_dbg_total"):
+                self._helix_dbg_total = 0
+            self._helix_dbg_total += 1
+            # Log calls 2-4 (skip warmup call 1, catch first decode calls)
+            if 2 <= self._helix_dbg_total <= 4:
+                _dbg = True
+
+        def _log(tag, t, r=None):
+            if not _dbg:
+                return
+            lid = self.self_attn.attn.layer_id
+            fm = forward_batch.forward_mode
+            rm = f" res={r.shape}|{r.float().mean():.4f}|{r.float().std():.4f}" if r is not None else " res=None"
+            print(f"[HELIX_DBG L{lid} {fm}] {tag}: hs={t.shape}|{t.float().mean():.6f}|{t.float().std():.4f}{rm}", flush=True)
+
+        _log("0_input", hidden_states, residual)
+
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
         )
+        _log("1_post_prepare_attn", hidden_states, residual)
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        _log("2_post_attn", hidden_states, residual)
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -321,13 +348,18 @@ class Qwen2DecoderLayer(nn.Module):
             residual,
             forward_batch,
         )
+        _log("3_post_prepare_mlp", hidden_states, residual)
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         hidden_states = self.mlp(hidden_states, use_reduce_scatter=use_reduce_scatter)
+        _log("4_post_mlp", hidden_states, residual)
+
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        _log("5_post_postprocess", hidden_states, residual)
         return hidden_states, residual
 
 
