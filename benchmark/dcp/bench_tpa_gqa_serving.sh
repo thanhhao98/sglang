@@ -56,6 +56,15 @@ kill_server() {
     sleep 10
 }
 
+run_accuracy() {
+    local output_dir="$1"
+    local acc_file="${output_dir}/accuracy_gsm8k.txt"
+    echo "Running accuracy test -> ${acc_file}"
+    python3 benchmark/gsm8k/bench_sglang.py \
+        --parallel 64 \
+        --host "$HOST" --port "$PORT" 2>&1 | tee "$acc_file"
+}
+
 run_perf() {
     local output_dir="$1"
     local model="$2"
@@ -100,7 +109,6 @@ start_server() {
     local attn_tp="$7"
     local helix_rs="$8"
     local context_length="$9"
-    local max_cc="${10}"
 
     local extra_args=""
     if [ "$dcp" -gt 0 ]; then
@@ -116,13 +124,13 @@ start_server() {
     echo "======================================================="
     echo "Starting: ${cfg_name} (${model})"
     echo "  backend=${backend}  mem=${mem_frac}  dcp=${dcp}  comm=${dcp_comm}"
-    echo "  attn_tp=${attn_tp}  helix_rs=${helix_rs}  ctx=${context_length}  max_cc=${max_cc}"
+    echo "  attn_tp=${attn_tp}  helix_rs=${helix_rs}  ctx=${context_length}"
     echo "======================================================="
 
     eval "${COMMON_ENV} python3 -m sglang.launch_server \
         --model-path ${model} --host 0.0.0.0 --port ${PORT} \
         --trust-remote-code --enable-cache-report --log-level info --tp-size 8 \
-        --max-running-requests ${max_cc} --chunked-prefill-size 32768 \
+        --chunked-prefill-size 32768 \
         --context-length ${context_length} --disable-radix-cache --enable-symm-mem \
         --mem-fraction-static ${mem_frac} \
         --attention-backend ${backend} \
@@ -164,7 +172,7 @@ run_scenario_configs() {
 
         mkdir -p "$OUTPUT_DIR"
         kill_server
-        start_server "$model" "$CFG_NAME" "$BACKEND" "$MEM_FRAC" "$DCP" "$DCP_COMM" "$ATTN_TP" "$HELIX_RS" "$context_length" "$max_cc"
+        start_server "$model" "$CFG_NAME" "$BACKEND" "$MEM_FRAC" "$DCP" "$DCP_COMM" "$ATTN_TP" "$HELIX_RS" "$context_length"
 
         if ! wait_for_server; then
             echo "Skipping ${CFG_NAME} due to server start failure"
@@ -172,6 +180,7 @@ run_scenario_configs() {
             continue
         fi
 
+        run_accuracy "$OUTPUT_DIR"
         run_perf "$OUTPUT_DIR" "$model" "$input_len" "$output_len" "${concurrencies[@]}"
         kill_server
     done
@@ -276,8 +285,8 @@ run_scenario5() {
         "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
     )
 
-    # MoE model: memory-constrained, use moderate CC and context
-    run_scenario_configs "scenario5_qwen3_235b" "$model" 32768 64 2048 500 "in2048_out500" "${configs[@]}"
+    # MoE model: long input (32K) + medium output (4K) to stress both prefill and decode
+    run_scenario_configs "scenario5_qwen3_235b" "$model" 40960 64 32000 4000 "in32k_out4k" "${configs[@]}"
 }
 
 
