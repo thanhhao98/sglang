@@ -44,6 +44,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -700,28 +701,31 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             # Helix RS: AllGather scattered tokens back to full batch for LM head.
+            # Uses attn_tp group since helix RS scatters across attn_tp.
             num_actual_tokens = forward_batch.input_ids.shape[0]
-            tp_size = get_tensor_model_parallel_world_size()
+            attn_tp_sz = get_attention_tp_size()
             if (
                 get_global_server_args().is_helix_reduce_scatter_enabled()
                 and forward_batch.forward_mode.is_decode()
-                and num_actual_tokens >= tp_size
+                and num_actual_tokens >= attn_tp_sz
                 and hidden_states.shape[0] < num_actual_tokens
             ):
                 import math
 
-                chunk_size = math.ceil(num_actual_tokens / tp_size)
-                padded_total = chunk_size * tp_size
+                chunk_size = math.ceil(num_actual_tokens / attn_tp_sz)
+                padded_total = chunk_size * attn_tp_sz
                 full_hidden = hidden_states.new_empty(
                     padded_total, hidden_states.shape[1]
                 )
-                get_tp_group().all_gather_into_tensor(full_hidden, hidden_states)
+                get_attention_tp_group().all_gather_into_tensor(
+                    full_hidden, hidden_states
+                )
                 hidden_states = full_hidden[:num_actual_tokens]
                 if residual is not None:
                     full_residual = residual.new_empty(
                         padded_total, residual.shape[1]
                     )
-                    get_tp_group().all_gather_into_tensor(
+                    get_attention_tp_group().all_gather_into_tensor(
                         full_residual, residual
                     )
                     residual = full_residual[:num_actual_tokens]

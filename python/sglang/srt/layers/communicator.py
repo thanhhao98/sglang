@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -466,7 +467,7 @@ class LayerCommunicator:
             self._context.use_helix_reduce_scatter
             and not self._context.is_first_layer
             and forward_batch.forward_mode.is_decode()
-            and _num_tokens >= self._context.tp_size
+            and _num_tokens >= self._context.attn_tp_size
             and hidden_states.shape[0] < _num_tokens  # scattered from previous layer
         )
         if _use_helix_this_step:
@@ -479,18 +480,19 @@ class LayerCommunicator:
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-            # 2. Save residual at [B/tp, H] for prepare_mlp
+            # 2. Save residual at [B/attn_tp, H] for prepare_mlp
             self._context.helix_saved_residual = residual
-            # 3. AllGather hidden_states only → [B, H]
+            # 3. AllGather hidden_states only → [B, H] across attn_tp group
             num_actual_tokens = forward_batch.input_ids.shape[0]
-            chunk_size = math.ceil(
-                num_actual_tokens / self._context.tp_size
-            )
-            padded_total = chunk_size * self._context.tp_size
+            helix_group_size = self._context.attn_tp_size
+            chunk_size = math.ceil(num_actual_tokens / helix_group_size)
+            padded_total = chunk_size * helix_group_size
             full_hidden = hidden_states.new_empty(
                 padded_total, hidden_states.shape[1]
             )
-            get_tp_group().all_gather_into_tensor(full_hidden, hidden_states)
+            get_attention_tp_group().all_gather_into_tensor(
+                full_hidden, hidden_states
+            )
             hidden_states = full_hidden[:num_actual_tokens]
             # 4. Return with residual=None (saved internally)
             if self.qkv_latent_func is not None:
@@ -1025,32 +1027,33 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
+                # Helix RS uses attn_tp group (not full TP) for ReduceScatter
+                # so that ranks within the same attn_tp group share the same
+                # scattered tokens. MLP AllReduce within attn_tp is then correct.
+                helix_group_size = context.attn_tp_size
                 if (
                     context.use_helix_reduce_scatter
                     and forward_batch.forward_mode.is_decode()
-                    and hidden_states.shape[0] >= context.tp_size
+                    and hidden_states.shape[0] >= helix_group_size
                 ):
                     context._helix_active_this_step = True
-                    # Helix ReduceScatter: sum partial o_proj outputs across
-                    # full TP group and scatter tokens so each rank processes
-                    # fewer tokens through MLP/MoE.
                     num_tokens = hidden_states.shape[0]
                     hidden_states, chunk_size = _helix_pad_tokens(
-                        hidden_states, num_tokens, context.tp_size
+                        hidden_states, num_tokens, helix_group_size
                     )
                     output = hidden_states.new_empty(
                         chunk_size, hidden_states.shape[1]
                     )
-                    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+                    get_attention_tp_group().reduce_scatter_tensor(
+                        output, hidden_states
+                    )
                     hidden_states = output
-                    # Restore residual at [B/tp, H].
-                    # Layer > 0: residual was saved by prepare_attn at [B/tp, H]
-                    # Layer 0: residual is [B, H] from embedding; slice it
+                    # Restore residual at [B/attn_tp, H].
                     if context.is_first_layer:
                         residual, _ = _helix_pad_tokens(
-                            residual, num_tokens, context.tp_size
+                            residual, num_tokens, helix_group_size
                         )
-                        start = context.tp_rank * chunk_size
+                        start = context.attn_tp_rank * chunk_size
                         residual = residual[start : start + chunk_size]
                     else:
                         residual = context.helix_saved_residual
