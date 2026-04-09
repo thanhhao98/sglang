@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -698,6 +699,33 @@ class Qwen2MoeModel(nn.Module):
                 }
             )
         else:
+            # Helix RS: AllGather scattered tokens back to full batch for LM head.
+            num_actual_tokens = forward_batch.input_ids.shape[0]
+            tp_size = get_tensor_model_parallel_world_size()
+            if (
+                get_global_server_args().is_helix_reduce_scatter_enabled()
+                and forward_batch.forward_mode.is_decode()
+                and num_actual_tokens >= tp_size
+                and hidden_states.shape[0] < num_actual_tokens
+            ):
+                import math
+
+                chunk_size = math.ceil(num_actual_tokens / tp_size)
+                padded_total = chunk_size * tp_size
+                full_hidden = hidden_states.new_empty(
+                    padded_total, hidden_states.shape[1]
+                )
+                get_tp_group().all_gather_into_tensor(full_hidden, hidden_states)
+                hidden_states = full_hidden[:num_actual_tokens]
+                if residual is not None:
+                    full_residual = residual.new_empty(
+                        padded_total, residual.shape[1]
+                    )
+                    get_tp_group().all_gather_into_tensor(
+                        full_residual, residual
+                    )
+                    residual = full_residual[:num_actual_tokens]
+
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
