@@ -685,10 +685,9 @@ class LayerCommunicator:
             # TPA keeps attention outputs replicated across DCP peers, so the
             # full-TP reduce-scatter shortcut is not layout-safe here.
             allow_reduce_scatter = False
-        if self.use_full_tp_attention_handoff and self._context.use_helix_reduce_scatter:
-            # Helix RS with TPA handoff: the dp_reduce_scatter_tensor path
-            # assumes attn_tp_group == tp_group, but TPA changes this.
-            # Helix RS handles scattering in prepare_mlp instead.
+        if self._context.use_helix_reduce_scatter:
+            # Helix RS handles scattering in prepare_mlp via attn_tp group.
+            # The dp_reduce_scatter_tensor path is incompatible.
             allow_reduce_scatter = False
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
@@ -706,7 +705,7 @@ class LayerCommunicator:
             # In TPA mode, attention uses a smaller TP group, so keep the
             # regular postprocess path instead of mixing group sizes here.
             return False
-        if self.use_full_tp_attention_handoff and self._context.use_helix_reduce_scatter:
+        if self._context.use_helix_reduce_scatter:
             return False
         # NOTE: helix RS does NOT skip MLP AllReduce. The ReduceScatter
         # replaces the o_proj AllReduce (in prepare_mlp), but the MLP's
