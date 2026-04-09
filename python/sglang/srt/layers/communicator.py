@@ -390,7 +390,8 @@ class LayerCommunicator:
         self._context.attention_outputs_are_tpa_replicated = (
             get_global_server_args().is_attention_tpa_enabled()
             and not self.use_full_tp_attention_handoff
-            and not helix_rs  # Helix RS: outputs are unique per rank, not replicated
+            # When helix RS is enabled but doesn't activate (B < attn_tp_size),
+            # outputs are still TPA-replicated and need attn_tp AllReduce.
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
