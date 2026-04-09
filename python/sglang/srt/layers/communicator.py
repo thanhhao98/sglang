@@ -473,9 +473,12 @@ class LayerCommunicator:
             self._context._helix_active_this_step = True
             # 1. LayerNorm on [B/tp, H] tensors
             if hidden_states.shape[0] != 0:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states, residual
-                )
+                if residual is not None:
+                    hidden_states, residual = self.input_layernorm(
+                        hidden_states, residual
+                    )
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
             # 2. Save residual at [B/tp, H] for prepare_mlp
             self._context.helix_saved_residual = residual
             # 3. AllGather hidden_states only → [B, H]
