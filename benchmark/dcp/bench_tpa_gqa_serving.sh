@@ -252,6 +252,35 @@ run_scenario2() {
 }
 
 
+# ============================================================
+# Scenario 5: Qwen3-235B-A22B MoE — Large MoE, 4 KV heads
+# Purpose: MoE + TPA. Helix RS reduces expert compute per rank.
+#   235B total / 22B active, 128 experts (8 active/tok), 94 layers
+#   4 KV heads (same as CodeQwen) → TPA unlocks DCP
+#   ~438 GB bf16 → TP8 uses ~41 GB/GPU, leaves ~55 GB for KV
+# Prerequisites: huggingface-cli download Qwen/Qwen3-235B-A22B-Instruct-2507
+# ============================================================
+run_scenario5() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 5: Qwen3-235B-A22B MoE — Large MoE Model"
+    echo "======================================================="
+
+    local model="Qwen/Qwen3-235B-A22B-Instruct-2507"
+    # 4 KV heads, 64 Q heads, 94 layers, MoE 128 experts (8 active)
+    # tp8: each rank has 0.5 KV heads (needs GQA replication)
+    # tpa4+dcp2: attn_tp=4, each attn rank has 1 KV head
+    local configs=(
+        "tp8_fa3|fa3|0.90|0||0|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.90|2|a2a|4|0"
+        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
+    )
+
+    # MoE model: memory-constrained, use moderate CC and context
+    run_scenario_configs "scenario5_qwen3_235b" "$model" 32768 64 2048 500 "in2048_out500" "${configs[@]}"
+}
+
+
 # ---- Main ----
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
@@ -262,14 +291,16 @@ case "$SCENARIO_FILTER" in
     scenario1) run_scenario1 ;;
     scenario4) run_scenario4 ;;
     scenario2) run_scenario2 ;;
+    scenario5) run_scenario5 ;;
     all)
         run_scenario1
         run_scenario4
         run_scenario2
+        run_scenario5
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [scenario1|scenario4|scenario2|all]"
+        echo "Usage: $0 [scenario1|scenario4|scenario2|scenario5|all]"
         exit 1
         ;;
 esac
