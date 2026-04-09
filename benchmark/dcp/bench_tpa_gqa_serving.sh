@@ -43,6 +43,7 @@ CONCURRENCIES=(1 2 4 8 16 32 64 128 256 512)
 CONFIGS=(
     "tp8_fa3|fa3|0.85|0||0|0"
     "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
+    "tp8_dcp2_agrs_fa3|fa3|0.85|2|ag_rs|0|0"
     "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
     # NOTE: helix RS is disabled — ReduceScatter changes tensor sizes during decode,
     # causing shape mismatches in layernorm (residual vs input). Needs further work.
@@ -131,8 +132,14 @@ for cfg in "${CONFIGS[@]}"; do
     IFS='|' read -r CFG_NAME BACKEND MEM_FRAC DCP DCP_COMM ATTN_TP HELIX_RS <<< "$cfg"
 
     OUTPUT_DIR="${BASE_OUTPUT}/${CFG_NAME}"
-    mkdir -p "$OUTPUT_DIR"
 
+    # Skip if results already exist (all concurrency levels completed)
+    if [ -f "$OUTPUT_DIR/cc512.txt" ] && grep -q "Output token throughput" "$OUTPUT_DIR/cc512.txt" 2>/dev/null; then
+        echo "Skipping ${CFG_NAME} — results already exist in ${OUTPUT_DIR}"
+        continue
+    fi
+
+    mkdir -p "$OUTPUT_DIR"
     kill_server
     start_server "$CFG_NAME" "$BACKEND" "$MEM_FRAC" "$DCP" "$DCP_COMM" "$ATTN_TP" "$HELIX_RS"
 
