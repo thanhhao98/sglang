@@ -13,7 +13,6 @@
 # ==============================================================================
 import logging
 import math
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -385,7 +384,6 @@ class LayerCommunicator:
         self.use_full_tp_attention_handoff = use_full_tp_attention_handoff
 
         self._context = CommunicateContext.init_new()
-        self._layer_id_for_debug = layer_id
         helix_rs = get_global_server_args().is_helix_reduce_scatter_enabled()
         self._context.use_helix_reduce_scatter = helix_rs
         self._context.is_first_layer = layer_id == 0
@@ -449,25 +447,6 @@ class LayerCommunicator:
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
-    def _helix_dbg(self, tag, hs, res, forward_batch):
-        """Lightweight debug logging for helix RS investigation."""
-        if not os.environ.get("SGLANG_HELIX_DEBUG"):
-            return
-        lid = getattr(self, '_layer_id_for_debug', -1)
-        if lid not in (0, 1):
-            return
-        if not forward_batch.forward_mode.is_decode():
-            return
-        if not hasattr(self, '_helix_dbg_count'):
-            self._helix_dbg_count = 0
-        self._helix_dbg_count += 1
-        if self._helix_dbg_count > 10:
-            return
-        rank = self._context.tp_rank
-        rm = f" res={list(res.shape)}|m={res.float().mean():.5f}|s={res.float().std():.4f}" if res is not None else " res=None"
-        helix_flag = "H" if getattr(self._context, '_helix_active_this_step', False) else "-"
-        print(f"[HELIX_DBG r{rank} L{lid} {helix_flag}] {tag}: hs={list(hs.shape)}|m={hs.float().mean():.5f}|s={hs.float().std():.4f}{rm}", flush=True)
-
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -483,7 +462,6 @@ class LayerCommunicator:
         # Helix RS layer > 0: only if hidden_states is at scattered size [B/tp, H]
         # (which means the PREVIOUS layer used helix RS). Check by comparing
         # with the full batch token count.
-        self._helix_dbg("0_input_prepare_attn", hidden_states, residual, forward_batch)
         _num_tokens = forward_batch.input_ids.shape[0]
         _dcp_size = self._context.attn_cp_size
         _use_helix_this_step = (
@@ -524,7 +502,6 @@ class LayerCommunicator:
                     hidden_states, forward_batch, self.qkv_latent_func
                 )
                 get_attn_tp_context().set_attn_inputs(attn_inputs)
-            self._helix_dbg("1_output_prepare_attn_helix", hidden_states, None, forward_batch)
             return hidden_states, None
 
         use_attention_tpa = self._context.attention_outputs_are_tpa_replicated
@@ -655,7 +632,6 @@ class LayerCommunicator:
                 hidden_states, forward_batch, self.qkv_latent_func
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
-        self._helix_dbg("1_output_prepare_attn_normal", hidden_states, residual, forward_batch)
         return hidden_states, residual
 
     def _tp_reduce_scatter(
@@ -687,16 +663,13 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        self._helix_dbg("2_input_prepare_mlp", hidden_states, residual, forward_batch)
-        result = self._communicate_with_all_reduce_and_layer_norm_fn(
+        return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
-        self._helix_dbg("3_output_prepare_mlp", result[0], result[1], forward_batch)
-        return result
 
     def postprocess_layer(
         self,
@@ -704,7 +677,6 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        self._helix_dbg("4_input_postprocess", hidden_states, residual, forward_batch)
         if getattr(self._context, '_helix_active_this_step', False):
             # Helix RS: tokens are already scattered and MLP skipped AllReduce.
             # Just pass through — no additional communication needed.
