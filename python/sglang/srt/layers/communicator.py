@@ -1056,10 +1056,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     # use_full_tp_attention_handoff or standard TP: o_proj is
                     # sharded across the full TP group, so reduce across all ranks.
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                if not (
-                    context.use_helix_reduce_scatter
-                    and forward_batch.forward_mode.is_decode()
-                ):
+                if not getattr(context, '_helix_active_this_step', False):
                     if _is_npu and context.cache is not None:
                         _ = prepare_weight_cache(hidden_states, context.cache)
                     hidden_states, residual = layernorm(hidden_states, residual)
