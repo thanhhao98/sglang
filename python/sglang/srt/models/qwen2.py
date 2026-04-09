@@ -480,14 +480,15 @@ class Qwen2Model(nn.Module):
             )
         else:
             # Helix RS: AllGather scattered tokens back to full batch for LM head.
+            num_actual_tokens = forward_batch.input_ids.shape[0]
+            tp_size = get_tensor_model_parallel_world_size()
             if (
                 get_global_server_args().is_helix_reduce_scatter_enabled()
                 and forward_batch.forward_mode.is_decode()
+                and num_actual_tokens >= tp_size
+                and hidden_states.shape[0] < num_actual_tokens  # actually scattered
             ):
                 import math
-
-                num_actual_tokens = forward_batch.input_ids.shape[0]
-                tp_size = get_tensor_model_parallel_world_size()
                 chunk_size = math.ceil(num_actual_tokens / tp_size)
                 padded_total = chunk_size * tp_size
                 full_hidden = hidden_states.new_empty(

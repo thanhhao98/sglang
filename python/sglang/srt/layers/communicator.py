@@ -458,11 +458,19 @@ class LayerCommunicator:
         # Run input_layernorm on the small tensors FIRST, then AllGather
         # only hidden_states for attention. Residual stays at [B/tp, H]
         # and is saved for prepare_mlp (matching TRT-LLM's approach).
-        if (
+        # Helix RS layer > 0: only if hidden_states is at scattered size [B/tp, H]
+        # (which means the PREVIOUS layer used helix RS). Check by comparing
+        # with the full batch token count.
+        _num_tokens = forward_batch.input_ids.shape[0]
+        _use_helix_this_step = (
             self._context.use_helix_reduce_scatter
             and not self._context.is_first_layer
             and forward_batch.forward_mode.is_decode()
-        ):
+            and _num_tokens >= self._context.tp_size
+            and hidden_states.shape[0] < _num_tokens  # scattered from previous layer
+        )
+        if _use_helix_this_step:
+            self._context._helix_active_this_step = True
             # 1. LayerNorm on [B/tp, H] tensors
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = self.input_layernorm(
@@ -662,12 +670,10 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            self._context.use_helix_reduce_scatter
-            and forward_batch.forward_mode.is_decode()
-        ):
+        if getattr(self._context, '_helix_active_this_step', False):
             # Helix RS: tokens are already scattered and MLP skipped AllReduce.
             # Just pass through — no additional communication needed.
+            self._context._helix_active_this_step = False
             return hidden_states, residual
         allow_reduce_scatter = self.allow_reduce_scatter
         if self._context.attention_outputs_are_tpa_replicated:
@@ -1012,7 +1018,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if (
                     context.use_helix_reduce_scatter
                     and forward_batch.forward_mode.is_decode()
+                    and hidden_states.shape[0] >= context.tp_size
                 ):
+                    context._helix_active_this_step = True
                     # Helix ReduceScatter: sum partial o_proj outputs across
                     # full TP group and scatter tokens so each rank processes
                     # fewer tokens through MLP/MoE.
