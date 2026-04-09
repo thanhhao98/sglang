@@ -284,10 +284,9 @@ run_scenario5() {
 # ============================================================
 # Scenario 3: Long Context Decode
 # Purpose: DCP/TPA shine at very long context (attention dominates)
-#   CodeQwen 7B supports 65K natively; use context_length=131072
-#   with RoPE scaling for longer. Low CC since each request is huge.
+#   CodeQwen 7B supports 65K natively. Low CC since each request is huge.
 #   KV cache per token: 4 heads * 128 dim * 2 (K+V) * 28 layers * 2 bytes = 57 KB
-#   At 128K context: ~7.3 GB/request → max ~10 requests on 8xH100
+#   At 60K context: ~3.4 GB/request → max ~20 concurrent on 8xH100
 # ============================================================
 run_scenario3() {
     echo ""
@@ -303,8 +302,8 @@ run_scenario3() {
         "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
     )
 
-    # Long context: 128K input, short output, low CC
-    run_scenario_configs "scenario3_longctx" "$model" 131072 16 128000 64 "in128k_out64" "${configs[@]}"
+    # Long context: 60K input, short output, low CC (near CodeQwen max 65K)
+    run_scenario_configs "scenario3_longctx" "$model" 65536 16 60000 64 "in60k_out64" "${configs[@]}"
 
     # Medium-long context: 32K input, short output, moderate CC
     run_scenario_configs "scenario3_longctx" "$model" 65536 64 32000 64 "in32k_out64" "${configs[@]}"
