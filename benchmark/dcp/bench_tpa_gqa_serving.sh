@@ -45,9 +45,7 @@ CONFIGS=(
     "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
     "tp8_dcp2_agrs_fa3|fa3|0.85|2|ag_rs|0|0"
     "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
-    # NOTE: helix RS is disabled — ReduceScatter changes tensor sizes during decode,
-    # causing shape mismatches in layernorm (residual vs input). Needs further work.
-    # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
+    "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
 )
 
 wait_for_server() {
@@ -111,7 +109,7 @@ start_server() {
         extra_args="${extra_args} --attention-tensor-parallel-size ${attn_tp}"
     fi
     if [ "$helix_rs" -eq 1 ]; then
-        extra_args="${extra_args} --enable-helix-reduce-scatter --disable-cuda-graph"
+        extra_args="${extra_args} --enable-helix-reduce-scatter"
     fi
 
     echo "======================================================="
