@@ -281,6 +281,36 @@ run_scenario5() {
 }
 
 
+# ============================================================
+# Scenario 3: Long Context Decode
+# Purpose: DCP/TPA shine at very long context (attention dominates)
+#   CodeQwen 7B supports 65K natively; use context_length=131072
+#   with RoPE scaling for longer. Low CC since each request is huge.
+#   KV cache per token: 4 heads * 128 dim * 2 (K+V) * 28 layers * 2 bytes = 57 KB
+#   At 128K context: ~7.3 GB/request → max ~10 requests on 8xH100
+# ============================================================
+run_scenario3() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 3: CodeQwen 7B — Long Context Decode"
+    echo "======================================================="
+
+    local model="Qwen/CodeQwen1.5-7B-Chat"
+    local configs=(
+        "tp8_fa3|fa3|0.90|0||0|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.90|2|a2a|0|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.90|2|a2a|4|0"
+        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
+    )
+
+    # Long context: 128K input, short output, low CC
+    run_scenario_configs "scenario3_longctx" "$model" 131072 16 128000 64 "in128k_out64" "${configs[@]}"
+
+    # Medium-long context: 32K input, short output, moderate CC
+    run_scenario_configs "scenario3_longctx" "$model" 65536 64 32000 64 "in32k_out64" "${configs[@]}"
+}
+
+
 # ---- Main ----
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
@@ -289,18 +319,20 @@ echo ""
 
 case "$SCENARIO_FILTER" in
     scenario1) run_scenario1 ;;
-    scenario4) run_scenario4 ;;
     scenario2) run_scenario2 ;;
+    scenario3) run_scenario3 ;;
+    scenario4) run_scenario4 ;;
     scenario5) run_scenario5 ;;
     all)
         run_scenario1
+        run_scenario3
         run_scenario4
         run_scenario2
         run_scenario5
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [scenario1|scenario4|scenario2|scenario5|all]"
+        echo "Usage: $0 [scenario1|scenario2|scenario3|scenario4|scenario5|all]"
         exit 1
         ;;
 esac
