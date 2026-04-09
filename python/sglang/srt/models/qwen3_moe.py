@@ -490,7 +490,6 @@ class Qwen3MoeAttention(nn.Module):
             get_global_server_args().is_attention_tpa_enabled()
             and full_tp_size > attn_tp_size
             and self.total_num_heads % full_tp_size == 0
-            and not get_global_server_args().is_helix_reduce_scatter_enabled()
         ):
             dcp_size = full_tp_size // attn_tp_size
             full_tp_local_num_heads = self.total_num_heads // full_tp_size

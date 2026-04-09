@@ -485,16 +485,18 @@ class LayerCommunicator:
         # with the full batch token count.
         self._helix_dbg("0_input_prepare_attn", hidden_states, residual, forward_batch)
         _num_tokens = forward_batch.input_ids.shape[0]
+        _dcp_size = self._context.attn_cp_size
         _use_helix_this_step = (
             self._context.use_helix_reduce_scatter
             and not self._context.is_first_layer
             and forward_batch.forward_mode.is_decode()
-            and _num_tokens >= self._context.attn_tp_size
+            and _num_tokens >= _dcp_size
+            and _dcp_size > 1
             and hidden_states.shape[0] < _num_tokens  # scattered from previous layer
         )
         if _use_helix_this_step:
             self._context._helix_active_this_step = True
-            # 1. LayerNorm on [B/tp, H] tensors
+            # 1. LayerNorm on [B/dcp, H] tensors
             if hidden_states.shape[0] != 0:
                 if residual is not None:
                     hidden_states, residual = self.input_layernorm(
@@ -502,17 +504,17 @@ class LayerCommunicator:
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-            # 2. Save residual at [B/attn_tp, H] for prepare_mlp
+            # 2. Save residual at [B/dcp, H] for prepare_mlp
             self._context.helix_saved_residual = residual
-            # 3. AllGather hidden_states only → [B, H] across attn_tp group
+            # 3. AllGather hidden_states only → [B, H] across DCP group
             num_actual_tokens = forward_batch.input_ids.shape[0]
-            helix_group_size = self._context.attn_tp_size
-            chunk_size = math.ceil(num_actual_tokens / helix_group_size)
-            padded_total = chunk_size * helix_group_size
+            chunk_size = math.ceil(num_actual_tokens / _dcp_size)
+            padded_total = chunk_size * _dcp_size
             full_hidden = hidden_states.new_empty(
                 padded_total, hidden_states.shape[1]
             )
-            get_attention_tp_group().all_gather_into_tensor(
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+            get_dcp_group().all_gather_into_tensor(
                 full_hidden, hidden_states
             )
             hidden_states = full_hidden[:num_actual_tokens]
@@ -1054,33 +1056,41 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                # Helix RS uses attn_tp group (not full TP) for ReduceScatter
-                # so that ranks within the same attn_tp group share the same
-                # scattered tokens. MLP AllReduce within attn_tp is then correct.
-                helix_group_size = context.attn_tp_size
+                # Helix RS approach: keep full-TP o_proj (with handoff).
+                # 1. AllReduce across full TP (standard o_proj reduction)
+                # 2. ReduceScatter across DCP group (B → B/dcp per rank)
+                # After this, ranks in the same attn_tp group share the same
+                # B/dcp tokens. MLP AllReduce within attn_tp group is correct
+                # (sums attn_tp_size weight partials for the same tokens).
+                dcp_size = context.attn_cp_size  # DCP size
                 if (
                     context.use_helix_reduce_scatter
                     and forward_batch.forward_mode.is_decode()
-                    and hidden_states.shape[0] >= helix_group_size
+                    and hidden_states.shape[0] >= dcp_size
+                    and dcp_size > 1
                 ):
+                    # Step 1: standard full-TP AllReduce for o_proj
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    # Step 2: ReduceScatter across DCP group (B → B/dcp)
                     context._helix_active_this_step = True
                     num_tokens = hidden_states.shape[0]
                     hidden_states, chunk_size = _helix_pad_tokens(
-                        hidden_states, num_tokens, helix_group_size
+                        hidden_states, num_tokens, dcp_size
                     )
                     output = hidden_states.new_empty(
                         chunk_size, hidden_states.shape[1]
                     )
-                    get_attention_tp_group().reduce_scatter_tensor(
+                    from sglang.srt.distributed.parallel_state import get_dcp_group
+                    get_dcp_group().reduce_scatter_tensor(
                         output, hidden_states
                     )
                     hidden_states = output
-                    # Restore residual at [B/attn_tp, H].
+                    # Restore residual at [B/dcp, H].
                     if context.is_first_layer:
                         residual, _ = _helix_pad_tokens(
-                            residual, num_tokens, helix_group_size
+                            residual, num_tokens, dcp_size
                         )
-                        start = context.attn_tp_rank * chunk_size
+                        start = context.attn_cp_rank * chunk_size
                         residual = residual[start : start + chunk_size]
                     else:
                         residual = context.helix_saved_residual
@@ -1094,10 +1104,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 elif use_attention_tp_reduce:
                     # In TPA mode, attention outputs are duplicated across DCP peers
                     # and only need to be summed across the smaller attention-TP group.
-                    hidden_states = attn_tp_all_reduce(hidden_states)
-                elif context.use_helix_reduce_scatter:
-                    # Helix RS fallback (B < attn_tp_size): o_proj is sharded by
-                    # attn_tp (no handoff), so use attn_tp AllReduce.
                     hidden_states = attn_tp_all_reduce(hidden_states)
                 else:
                     # use_full_tp_attention_handoff or standard TP: o_proj is

@@ -78,25 +78,14 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_attn_tp_sharding: bool = False,
     ) -> None:
         super().__init__()
-        # When helix RS is active, MLP must use attn_tp group for weight
-        # sharding so that AllReduce operates on ranks with the same tokens.
-        if use_attn_tp_sharding:
-            mlp_tp_rank = get_attention_tp_rank()
-            mlp_tp_size = get_attention_tp_size()
-        else:
-            mlp_tp_rank = None  # defaults to full_tp
-            mlp_tp_size = None
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=mlp_tp_rank,
-            tp_size=mlp_tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -104,9 +93,6 @@ class Qwen2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=mlp_tp_rank,
-            tp_size=mlp_tp_size,
-            use_dp_attention_reduce=use_attn_tp_sharding,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -175,7 +161,6 @@ class Qwen2Attention(nn.Module):
             get_global_server_args().is_attention_tpa_enabled()
             and full_tp_size > attn_tp_size
             and self.total_num_heads % full_tp_size == 0
-            and not get_global_server_args().is_helix_reduce_scatter_enabled()
         ):
             dcp_size = full_tp_size // attn_tp_size
             full_tp_local_num_heads = self.total_num_heads // full_tp_size
@@ -285,7 +270,6 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            use_attn_tp_sharding=get_global_server_args().is_helix_reduce_scatter_enabled(),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -497,22 +481,27 @@ class Qwen2Model(nn.Module):
             )
         else:
             # Helix RS: AllGather scattered tokens back to full batch for LM head.
-            # Uses attn_tp group (not full TP) since helix RS scatters across attn_tp.
+            # Uses DCP group since helix RS scatters across DCP peers.
+            from sglang.srt.distributed.parallel_state import (
+                get_dcp_group,
+                get_dcp_size,
+            )
             num_actual_tokens = forward_batch.input_ids.shape[0]
-            attn_tp_sz = get_attention_tp_size()
+            dcp_sz = get_dcp_size()
             if (
                 get_global_server_args().is_helix_reduce_scatter_enabled()
                 and forward_batch.forward_mode.is_decode()
-                and num_actual_tokens >= attn_tp_sz
+                and dcp_sz > 1
+                and num_actual_tokens >= dcp_sz
                 and hidden_states.shape[0] < num_actual_tokens  # actually scattered
             ):
                 import math
-                chunk_size = math.ceil(num_actual_tokens / attn_tp_sz)
-                padded_total = chunk_size * attn_tp_sz
+                chunk_size = math.ceil(num_actual_tokens / dcp_sz)
+                padded_total = chunk_size * dcp_sz
                 full_hidden = hidden_states.new_empty(
                     padded_total, hidden_states.shape[1]
                 )
-                get_attention_tp_group().all_gather_into_tensor(
+                get_dcp_group().all_gather_into_tensor(
                     full_hidden, hidden_states
                 )
                 hidden_states = full_hidden[:num_actual_tokens]
@@ -520,7 +509,7 @@ class Qwen2Model(nn.Module):
                     full_residual = residual.new_empty(
                         padded_total, residual.shape[1]
                     )
-                    get_attention_tp_group().all_gather_into_tensor(
+                    get_dcp_group().all_gather_into_tensor(
                         full_residual, residual
                     )
                     residual = full_residual[:num_actual_tokens]
