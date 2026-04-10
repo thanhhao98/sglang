@@ -691,6 +691,10 @@ class LayerCommunicator:
             # Helix RS handles scattering in prepare_mlp via attn_tp group.
             # The dp_reduce_scatter_tensor path is incompatible.
             allow_reduce_scatter = False
+        if self.use_full_tp_attention_handoff and self._context.attn_tp_size != self._context.tp_size:
+            # TPA with handoff: dp_reduce_scatter_tensor uses mixed attn_tp/tp
+            # groups that produce size mismatches. Disable for safety.
+            allow_reduce_scatter = False
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -708,6 +712,8 @@ class LayerCommunicator:
             # regular postprocess path instead of mixing group sizes here.
             return False
         if self._context.use_helix_reduce_scatter:
+            return False
+        if self.use_full_tp_attention_handoff and self._context.attn_tp_size != self._context.tp_size:
             return False
         # NOTE: helix RS does NOT skip MLP AllReduce. The ReduceScatter
         # replaces the o_proj AllReduce (in prepare_mlp), but the MLP's
@@ -1041,9 +1047,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     and hidden_states.shape[0] >= dcp_size
                     and dcp_size > 1
                 ):
-                    # Step 1: standard full-TP AllReduce for o_proj
+                    # Step 1: full-TP AllReduce for o_proj (with handoff, 8 partials)
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     # Step 2: ReduceScatter across DCP group (B → B/dcp)
+                    #   After AllReduce, DCP peers have identical tensors.
+                    #   RS sums them (2x, normalized by layernorm) and scatters tokens.
                     context._helix_active_this_step = True
                     num_tokens = hidden_states.shape[0]
                     hidden_states, chunk_size = _helix_pad_tokens(
