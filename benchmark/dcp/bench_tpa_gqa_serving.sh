@@ -28,14 +28,15 @@ BASE_OUTPUT="${SCRIPT_DIR}/results/${BRANCH}_${HASH}"
 
 COMMON_ENV="SGLANG_DCP_SYMM_ONLY=true NCCL_DEBUG=WARN PYTHONUNBUFFERED=1 \
 TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_AUTOGRAD_CACHE=1 \
-SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1"
+SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1 \
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
 
 SCENARIO_FILTER="${1:-all}"
 
 # ---- Helper functions ----
 
 wait_for_server() {
-    local max_wait=600
+    local max_wait=1200
     local elapsed=0
     echo "Waiting for server on ${HOST}:${PORT} ..."
     while [ $elapsed -lt $max_wait ]; do
@@ -279,14 +280,15 @@ run_scenario5() {
     # 4 KV heads, 64 Q heads, 94 layers, MoE 128 experts (8 active)
     # tp8: each rank has 0.5 KV heads (needs GQA replication)
     # tpa4+dcp2: attn_tp=4, each attn rank has 1 KV head
+    # Note: DCP+TPA needs extra memory for symmetric mem buffers — use lower mem_frac
     local configs=(
         "tp8_fa3|fa3|0.90|0||0|0"
-        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.90|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
+        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
     )
 
-    # MoE model: long input (32K) + medium output (4K) to stress both prefill and decode
-    run_scenario_configs "scenario5_qwen3_235b" "$model" 40960 64 32000 4000 "in32k_out4k" "${configs[@]}"
+    # MoE model: medium input + output, high CC to see saturation
+    run_scenario_configs "scenario5_qwen3_235b" "$model" 32768 512 4000 1500 "in4000_out1500" "${configs[@]}"
 }
 
 
@@ -319,6 +321,35 @@ run_scenario3() {
 }
 
 
+# ============================================================
+# Scenario 6: CodeQwen 7B — 1M Context (DCP/TPA sweet spot)
+# Purpose: Very long context where DCP splits KV cache across ranks,
+#   TPA enables higher DCP degrees. This is where Phase-1 showed 2x.
+#   Uses SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 (set in COMMON_ENV)
+#   KV per token: 57 KB → at 1M: ~57 GB → needs DCP to fit
+# ============================================================
+run_scenario6() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 6: CodeQwen 7B — 1M Context"
+    echo "======================================================="
+
+    local model="Qwen/CodeQwen1.5-7B-Chat"
+    local configs=(
+        "tp8_fa3|fa3|0.92|0||0|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.92|2|a2a|4|0"
+        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.92|2|a2a|4|1"
+    )
+
+    # 1M context: very long input, short output, low CC
+    run_scenario_configs "scenario6_1m" "$model" 1048576 16 1000000 64 "in1m_out64" "${configs[@]}"
+
+    # 131K context: long input, moderate CC
+    run_scenario_configs "scenario6_1m" "$model" 131072 32 131000 64 "in131k_out64" "${configs[@]}"
+}
+
+
 # ---- Main ----
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
@@ -331,16 +362,18 @@ case "$SCENARIO_FILTER" in
     scenario3) run_scenario3 ;;
     scenario4) run_scenario4 ;;
     scenario5) run_scenario5 ;;
+    scenario6) run_scenario6 ;;
     all)
         run_scenario1
         run_scenario3
         run_scenario4
         run_scenario2
         run_scenario5
+        run_scenario6
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [scenario1|scenario2|scenario3|scenario4|scenario5|all]"
+        echo "Usage: $0 [scenario1|scenario2|scenario3|scenario4|scenario5|scenario6|all]"
         exit 1
         ;;
 esac
