@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -43,6 +44,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -698,6 +700,41 @@ class Qwen2MoeModel(nn.Module):
                 }
             )
         else:
+            # Helix RS: AllGather scattered tokens back to full batch for LM head.
+            # Uses DCP group since helix RS scatters across DCP peers.
+            from sglang.srt.distributed.parallel_state import (
+                get_dcp_group,
+                get_dcp_size,
+            )
+            num_actual_tokens = forward_batch.input_ids.shape[0]
+            dcp_sz = get_dcp_size()
+            if (
+                get_global_server_args().is_helix_reduce_scatter_enabled()
+                and forward_batch.forward_mode.is_decode()
+                and dcp_sz > 1
+                and num_actual_tokens >= dcp_sz
+                and hidden_states.shape[0] < num_actual_tokens
+            ):
+                import math
+
+                chunk_size = math.ceil(num_actual_tokens / dcp_sz)
+                padded_total = chunk_size * dcp_sz
+                full_hidden = hidden_states.new_empty(
+                    padded_total, hidden_states.shape[1]
+                )
+                get_dcp_group().all_gather_into_tensor(
+                    full_hidden, hidden_states
+                )
+                hidden_states = full_hidden[:num_actual_tokens]
+                if residual is not None:
+                    full_residual = residual.new_empty(
+                        padded_total, residual.shape[1]
+                    )
+                    get_dcp_group().all_gather_into_tensor(
+                        full_residual, residual
+                    )
+                    residual = full_residual[:num_actual_tokens]
+
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)

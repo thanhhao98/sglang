@@ -1006,6 +1006,8 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
 
         output_heads, _ = self._get_output_head_partition(layer)
+        if o.ndim == 3 and output_heads != o.shape[1]:
+            o = self._apply_output_head_partition(o, layer)
         return o.reshape(-1, output_heads * layer.v_head_dim)
 
     def forward_decode(
@@ -1475,25 +1477,29 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
         if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
-            # Per-bs buffer allocation: each CUDA graph capture gets
-            # right-sized buffers so NCCL transfers only actual batch data,
-            # not the full max_bs padding. Buffers are lazily allocated in
-            # _alloc_dcp_a2a_buffers_for_bs() during graph capture.
+            # Pre-allocate a single set of A2A buffers for max_bs, reused by
+            # all graph batch sizes.  This avoids per-bs symmetric memory
+            # allocations which exhaust NCCL symmetric memory at high
+            # concurrency (CC512 with 52 captured batch sizes).
             self.dcp_cuda_graph_buffers_per_bs = {}
             self.dcp_cuda_graph_buffers = None
+            self._dcp_a2a_max_bs_buffers = self._alloc_dcp_a2a_buffers_max(max_bs)
 
             # TPA-specific DCP A2A buffers (narrower head count)
             if getattr(self, "tpa_dcp_a2a_heads_per_rank", None) is not None:
+                from sglang.srt.layers.attention.dcp_a2a import _lse_pack_dim
+
                 N = self.dcp_size
                 H_per_rank = self.tpa_dcp_a2a_heads_per_rank
                 D = self.dcp_v_head_dim
+                lpd = _lse_pack_dim(self.dcp_dtype)
                 self.tpa_dcp_cuda_graph_buffers = {
-                    "send_output": torch.empty(
-                        N, max_bs, H_per_rank, D,
+                    "send_combined": torch.empty(
+                        N, max_bs, H_per_rank, D + lpd,
                         dtype=self.dcp_dtype, device=self.device,
                     ),
-                    "recv_output": torch.empty(
-                        N, max_bs, H_per_rank, D,
+                    "recv_combined": torch.empty(
+                        N, max_bs, H_per_rank, D + lpd,
                         dtype=self.dcp_dtype, device=self.device,
                     ),
                     "send_lse": torch.empty(
@@ -1996,6 +2002,7 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
+        raw_bs: Optional[int] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         seq_lens = seq_lens[:bs]
@@ -2108,7 +2115,18 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 if self.dcp_size > 1:
+                    # Zero page_table padding rows BEFORE DCP builds its local
+                    # page table, so DCP never sees stale indices.
+                    if raw_bs is not None and raw_bs < bs:
+                        metadata.page_table[raw_bs:bs].zero_()
                     self._init_dcp_decode_metadata(metadata, device)
+                    # Also zero dcp_page_table for padding rows.  For DCP rank 0
+                    # with fill_value=1, padding gets local_seqlens=1 (not 0),
+                    # so the dcp_layout.py mask doesn't catch it.  FA3 then reads
+                    # 1 KV token from a garbage page index -> OOB.
+                    if raw_bs is not None and raw_bs < bs:
+                        metadata.dcp_page_table[raw_bs:bs].zero_()
+                        metadata.dcp_cache_seqlens[raw_bs:bs].zero_()
                     if self.dcp_comm_backend == "a2a":
                         # Point to the right per-bs buffers for this graph replay.
                         self.dcp_cuda_graph_buffers = (
@@ -2358,17 +2376,12 @@ class FlashAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
-    def _alloc_dcp_a2a_buffers_for_bs(self, bs: int):
-        """Allocate right-sized DCP A2A buffers for a specific batch size.
+    def _alloc_dcp_a2a_buffers_max(self, max_bs: int):
+        """Pre-allocate ONE set of DCP A2A buffers for the max batch size.
 
-        Uses a fused buffer layout that packs output (bf16) + LSE (fp32
-        reinterpreted as 2×bf16) into a single [N, bs, H_per_rank, D+2]
-        buffer, enabling one all_to_all call instead of two.
+        All graph captures reuse these buffers, avoiding per-bs symmetric
+        memory allocations that exhaust NCCL symmetric memory at CC512.
         """
-        if bs in self.dcp_cuda_graph_buffers_per_bs:
-            self.dcp_cuda_graph_buffers = self.dcp_cuda_graph_buffers_per_bs[bs]
-            return
-
         from sglang.srt.layers.attention.dcp_a2a import _lse_pack_dim
 
         N = self.dcp_size
@@ -2380,47 +2393,41 @@ class FlashAttentionBackend(AttentionBackend):
         with SymmetricMemoryContext(get_dcp_group()):
             buffers = {
                 "q_gathered": torch.empty(
-                    bs,
-                    H_all,
-                    self.dcp_head_dim,
-                    dtype=self.dcp_dtype,
-                    device=self.device,
+                    max_bs, H_all, self.dcp_head_dim,
+                    dtype=self.dcp_dtype, device=self.device,
                 ),
-                # Fused output+LSE buffer: [N, bs, H_per_rank, D + lse_pack_dim]
                 "send_combined": torch.empty(
-                    N,
-                    bs,
-                    H_per_rank,
-                    D + lpd,
-                    dtype=self.dcp_dtype,
-                    device=self.device,
+                    N, max_bs, H_per_rank, D + lpd,
+                    dtype=self.dcp_dtype, device=self.device,
                 ),
                 "recv_combined": torch.empty(
-                    N,
-                    bs,
-                    H_per_rank,
-                    D + lpd,
-                    dtype=self.dcp_dtype,
-                    device=self.device,
+                    N, max_bs, H_per_rank, D + lpd,
+                    dtype=self.dcp_dtype, device=self.device,
                 ),
-                # fp32 staging buffers for LSE pack/unpack
                 "send_lse": torch.empty(
-                    N,
-                    bs,
-                    H_per_rank,
-                    dtype=torch.float32,
-                    device=self.device,
+                    N, max_bs, H_per_rank,
+                    dtype=torch.float32, device=self.device,
                 ),
                 "recv_lse": torch.empty(
-                    N,
-                    bs,
-                    H_per_rank,
-                    dtype=torch.float32,
-                    device=self.device,
+                    N, max_bs, H_per_rank,
+                    dtype=torch.float32, device=self.device,
                 ),
             }
-        self.dcp_cuda_graph_buffers_per_bs[bs] = buffers
-        self.dcp_cuda_graph_buffers = buffers
+        return buffers
+
+    def _alloc_dcp_a2a_buffers_for_bs(self, bs: int):
+        """Point to the pre-allocated max-bs A2A buffers for this batch size.
+
+        The all_to_all_single inside CUDA graph operates on the full max-bs
+        buffer; unused rows (bs..max_bs) are harmless padding.
+        """
+        if bs in self.dcp_cuda_graph_buffers_per_bs:
+            self.dcp_cuda_graph_buffers = self.dcp_cuda_graph_buffers_per_bs[bs]
+            return
+
+        # Reuse the single pre-allocated max-bs buffer set
+        self.dcp_cuda_graph_buffers_per_bs[bs] = self._dcp_a2a_max_bs_buffers
+        self.dcp_cuda_graph_buffers = self._dcp_a2a_max_bs_buffers
 
     def _init_dcp_decode_metadata(self, metadata: FlashAttentionMetadata, device):
         """Build DCP-filtered page_table and cache_seqlens for local KV shard.
@@ -2450,13 +2457,15 @@ class FlashAttentionBackend(AttentionBackend):
         )
         max_local_pages = local_pt.shape[1]
 
-        # Use pre-allocated buffers if available (CUDA graph mode)
+        # Use pre-allocated buffers if available (CUDA graph mode).
+        # IMPORTANT: Always expose the full pre-allocated column width so the
+        # FA3 kernel sees a stable tensor shape across capture and replay.
         cg_meta = self.decode_cuda_graph_metadata
         if isinstance(cg_meta, dict) and "dcp_page_table" in cg_meta:
             cg_meta["dcp_cache_seqlens"][:B].copy_(local_seqlens.to(torch.int32))
             cg_meta["dcp_page_table"][:B, :max_local_pages].copy_(local_pt)
             metadata.dcp_cache_seqlens = cg_meta["dcp_cache_seqlens"][:B]
-            metadata.dcp_page_table = cg_meta["dcp_page_table"][:B, :max_local_pages]
+            metadata.dcp_page_table = cg_meta["dcp_page_table"][:B]
         else:
             metadata.dcp_page_table = local_pt
             metadata.dcp_cache_seqlens = local_seqlens.to(torch.int32)

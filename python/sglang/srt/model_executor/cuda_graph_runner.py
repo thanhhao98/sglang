@@ -268,6 +268,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            # Zero padding slots in req_pool_indices to prevent stale indices
+            # from causing OOB reads in the metadata Triton kernel (e.g. DCP).
+            self.req_pool_indices[raw_bs:bs].zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -1128,6 +1131,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            raw_bs=raw_bs,
         )
 
         # Store fields
@@ -1152,6 +1156,12 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+        # Ensure metadata updates on the current stream complete before
+        # the graph replays on its captured stream.  Without this, DCP
+        # metadata (.zero_() / .copy_()) may not be visible to FA3.
+        if self.stream is not None:
+            self.stream.wait_stream(torch.cuda.current_stream())
 
         # Replay
         if self.enable_pdmux:

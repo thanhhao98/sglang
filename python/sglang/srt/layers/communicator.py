@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -389,7 +390,7 @@ class LayerCommunicator:
         self._context.attention_outputs_are_tpa_replicated = (
             get_global_server_args().is_attention_tpa_enabled()
             and not self.use_full_tp_attention_handoff
-            and not helix_rs  # Helix RS: outputs are unique per rank, not replicated
+            and not helix_rs  # Helix RS: handled by ReduceScatter or explicit fallback
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
@@ -454,31 +455,54 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
-        # Helix RS: AllGather scattered tokens back to full batch for attention.
-        # Layer 0 already has full tokens from the embedding.
-        if (
+        # Helix RS (layer > 0): hidden_states and residual arrive at [B/tp, H].
+        # Run input_layernorm on the small tensors FIRST, then AllGather
+        # only hidden_states for attention. Residual stays at [B/tp, H]
+        # and is saved for prepare_mlp (matching TRT-LLM's approach).
+        # Helix RS layer > 0: only if hidden_states is at scattered size [B/tp, H]
+        # (which means the PREVIOUS layer used helix RS). Check by comparing
+        # with the full batch token count.
+        _num_tokens = forward_batch.input_ids.shape[0]
+        _dcp_size = self._context.attn_cp_size
+        _use_helix_this_step = (
             self._context.use_helix_reduce_scatter
             and not self._context.is_first_layer
             and forward_batch.forward_mode.is_decode()
-        ):
+            and _num_tokens >= _dcp_size
+            and _dcp_size > 1
+            and hidden_states.shape[0] < _num_tokens  # scattered from previous layer
+        )
+        if _use_helix_this_step:
+            self._context._helix_active_this_step = True
+            # 1. LayerNorm on [B/dcp, H] tensors
+            if hidden_states.shape[0] != 0:
+                if residual is not None:
+                    hidden_states, residual = self.input_layernorm(
+                        hidden_states, residual
+                    )
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
+            # 2. Save residual at [B/dcp, H] for prepare_mlp
+            self._context.helix_saved_residual = residual
+            # 3. AllGather hidden_states only → [B, H] across DCP group
             num_actual_tokens = forward_batch.input_ids.shape[0]
-            chunk_size = math.ceil(
-                num_actual_tokens / self._context.tp_size
-            )
-            padded_total = chunk_size * self._context.tp_size
+            chunk_size = math.ceil(num_actual_tokens / _dcp_size)
+            padded_total = chunk_size * _dcp_size
             full_hidden = hidden_states.new_empty(
                 padded_total, hidden_states.shape[1]
             )
-            get_tp_group().all_gather_into_tensor(full_hidden, hidden_states)
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+            get_dcp_group().all_gather_into_tensor(
+                full_hidden, hidden_states
+            )
             hidden_states = full_hidden[:num_actual_tokens]
-            if residual is not None:
-                full_residual = residual.new_empty(
-                    padded_total, residual.shape[1]
+            # 4. Return with residual=None (saved internally)
+            if self.qkv_latent_func is not None:
+                attn_inputs = AttentionInputs(
+                    hidden_states, forward_batch, self.qkv_latent_func
                 )
-                get_tp_group().all_gather_into_tensor(
-                    full_residual, residual
-                )
-                residual = full_residual[:num_actual_tokens]
+                get_attn_tp_context().set_attn_inputs(attn_inputs)
+            return hidden_states, None
 
         use_attention_tpa = self._context.attention_outputs_are_tpa_replicated
         if get_attn_tp_context().input_scattered:
@@ -596,17 +620,13 @@ class LayerCommunicator:
                             post_residual_addition,
                         )
 
-        if not (
-            self._context.use_helix_reduce_scatter
-            and not self._context.is_first_layer
-            and forward_batch.forward_mode.is_decode()
-        ):
-            # Skip for helix RS decode (layer > 0): AllGather already done above.
-            hidden_states = self._communicate_simple_fn(
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                context=self._context,
-            )
+        # Helix RS layer > 0 decode returned early above; this runs for
+        # all other cases (layer 0, prefill, non-helix).
+        hidden_states = self._communicate_simple_fn(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            context=self._context,
+        )
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
@@ -657,17 +677,23 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            self._context.use_helix_reduce_scatter
-            and forward_batch.forward_mode.is_decode()
-        ):
+        if getattr(self._context, '_helix_active_this_step', False):
             # Helix RS: tokens are already scattered and MLP skipped AllReduce.
             # Just pass through — no additional communication needed.
+            self._context._helix_active_this_step = False
             return hidden_states, residual
         allow_reduce_scatter = self.allow_reduce_scatter
         if self._context.attention_outputs_are_tpa_replicated:
             # TPA keeps attention outputs replicated across DCP peers, so the
             # full-TP reduce-scatter shortcut is not layout-safe here.
+            allow_reduce_scatter = False
+        if self._context.use_helix_reduce_scatter:
+            # Helix RS handles scattering in prepare_mlp via attn_tp group.
+            # The dp_reduce_scatter_tensor path is incompatible.
+            allow_reduce_scatter = False
+        if self.use_full_tp_attention_handoff and self._context.attn_tp_size != self._context.tp_size:
+            # TPA with handoff: dp_reduce_scatter_tensor uses mixed attn_tp/tp
+            # groups that produce size mismatches. Disable for safety.
             allow_reduce_scatter = False
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
@@ -685,13 +711,13 @@ class LayerCommunicator:
             # In TPA mode, attention uses a smaller TP group, so keep the
             # regular postprocess path instead of mixing group sizes here.
             return False
-        if (
-            self._context.use_helix_reduce_scatter
-            and forward_batch.forward_mode.is_decode()
-        ):
-            # Helix RS already did ReduceScatter after o_proj; MLP/MoE
-            # must skip their AllReduce to avoid double-reduction.
-            return True
+        if self._context.use_helix_reduce_scatter:
+            return False
+        if self.use_full_tp_attention_handoff and self._context.attn_tp_size != self._context.tp_size:
+            return False
+        # NOTE: helix RS does NOT skip MLP AllReduce. The ReduceScatter
+        # replaces the o_proj AllReduce (in prepare_mlp), but the MLP's
+        # down_proj is still TP-sharded and needs its own AllReduce.
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
@@ -774,6 +800,7 @@ class CommunicateContext:
     attention_outputs_are_tpa_replicated: bool = False
     use_helix_reduce_scatter: bool = False
     is_first_layer: bool = False
+    helix_saved_residual: Optional[torch.Tensor] = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1007,45 +1034,62 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
+                # Helix RS approach: keep full-TP o_proj (with handoff).
+                # 1. AllReduce across full TP (standard o_proj reduction)
+                # 2. ReduceScatter across DCP group (B → B/dcp per rank)
+                # After this, ranks in the same attn_tp group share the same
+                # B/dcp tokens. MLP AllReduce within attn_tp group is correct
+                # (sums attn_tp_size weight partials for the same tokens).
+                dcp_size = context.attn_cp_size  # DCP size
                 if (
                     context.use_helix_reduce_scatter
                     and forward_batch.forward_mode.is_decode()
+                    and hidden_states.shape[0] >= dcp_size
+                    and dcp_size > 1
                 ):
-                    # Helix ReduceScatter: sum partial o_proj outputs across
-                    # full TP group and scatter tokens so each rank processes
-                    # fewer tokens through MLP/MoE.
+                    # Step 1: full-TP AllReduce for o_proj (with handoff, 8 partials)
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    # Step 2: ReduceScatter across DCP group (B → B/dcp)
+                    #   After AllReduce, DCP peers have identical tensors.
+                    #   RS sums them (2x, normalized by layernorm) and scatters tokens.
+                    context._helix_active_this_step = True
                     num_tokens = hidden_states.shape[0]
                     hidden_states, chunk_size = _helix_pad_tokens(
-                        hidden_states, num_tokens, context.tp_size
+                        hidden_states, num_tokens, dcp_size
                     )
                     output = hidden_states.new_empty(
                         chunk_size, hidden_states.shape[1]
                     )
-                    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+                    from sglang.srt.distributed.parallel_state import get_dcp_group
+                    get_dcp_group().reduce_scatter_tensor(
+                        output, hidden_states
+                    )
                     hidden_states = output
-                    # Slice residual to match local token chunk
+                    # Restore residual at [B/dcp, H].
                     if context.is_first_layer:
                         residual, _ = _helix_pad_tokens(
-                            residual, num_tokens, context.tp_size
+                            residual, num_tokens, dcp_size
                         )
-                        start = context.tp_rank * chunk_size
+                        start = context.attn_cp_rank * chunk_size
                         residual = residual[start : start + chunk_size]
+                    else:
+                        residual = context.helix_saved_residual
                     if hidden_states.shape[0] != 0:
-                        hidden_states, residual = layernorm(
-                            hidden_states, residual
-                        )
+                        if residual is not None:
+                            hidden_states, residual = layernorm(
+                                hidden_states, residual
+                            )
+                        else:
+                            hidden_states = layernorm(hidden_states)
                 elif use_attention_tp_reduce:
                     # In TPA mode, attention outputs are duplicated across DCP peers
                     # and only need to be summed across the smaller attention-TP group.
                     hidden_states = attn_tp_all_reduce(hidden_states)
                 else:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
-                if not (
-                    context.use_helix_reduce_scatter
-                    and forward_batch.forward_mode.is_decode()
-                ):
+                    # use_full_tp_attention_handoff or standard TP: o_proj is
+                    # sharded across the full TP group, so reduce across all ranks.
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if not getattr(context, '_helix_active_this_step', False):
                     if _is_npu and context.cache is not None:
                         _ = prepare_weight_cache(hidden_states, context.cache)
                     hidden_states, residual = layernorm(hidden_states, residual)

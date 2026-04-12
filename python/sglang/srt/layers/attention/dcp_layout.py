@@ -47,7 +47,7 @@ def build_dcp_local_page_table(
     else:
         source_cols = global_token_positions // page_size
 
-    source_cols = source_cols.clamp_max(global_page_table.shape[1] - 1).to(torch.long)
+    source_cols = source_cols.clamp(0, global_page_table.shape[1] - 1).to(torch.long)
     local_page_table = global_page_table.index_select(1, source_cols)
 
     # Eager decode stores one entry per token position, and those entries are
@@ -62,5 +62,11 @@ def build_dcp_local_page_table(
             torch.div(local_page_table, dcp_size, rounding_mode="floor"),
             local_page_table,
         )
+
+    # Zero out rows for padding slots (local_seqlens == 0) to prevent
+    # stale page indices from causing OOB access in downstream kernels.
+    padding_mask = (local_seqlens == 0).unsqueeze(1)
+    if padding_mask.any():
+        local_page_table = local_page_table.masked_fill(padding_mask, 0)
 
     return local_page_table, local_seqlens.to(torch.int32)
