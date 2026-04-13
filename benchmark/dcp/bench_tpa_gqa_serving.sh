@@ -17,6 +17,8 @@
 #   S8:  CodeQwen 7B TPA at 512K (tpa2_dcp4 only config with headroom)
 #   S9:  Qwen2-72B TPA enables DCP (plain DCP impossible)
 #   S10: Qwen3-235B MoE TPA high CC at 32K
+#   S11: CodeQwen 7B decode-focused (Zhao repro) — prefix cache, 512K/1M
+#   S12: CodeQwen 7B decode TPOT comparison — prefix cache, 128K/256K
 #
 # Usage:
 #   bash benchmark/dcp/bench_tpa_gqa_serving.sh <scenario> [mode]
@@ -112,16 +114,47 @@ run_perf() {
 
         echo "--- Concurrency=$C, Prompts=$NUM_PROMPTS -> $FILE_NAME ---"
 
+        local extra_bench_args=""
+        local dataset_args="--dataset-name random --random-input-len $input_len --random-output-len $output_len --random-range-ratio 0.1"
+        if [ "${ENABLE_PREFIX_CACHE:-0}" -eq 1 ]; then
+            # Generate prompts with shared prefix + unique suffix.
+            # Shared prefix → cached (prefill is free after first request)
+            # Unique suffix (~100 tokens) → each request has own KV tail → real decode work
+            # This creates memory pressure: N concurrent = N × full context KV
+            local PROMPT_FILE="/tmp/decode_bench_prompts_${input_len}_${NUM_PROMPTS}.json"
+            python3 -c "
+import json, random
+random.seed(42)
+from transformers import AutoTokenizer
+tk = AutoTokenizer.from_pretrained('$model', trust_remote_code=True)
+# Shared prefix: 99% of input length
+prefix_len = max(1, ${input_len} - 100)
+suffix_len = ${input_len} - prefix_len
+base = 'The quick brown fox jumps over the lazy dog. '
+prefix_tokens = tk.encode(base * (prefix_len // 10 + 1))[:prefix_len]
+prefix_text = tk.decode(prefix_tokens)
+# Each prompt: shared prefix + unique random suffix
+data = []
+for i in range(${NUM_PROMPTS}):
+    suffix_tokens = [random.randint(100, tk.vocab_size - 1) for _ in range(suffix_len)]
+    suffix_text = tk.decode(suffix_tokens)
+    prompt = prefix_text + ' ' + suffix_text
+    data.append({'conversations': [{'from': 'human', 'value': prompt}, {'from': 'gpt', 'value': 'OK'}]})
+with open('${PROMPT_FILE}', 'w') as f:
+    json.dump(data, f)
+print(f'Generated {len(data)} prompts: prefix={prefix_len} + suffix={suffix_len} tokens each')
+"
+            dataset_args="--dataset-name sharegpt --dataset-path $PROMPT_FILE --sharegpt-output-len $output_len"
+            extra_bench_args="--seed 1"
+        fi
+
         python3 -m sglang.bench_serving --backend sglang \
             --host "$HOST" --port "$PORT" \
             --model "$model" \
-            --dataset-name random \
-            --random-input-len "$input_len" \
-            --random-output-len "$output_len" \
-            --random-range-ratio 0.1 \
+            $dataset_args \
             --num-prompts "$NUM_PROMPTS" \
             --max-concurrency "$C" \
-            --disable-ignore-eos 2>&1 | tee "$FILE_NAME" || {
+            --disable-ignore-eos $extra_bench_args 2>&1 | tee "$FILE_NAME" || {
             echo "  WARNING: cc${C} failed (likely OOM at high concurrency). Skipping remaining CCs."
             break
         }
@@ -150,20 +183,29 @@ start_server() {
         extra_args="${extra_args} --enable-helix-reduce-scatter"
     fi
 
+    local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
+
     echo "======================================================="
     echo "Starting: ${cfg_name} (${model})"
     echo "  backend=${backend}  mem=${mem_frac}  dcp=${dcp}  comm=${dcp_comm}"
     echo "  attn_tp=${attn_tp}  helix_rs=${helix_rs}  ctx=${context_length}"
+    echo "  server_log=${SERVER_LOG}"
     echo "======================================================="
+
+    local cache_flag="--disable-radix-cache"
+    if [ "${ENABLE_PREFIX_CACHE:-0}" -eq 1 ]; then
+        cache_flag=""
+        echo "  prefix_cache=ENABLED"
+    fi
 
     eval "${COMMON_ENV} python3 -m sglang.launch_server \
         --model-path ${model} --host 0.0.0.0 --port ${PORT} \
         --trust-remote-code --enable-cache-report --log-level info --tp-size 8 \
         --chunked-prefill-size 32768 \
-        --context-length ${context_length} --disable-radix-cache --enable-symm-mem \
+        --context-length ${context_length} ${cache_flag} --enable-symm-mem \
         --mem-fraction-static ${mem_frac} \
         --attention-backend ${backend} \
-        ${extra_args}" &
+        ${extra_args}" > "${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     echo "Server PID: ${SERVER_PID}"
 }
@@ -211,7 +253,12 @@ run_scenario_configs() {
         start_server "$model" "$CFG_NAME" "$BACKEND" "$MEM_FRAC" "$DCP" "$DCP_COMM" "$ATTN_TP" "$HELIX_RS" "$context_length"
 
         if ! wait_for_server; then
-            echo "Skipping ${CFG_NAME} due to server start failure"
+            local SERVER_LOG="/tmp/sglang_server_${CFG_NAME}.log"
+            if grep -q "OutOfMemoryError\|CUDA out of memory" "$SERVER_LOG" 2>/dev/null; then
+                echo "Skipping ${CFG_NAME} — SERVER OOM (see ${SERVER_LOG})"
+            else
+                echo "Skipping ${CFG_NAME} — server start failure (see ${SERVER_LOG})"
+            fi
             kill_server
             continue
         fi
@@ -489,6 +536,96 @@ run_scenario10() {
 }
 
 
+# ============================================================
+# Scenario 11: CodeQwen 7B — Decode-Focused (Zhao Reproduction)
+# Purpose: Reproduce Phase-1 findings with prefix caching enabled.
+#   Same prompt repeated → prefill cached → measures pure decode.
+#   Zhao showed dcp2 ≈ tpa2_dcp4 ≈ 2x better than tp8 at 1M.
+#   H100 96GB: 1M fits cc=1(tp8), cc=2(dcp2), cc=5(tpa2_dcp4)
+#              512K fits cc=2(tp8), cc=5(dcp2), cc=10(tpa2_dcp4)
+# Key differences from S1-S7:
+#   - Prefix caching ENABLED (prefill is free from cache)
+#   - Same prompt (--seed 1 --random-range-ratio 0) → guaranteed cache hit
+#   - Measures DECODE throughput, not prefill+decode
+# ============================================================
+run_scenario11() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 11: CodeQwen 7B — Decode-Focused (Zhao Repro)"
+    echo "======================================================="
+
+    # Enable prefix caching for this scenario
+    ENABLE_PREFIX_CACHE=1
+
+    local model="Qwen/CodeQwen1.5-7B-Chat"
+
+    # SAME mem_frac=0.85 for ALL configs — fair comparison
+    # Symmetric memory uses ~4GB for DCP, ~0 for tp8
+    # Available for KV: ~74 GB for all
+
+    # --- 512K context ---
+    # Use 0.80 for DCP=4 (needs 4x symm mem), 0.82 for DCP=2, 0.85 for tp8
+    local configs_512k=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.80|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.82|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.82|2|a2a|0|0"
+        "tp8_fa3|fa3|0.85|0||0|0"
+    )
+    run_scenario_configs "scenario11_decode" "$model" 524288 16 500000 500 "in500k_out500" "${configs_512k[@]}"
+
+    # --- 1M context (direct Zhao comparison) ---
+    local configs_1m=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.80|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.82|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.82|2|a2a|0|0"
+        "tp8_fa3|fa3|0.85|0||0|0"
+    )
+    run_scenario_configs "scenario11_decode" "$model" 1048576 8 1000000 500 "in1m_out500" "${configs_1m[@]}"
+
+    # Reset
+    ENABLE_PREFIX_CACHE=0
+}
+
+
+# ============================================================
+# Scenario 12: CodeQwen 7B — Decode-Focused, Controlled CC
+# Purpose: Fixed concurrency comparison at long context.
+#   All configs at same CC to compare decode TPOT directly.
+#   Prefix caching enabled, same prompt.
+# ============================================================
+run_scenario12() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 12: CodeQwen 7B — Decode TPOT Comparison"
+    echo "======================================================="
+
+    ENABLE_PREFIX_CACHE=1
+
+    local model="Qwen/CodeQwen1.5-7B-Chat"
+
+    # Push CC high to find OOM point for each config
+    # 128K: tp8 ~10, dcp2/tpa4 ~18, tpa2_dcp4 ~35
+    local configs_128k=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.80|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.82|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.82|2|a2a|0|0"
+        "tp8_fa3|fa3|0.85|0||0|0"
+    )
+    run_scenario_configs "scenario12_decode_tpot" "$model" 131072 64 128000 500 "in128k_out500" "${configs_128k[@]}"
+
+    # 256K: tp8 ~4, dcp2/tpa4 ~8, tpa2_dcp4 ~17
+    local configs_256k=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.80|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.82|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.82|2|a2a|0|0"
+        "tp8_fa3|fa3|0.85|0||0|0"
+    )
+    run_scenario_configs "scenario12_decode_tpot" "$model" 262144 32 256000 500 "in256k_out500" "${configs_256k[@]}"
+
+    ENABLE_PREFIX_CACHE=0
+}
+
+
 # ---- Main ----
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
@@ -507,6 +644,12 @@ case "$SCENARIO_FILTER" in
     scenario8) run_scenario8 ;;
     scenario9) run_scenario9 ;;
     scenario10) run_scenario10 ;;
+    scenario11) run_scenario11 ;;
+    scenario12) run_scenario12 ;;
+    decode_focused)
+        run_scenario11
+        run_scenario12
+        ;;
     all)
         run_scenario1
         run_scenario3
@@ -527,7 +670,7 @@ case "$SCENARIO_FILTER" in
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [scenario1-10|tpa_advantage|all] [accuracy|perf|all]"
+        echo "Usage: $0 [scenario1-12|tpa_advantage|decode_focused|all] [accuracy|perf|all]"
         exit 1
         ;;
 esac
