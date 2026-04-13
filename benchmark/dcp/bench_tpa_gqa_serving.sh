@@ -7,10 +7,14 @@
 #   Scenario 2: Qwen2-72B   — large model, TPA memory advantage
 #
 # Usage:
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh                    # run all
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1          # only scenario 1
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario4          # only scenario 4
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario2          # only scenario 2 (72B)
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh <scenario> [mode]
+#
+#   Modes: accuracy = accuracy only, perf = perf only, all = both (default)
+#
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1           # all: accuracy + perf
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1 accuracy  # accuracy only (quick validation)
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1 perf      # perf only (skip accuracy)
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario5 accuracy  # validate 235B configs start OK
 #
 # Prerequisites:
 #   - 8x H100 GPUs
@@ -32,6 +36,8 @@ SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1 \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
 
 SCENARIO_FILTER="${1:-all}"
+# Run mode: "accuracy" = accuracy only, "perf" = perf only, "all" = both (default)
+RUN_MODE="${2:-all}"
 
 # ---- Helper functions ----
 
@@ -164,11 +170,18 @@ run_scenario_configs() {
 
         OUTPUT_DIR="${BASE_OUTPUT}/${scenario_name}/${CFG_NAME}/${workload_tag}"
 
-        # Skip if last CC result exists
-        local last_cc="${concurrencies[-1]}"
-        if [ -f "$OUTPUT_DIR/cc${last_cc}.txt" ] && grep -q "Output token throughput" "$OUTPUT_DIR/cc${last_cc}.txt" 2>/dev/null; then
-            echo "Skipping ${scenario_name}/${CFG_NAME}/${workload_tag} — results already exist"
-            continue
+        # Skip logic depends on run mode
+        if [ "$RUN_MODE" = "accuracy" ]; then
+            if [ -f "$OUTPUT_DIR/accuracy_gsm8k.txt" ] && grep -q "Accuracy:" "$OUTPUT_DIR/accuracy_gsm8k.txt" 2>/dev/null; then
+                echo "Skipping ${scenario_name}/${CFG_NAME}/${workload_tag} — accuracy already done"
+                continue
+            fi
+        else
+            local last_cc="${concurrencies[-1]}"
+            if [ -f "$OUTPUT_DIR/cc${last_cc}.txt" ] && grep -q "Output token throughput" "$OUTPUT_DIR/cc${last_cc}.txt" 2>/dev/null; then
+                echo "Skipping ${scenario_name}/${CFG_NAME}/${workload_tag} — results already exist"
+                continue
+            fi
         fi
 
         mkdir -p "$OUTPUT_DIR"
@@ -181,16 +194,20 @@ run_scenario_configs() {
             continue
         fi
 
-        run_accuracy "$OUTPUT_DIR"
-        run_perf "$OUTPUT_DIR" "$model" "$input_len" "$output_len" "${concurrencies[@]}"
+        if [ "$RUN_MODE" = "accuracy" ] || [ "$RUN_MODE" = "all" ]; then
+            run_accuracy "$OUTPUT_DIR"
+        fi
+        if [ "$RUN_MODE" = "perf" ] || [ "$RUN_MODE" = "all" ]; then
+            run_perf "$OUTPUT_DIR" "$model" "$input_len" "$output_len" "${concurrencies[@]}"
+        fi
         kill_server
     done
 }
 
 
 # ============================================================
-# Scenario 1: CodeQwen 7B — standard benchmark (5 configs)
-# Purpose: Compare all configs with helix RS on same workload
+# Scenario 1: CodeQwen 7B — standard benchmark
+# Purpose: Compare tp8 vs DCP vs TPA+DCP on same workload
 # ============================================================
 run_scenario1() {
     echo ""
@@ -199,12 +216,13 @@ run_scenario1() {
     echo "======================================================="
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
+    # DCP/TPA configs first (most likely to break with new changes)
     local configs=(
-        "tp8_fa3|fa3|0.85|0||0|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
         "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
         "tp8_dcp2_agrs_fa3|fa3|0.85|2|ag_rs|0|0"
-        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
+        "tp8_fa3|fa3|0.85|0||0|0"
+        # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
     )
 
     run_scenario_configs "scenario1_7b" "$model" 65536 512 4000 1500 "in4000_out1500" "${configs[@]}"
@@ -213,8 +231,7 @@ run_scenario1() {
 
 # ============================================================
 # Scenario 4: CodeQwen 7B — High throughput saturation
-# Purpose: Short input + high CC to show helix RS MLP savings
-# Only runs key configs (baseline TPA vs helix RS)
+# Purpose: Short input + high CC to measure decode throughput
 # ============================================================
 run_scenario4() {
     echo ""
@@ -223,11 +240,11 @@ run_scenario4() {
     echo "======================================================="
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
-    # Only the 2 key configs + baseline for comparison
     local configs=(
-        "tp8_fa3|fa3|0.85|0||0|0"
         "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
+        "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
+        "tp8_fa3|fa3|0.85|0||0|0"
+        # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
     )
 
     # Workload A: Short input, short output (pure decode throughput)
@@ -250,11 +267,11 @@ run_scenario2() {
 
     local model="Qwen/Qwen2-72B-Instruct"
     # 72B: 8 KV heads, tp8 gives 1 KV head/rank
-    # dcp2: requires attn_tp=4 (TPA) since 1 KV head can't be split further
+    # Plain dcp2 fails (can't split 1 KV head further), needs TPA
     local configs=(
-        "tp8_fa3|fa3|0.88|0||0|0"
         "tp8_tpa4_dcp2_a2a_fa3|fa3|0.88|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.88|2|a2a|4|1"
+        "tp8_fa3|fa3|0.88|0||0|0"
+        # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.88|2|a2a|4|1"
     )
 
     # Conservative: shorter output, lower max CC (72B needs more memory)
@@ -282,9 +299,10 @@ run_scenario5() {
     # tpa4+dcp2: attn_tp=4, each attn rank has 1 KV head
     # Note: DCP+TPA needs extra memory for symmetric mem buffers — use lower mem_frac
     local configs=(
-        "tp8_fa3|fa3|0.90|0||0|0"
         "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
+        "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
+        "tp8_fa3|fa3|0.90|0||0|0"
+        # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.85|2|a2a|4|1"
     )
 
     # MoE model: medium input + output, high CC to see saturation
@@ -307,10 +325,10 @@ run_scenario3() {
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
     local configs=(
-        "tp8_fa3|fa3|0.90|0||0|0"
-        "tp8_dcp2_a2a_fa3|fa3|0.90|2|a2a|0|0"
         "tp8_tpa4_dcp2_a2a_fa3|fa3|0.90|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
+        "tp8_dcp2_a2a_fa3|fa3|0.90|2|a2a|0|0"
+        "tp8_fa3|fa3|0.90|0||0|0"
+        # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.90|2|a2a|4|1"
     )
 
     # Long context: 60K input, short output, low CC (near CodeQwen max 65K)
@@ -336,10 +354,10 @@ run_scenario6() {
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
     local configs=(
-        "tp8_fa3|fa3|0.92|0||0|0"
-        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
         "tp8_tpa4_dcp2_a2a_fa3|fa3|0.92|2|a2a|4|0"
-        "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.92|2|a2a|4|1"
+        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
+        "tp8_fa3|fa3|0.92|0||0|0"
+        # "tp8_tpa4_dcp2_a2a_helix_fa3|fa3|0.92|2|a2a|4|1"
     )
 
     # 1M context: very long input, short output, low CC
@@ -354,6 +372,7 @@ run_scenario6() {
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
 echo "Scenario filter: ${SCENARIO_FILTER}"
+echo "Run mode: ${RUN_MODE}"
 echo ""
 
 case "$SCENARIO_FILTER" in
@@ -373,7 +392,7 @@ case "$SCENARIO_FILTER" in
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [scenario1|scenario2|scenario3|scenario4|scenario5|scenario6|all]"
+        echo "Usage: $0 [scenario1|scenario2|scenario3|scenario4|scenario5|scenario6|all] [accuracy|perf|all]"
         exit 1
         ;;
 esac
