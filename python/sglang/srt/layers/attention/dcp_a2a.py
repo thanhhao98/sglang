@@ -384,6 +384,155 @@ def _unpack_a2a_recv_lse(
 
 
 # ---------------------------------------------------------------------------
+# Triton kernel: fused unpack + LSE combine (replaces 2 separate kernels)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fused_unpack_combine_kernel(
+    # Input: packed recv buffer [N, max_bs, H_per_rank, D + LSE_PACK_DIM]
+    recv_ptr,
+    # Output: combined attention output [B, H_local, D]
+    out_ptr,
+    # Strides for recv buffer [N, max_bs, H_per_rank, D+lpd]
+    recv_stride_N,
+    recv_stride_B,
+    recv_stride_H,
+    recv_stride_D,
+    # Strides for output [B, H_local, D]
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    # Dims
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_BASE_E: tl.constexpr,
+    LSE_PACK_DIM: tl.constexpr,
+):
+    """Fused unpack + LSE-weighted combine: reads packed recv buffer directly.
+
+    Replaces _unpack_a2a_recv_kernel + dcp_lse_combine_triton (2 kernels → 1).
+    Reads output[:D] and packed LSE[D:] from recv buffer, unpacks LSE bits,
+    and does weighted combine — all in a single kernel.
+
+    Grid: (B, H_local).
+    Each program handles one (batch, head) across all N shards.
+    """
+    batch_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    # Pass 1: unpack LSE from all N shards and find max
+    lse_max = tl.full([], -float("inf"), dtype=tl.float32)
+    for i in tl.static_range(N):
+        recv_base = (
+            i * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 2:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D)
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_bits = lo | (hi << 16)
+            lse_i = lse_bits.to(tl.float32, bitcast=True)
+        else:
+            lse_i = tl.load(
+                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
+            ).to(tl.float32)
+
+        # Handle NaN/inf
+        lse_i = tl.where(
+            (lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i
+        )
+        lse_max = tl.where(lse_i > lse_max, lse_i, lse_max)
+
+    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+
+    # Pass 2: accumulate weighted outputs (re-read LSE + read output)
+    weight_sum = tl.zeros([], dtype=tl.float32)
+    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+
+    for i in tl.static_range(N):
+        recv_base = (
+            i * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+
+        # Unpack LSE again (register pressure is better than storing to SRAM)
+        if LSE_PACK_DIM == 2:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D)
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_bits = lo | (hi << 16)
+            lse_i = lse_bits.to(tl.float32, bitcast=True)
+        else:
+            lse_i = tl.load(
+                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
+            ).to(tl.float32)
+
+        lse_i = tl.where(
+            (lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i
+        )
+        centered = lse_i - lse_max
+        if IS_BASE_E:
+            w = tl.exp(centered)
+        else:
+            w = tl.exp2(centered)
+        weight_sum += w
+
+        # Read output from [:D] columns
+        o_offsets = recv_base + d_offsets * recv_stride_D
+        partial_out = tl.load(recv_ptr + o_offsets).to(tl.float32)
+        acc += partial_out * w
+
+    acc = acc / weight_sum
+
+    out_offsets = (
+        batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
+    )
+    tl.store(out_ptr + out_offsets, acc.to(out_ptr.dtype.element_ty))
+
+
+def dcp_fused_unpack_combine(
+    recv_combined: torch.Tensor,
+    B: int,
+    H_per_rank: int,
+    D: int,
+    lpd: int,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor:
+    """Fused unpack + LSE combine: reads packed recv buffer, outputs combined [B, H_local, D].
+
+    Replaces: _unpack_a2a_recv_lse() + dcp_lse_combine_triton() (2 kernels → 1).
+    """
+    N = recv_combined.shape[0]
+    out = torch.empty(
+        (B, H_per_rank, D), device=recv_combined.device, dtype=recv_combined.dtype
+    )
+    grid = (B, H_per_rank)
+    _fused_unpack_combine_kernel[grid](
+        recv_combined,
+        out,
+        recv_combined.stride(0),
+        recv_combined.stride(1),
+        recv_combined.stride(2),
+        recv_combined.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        N=N,
+        HEAD_DIM=D,
+        IS_BASE_E=is_lse_base_on_e,
+        LSE_PACK_DIM=lpd,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator — main entry point
 # ---------------------------------------------------------------------------
 
@@ -433,51 +582,38 @@ def dcp_a2a_lse_reduce(
         # CUDA graph path with pre-allocated fused buffers.
         send_combined = cuda_graph_buffers["send_combined"]
         recv_combined = cuda_graph_buffers["recv_combined"]
-        recv_lse_stg = cuda_graph_buffers["recv_lse"]
 
         # Fused pack: [B,H,D] + [B,H] → [N, max_bs, H/N, D+lpd]
-        # Replaces permute + 3 separate copy_ ops with a single Triton kernel.
         _pack_a2a_send(cp_attn_out, cp_attn_lse, send_combined, N, B, H_per_rank, D, lpd)
 
         # Single fused all_to_all
         cp_group.all_to_all_single(recv_combined.view(-1), send_combined.view(-1))
 
-        # Unpack: output is a view (Triton combine handles strides),
-        # LSE needs reinterpretation from packed bf16 back to fp32.
-        recv_output = recv_combined[:, :B, :, :D]
-        _unpack_a2a_recv_lse(recv_combined, recv_lse_stg, N, B, H_per_rank, D, lpd)
-        recv_lse = recv_lse_stg[:, :B, :]
+        # Fused unpack + LSE combine: reads packed recv buffer directly,
+        # unpacks LSE bits inline, does weighted combine — single kernel.
+        combined = dcp_fused_unpack_combine(
+            recv_combined[:, :B, :, :], B, H_per_rank, D, lpd,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
     else:
         # Eager path: allocate fused buffer on the fly
         send_combined = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            D + lpd,
-            dtype=out_dtype,
-            device=cp_attn_out.device,
+            N, B, H_per_rank, D + lpd,
+            dtype=out_dtype, device=cp_attn_out.device,
         )
         recv_combined = torch.empty_like(send_combined)
 
-        # Fused pack (same kernel, works for eager too)
+        # Fused pack
         _pack_a2a_send(cp_attn_out, cp_attn_lse, send_combined, N, B, H_per_rank, D, lpd)
 
         cp_group.all_to_all_single(recv_combined.view(-1), send_combined.view(-1))
 
-        recv_output = recv_combined[:, :, :, :D]
-        recv_lse_stg = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            dtype=torch.float32,
-            device=cp_attn_out.device,
+        # Fused unpack + LSE combine
+        combined = dcp_fused_unpack_combine(
+            recv_combined, B, H_per_rank, D, lpd,
+            is_lse_base_on_e=is_lse_base_on_e,
         )
-        _unpack_a2a_recv_lse(recv_combined, recv_lse_stg, N, B, H_per_rank, D, lpd)
-        recv_lse = recv_lse_stg
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
-    )
     return combined
 
 
