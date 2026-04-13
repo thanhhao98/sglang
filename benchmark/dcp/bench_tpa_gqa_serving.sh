@@ -114,7 +114,10 @@ run_perf() {
             --random-range-ratio 0.1 \
             --num-prompts "$NUM_PROMPTS" \
             --max-concurrency "$C" \
-            --disable-ignore-eos 2>&1 | tee "$FILE_NAME"
+            --disable-ignore-eos 2>&1 | tee "$FILE_NAME" || {
+            echo "  WARNING: cc${C} failed (likely OOM at high concurrency). Skipping remaining CCs."
+            break
+        }
     done
 }
 
@@ -393,10 +396,11 @@ run_scenario7() {
     echo "======================================================="
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
+    # DCP=4 needs more symmetric memory buffers → lower mem_frac
     local configs=(
-        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.92|4|a2a|2|0"
-        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.92|2|a2a|4|0"
-        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.85|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.88|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.90|2|a2a|0|0"
         "tp8_fa3|fa3|0.92|0||0|0"
     )
 
@@ -418,8 +422,8 @@ run_scenario8() {
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
     local configs=(
-        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.92|4|a2a|2|0"
-        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.85|4|a2a|2|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.88|2|a2a|0|0"
         "tp8_fa3|fa3|0.92|0||0|0"
     )
 
