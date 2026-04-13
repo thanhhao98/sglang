@@ -1275,9 +1275,6 @@ class FlashAttentionBackend(AttentionBackend):
                         lse_2d = softmax_lse.T.contiguous()
                     else:
                         lse_2d = softmax_lse.view(B_out, H_out)
-                    # FlashAttention returns natural-log LSE, while the
-                    # cp_lse_* correction helpers use exp2/log2 math.
-                    lse_base2 = lse_2d / math.log(2.0)
                     use_tpa_dcp_a2a = use_tpa_dcp and self._should_use_tpa_dcp_a2a(
                         layer, H_out
                     )
@@ -1289,8 +1286,6 @@ class FlashAttentionBackend(AttentionBackend):
                             is_lse_base_on_e=True,
                             cuda_graph_buffers=self.tpa_dcp_cuda_graph_buffers,
                         )
-                    elif use_tpa_dcp:
-                        o = cp_lse_ag_out_allreduce(o, lse_base2, get_dcp_group())
                     elif self.dcp_comm_backend == "a2a":
                         o = dcp_a2a_lse_reduce(
                             o,
@@ -1302,9 +1297,14 @@ class FlashAttentionBackend(AttentionBackend):
                             ),
                         )
                     else:
-                        o = cp_lse_ag_out_rs(
-                            o, lse_2d, get_dcp_group(), is_lse_base_on_e=True
-                        )
+                        # Non-A2A paths use base-2 LSE
+                        lse_base2 = lse_2d / math.log(2.0)
+                        if use_tpa_dcp:
+                            o = cp_lse_ag_out_allreduce(o, lse_base2, get_dcp_group())
+                        else:
+                            o = cp_lse_ag_out_rs(
+                                o, lse_2d, get_dcp_group(), is_lse_base_on_e=True
+                            )
                     if not use_tpa_dcp_a2a:
                         o = self._apply_output_head_partition(o, layer)
                 else:

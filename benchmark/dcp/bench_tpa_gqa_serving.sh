@@ -54,7 +54,7 @@ RUN_MODE="${2:-all}"
 # ---- Helper functions ----
 
 wait_for_server() {
-    local max_wait=1200
+    local max_wait=600
     local elapsed=0
     echo "Waiting for server on ${HOST}:${PORT} ..."
     while [ $elapsed -lt $max_wait ]; do
@@ -72,7 +72,14 @@ wait_for_server() {
 kill_server() {
     echo "Killing server on port ${PORT} ..."
     pkill -f "sglang.launch_server.*--port ${PORT}" 2>/dev/null || true
-    sleep 10
+    pkill -f "sglang::schedul" 2>/dev/null || true
+    pkill -f "sglang::detoken" 2>/dev/null || true
+    sleep 5
+    # Force kill anything still alive (prevents stuck graceful shutdown)
+    pkill -9 -f "sglang.launch_server.*--port ${PORT}" 2>/dev/null || true
+    pkill -9 -f "sglang::schedul" 2>/dev/null || true
+    pkill -9 -f "sglang::detoken" 2>/dev/null || true
+    sleep 3
 }
 
 run_accuracy() {
@@ -396,12 +403,13 @@ run_scenario7() {
     echo "======================================================="
 
     local model="Qwen/CodeQwen1.5-7B-Chat"
-    # DCP=4 needs more symmetric memory buffers → lower mem_frac
+    # DCP needs symmetric memory buffers → lower mem_frac for DCP configs
+    # tp8 at 128K context also tight on memory → use 0.88
     local configs=(
-        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.85|4|a2a|2|0"
-        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.88|2|a2a|4|0"
-        "tp8_dcp2_a2a_fa3|fa3|0.90|2|a2a|0|0"
-        "tp8_fa3|fa3|0.92|0||0|0"
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.82|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.87|2|a2a|0|0"
+        "tp8_fa3|fa3|0.88|0||0|0"
     )
 
     run_scenario_configs "scenario7_tpa_kv" "$model" 131072 32 128000 64 "in128k_out64" "${configs[@]}"
