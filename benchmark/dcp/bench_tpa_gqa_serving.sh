@@ -6,15 +6,27 @@
 #   Scenario 4: CodeQwen 7B  — saturation test, short/medium input, high CC
 #   Scenario 2: Qwen2-72B   — large model, TPA memory advantage
 #
+# Scenarios:
+#   S1:  CodeQwen 7B standard (tp8, dcp2, tpa4_dcp2)
+#   S2:  Qwen2-72B (tp8, tpa4_dcp2)
+#   S3:  CodeQwen 7B long context 60K/32K
+#   S4:  CodeQwen 7B saturation (short input, high CC)
+#   S5:  Qwen3-235B MoE (tp8, dcp2, tpa4_dcp2)
+#   S6:  CodeQwen 7B 1M context
+#   S7:  CodeQwen 7B TPA KV advantage at 128K (tpa2_dcp4 vs dcp2 vs tp8)
+#   S8:  CodeQwen 7B TPA at 512K (tpa2_dcp4 only config with headroom)
+#   S9:  Qwen2-72B TPA enables DCP (plain DCP impossible)
+#   S10: Qwen3-235B MoE TPA high CC at 32K
+#
 # Usage:
 #   bash benchmark/dcp/bench_tpa_gqa_serving.sh <scenario> [mode]
 #
 #   Modes: accuracy = accuracy only, perf = perf only, all = both (default)
 #
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1           # all: accuracy + perf
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1 accuracy  # accuracy only (quick validation)
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1 perf      # perf only (skip accuracy)
-#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario5 accuracy  # validate 235B configs start OK
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1 accuracy  # quick validation
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario1 perf      # perf only
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh tpa_advantage       # run S7-S10 (TPA sweet spots)
+#   bash benchmark/dcp/bench_tpa_gqa_serving.sh scenario7 accuracy  # validate tpa2_dcp4 configs
 #
 # Prerequisites:
 #   - 8x H100 GPUs
@@ -368,6 +380,103 @@ run_scenario6() {
 }
 
 
+# ============================================================
+# Scenario 7: CodeQwen 7B — TPA KV Cache Advantage at 128K
+# Purpose: Show tpa2_dcp4 handles more concurrent requests than
+#   tp8/dcp2 at long context where KV cache is the bottleneck.
+#   tp8 fits ~12, dcp2 fits ~24, tpa2_dcp4 fits ~49 at 128K.
+# ============================================================
+run_scenario7() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 7: CodeQwen 7B — TPA KV Cache Advantage (128K)"
+    echo "======================================================="
+
+    local model="Qwen/CodeQwen1.5-7B-Chat"
+    local configs=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.92|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.92|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
+        "tp8_fa3|fa3|0.92|0||0|0"
+    )
+
+    run_scenario_configs "scenario7_tpa_kv" "$model" 131072 32 128000 64 "in128k_out64" "${configs[@]}"
+}
+
+
+# ============================================================
+# Scenario 8: CodeQwen 7B — TPA at 512K Context
+# Purpose: At 512K only DCP=4 (via TPA) has enough headroom.
+#   tp8 fits 3, dcp2 fits 6, tpa2_dcp4 fits 12.
+#   Phase-1 showed tpa2_dcp4 has 2x faster TPOT than dcp2 at 512K.
+# ============================================================
+run_scenario8() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 8: CodeQwen 7B — TPA at 512K Context"
+    echo "======================================================="
+
+    local model="Qwen/CodeQwen1.5-7B-Chat"
+    local configs=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.92|4|a2a|2|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.92|2|a2a|0|0"
+        "tp8_fa3|fa3|0.92|0||0|0"
+    )
+
+    run_scenario_configs "scenario8_512k" "$model" 524288 8 500000 64 "in500k_out64" "${configs[@]}"
+}
+
+
+# ============================================================
+# Scenario 9: Qwen2-72B — TPA Enables DCP (Impossible Without)
+# Purpose: 72B with 8 KV heads can't do plain DCP at TP=8.
+#   TPA is the ONLY way to get DCP benefits.
+#   tp8 max ~7 concurrent at 32K. tpa4_dcp2 max ~14.
+# ============================================================
+run_scenario9() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 9: Qwen2-72B — TPA Enables DCP"
+    echo "======================================================="
+
+    local model="Qwen/Qwen2-72B-Instruct"
+    local configs=(
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.88|2|a2a|4|0"
+        "tp8_fa3|fa3|0.88|0||0|0"
+    )
+
+    # Long context KV pressure test
+    run_scenario_configs "scenario9_72b_kv" "$model" 32768 16 30000 64 "in30k_out64" "${configs[@]}"
+
+    # Standard throughput for comparison
+    run_scenario_configs "scenario9_72b_kv" "$model" 32768 128 4000 500 "in4k_out500" "${configs[@]}"
+}
+
+
+# ============================================================
+# Scenario 10: Qwen3-235B MoE — TPA High CC at 32K
+# Purpose: 235B has only ~33 GB for KV. At 32K, tp8 fits 5.
+#   tpa2_dcp4 fits ~22.
+# ============================================================
+run_scenario10() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 10: Qwen3-235B MoE — TPA High CC at 32K"
+    echo "======================================================="
+
+    local model="Qwen/Qwen3-235B-A22B-Instruct-2507"
+    local configs=(
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.85|4|a2a|2|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
+        "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
+        "tp8_fa3|fa3|0.90|0||0|0"
+    )
+
+    # Long context KV pressure test
+    run_scenario_configs "scenario10_235b_kv" "$model" 32768 16 30000 500 "in30k_out500" "${configs[@]}"
+}
+
+
 # ---- Main ----
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
@@ -382,6 +491,10 @@ case "$SCENARIO_FILTER" in
     scenario4) run_scenario4 ;;
     scenario5) run_scenario5 ;;
     scenario6) run_scenario6 ;;
+    scenario7) run_scenario7 ;;
+    scenario8) run_scenario8 ;;
+    scenario9) run_scenario9 ;;
+    scenario10) run_scenario10 ;;
     all)
         run_scenario1
         run_scenario3
@@ -389,10 +502,20 @@ case "$SCENARIO_FILTER" in
         run_scenario2
         run_scenario5
         run_scenario6
+        run_scenario7
+        run_scenario8
+        run_scenario9
+        run_scenario10
+        ;;
+    tpa_advantage)
+        run_scenario7
+        run_scenario8
+        run_scenario9
+        run_scenario10
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [scenario1|scenario2|scenario3|scenario4|scenario5|scenario6|all] [accuracy|perf|all]"
+        echo "Usage: $0 [scenario1-10|tpa_advantage|all] [accuracy|perf|all]"
         exit 1
         ;;
 esac
