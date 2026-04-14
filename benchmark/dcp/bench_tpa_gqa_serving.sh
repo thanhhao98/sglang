@@ -19,6 +19,7 @@
 #   S10: Qwen3-235B MoE TPA high CC at 32K
 #   S11: CodeQwen 7B decode-focused (Zhao repro) — prefix cache, 512K/1M
 #   S12: CodeQwen 7B decode TPOT comparison — prefix cache, 128K/256K
+#   S13: Qwen3-235B PR#14982 repro — 32K/4K + 32K/8K, tp8 vs dcp2 vs tpa
 #
 # Usage:
 #   bash benchmark/dcp/bench_tpa_gqa_serving.sh <scenario> [mode]
@@ -223,7 +224,7 @@ run_scenario_configs() {
 
     # Concurrencies depend on max_cc
     local concurrencies=()
-    for cc in 1 2 4 8 16 32 64 128 256 512 1024; do
+    for cc in 1 2 4 8 16 32 48 64 80 96 128 256 512 1024; do
         if [ "$cc" -le "$max_cc" ]; then
             concurrencies+=("$cc")
         fi
@@ -626,6 +627,42 @@ run_scenario12() {
 }
 
 
+# ============================================================
+# Scenario 13: Qwen3-235B — PR #14982 Reproduction (DCP for GQA)
+# Purpose: Reproduce PR #14982 results (FENP, FlashInfer DCP on H20)
+#   using FA3 backend on H100 NVL. Validates tp8 vs dcp2 vs tpa.
+#   PR showed: DCP2 +16% at bs=96 (32k/4k), +24.7% at bs=80 (32k/8k).
+#   PR TPOT overhead at bs=1: ~6.7% (10.86ms vs 10.18ms).
+#   We add TPA configs (tpa4_dcp2, tpa2_dcp4) not in the PR.
+#
+#   Model: Qwen3-235B-A22B-Instruct-2507 (64Q/4KV heads, MoE)
+#   Workloads: 32K/4K and 32K/8K (match PR exactly)
+#   CCs: 1,32,48,64,80,96 (match PR batch sizes)
+# ============================================================
+run_scenario13() {
+    echo ""
+    echo "======================================================="
+    echo "SCENARIO 13: Qwen3-235B — PR #14982 Reproduction"
+    echo "======================================================="
+
+    local model="Qwen/Qwen3-235B-A22B-Instruct-2507"
+    # 4 KV heads, 64 Q heads, 94 layers, MoE
+    # tp8 gets more mem since no symm mem needed
+    local configs=(
+        "tp8_dcp2_a2a_fa3|fa3|0.85|2|a2a|0|0"
+        "tp8_tpa4_dcp2_a2a_fa3|fa3|0.85|2|a2a|4|0"
+        "tp8_tpa2_dcp4_a2a_fa3|fa3|0.82|4|a2a|2|0"
+        "tp8_fa3|fa3|0.90|0||0|0"
+    )
+
+    # Workload A: 32K input / 4K output (matches PR Table 1)
+    run_scenario_configs "scenario13_pr14982" "$model" 32768 96 32000 4000 "in32k_out4k" "${configs[@]}"
+
+    # Workload B: 32K input / 8K output (matches PR Table 2)
+    run_scenario_configs "scenario13_pr14982" "$model" 32768 96 32000 8000 "in32k_out8k" "${configs[@]}"
+}
+
+
 # ---- Main ----
 echo "Benchmark run: branch=${BRANCH} commit=${HASH}"
 echo "Output dir: ${BASE_OUTPUT}/"
@@ -646,6 +683,7 @@ case "$SCENARIO_FILTER" in
     scenario10) run_scenario10 ;;
     scenario11) run_scenario11 ;;
     scenario12) run_scenario12 ;;
+    scenario13) run_scenario13 ;;
     decode_focused)
         run_scenario11
         run_scenario12
