@@ -93,6 +93,131 @@ def create_flashinfer_kv_indices_for_dcp_triton(
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
+@triton.jit
+def _build_fa3_dcp_page_table_kernel(
+    global_pt_ptr,
+    full_seqlens_ptr,
+    dcp_pt_ptr,
+    dcp_seqlens_ptr,
+    global_pt_stride_B: tl.constexpr,
+    dcp_pt_stride_B: tl.constexpr,
+    max_global_pages: tl.constexpr,
+    max_local_pages: tl.constexpr,
+    page_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    dcp_size: tl.constexpr,
+):
+    """Build DCP-local page table and seqlens for one batch element.
+
+    Grid: (B,). Each program handles one request.
+    Maps global page indices to local DCP page indices using the
+    interleaved ownership: token at position `pos` belongs to rank `pos % dcp_size`.
+    """
+    bid = tl.program_id(0).to(tl.int64)
+
+    full_seqlen = tl.load(full_seqlens_ptr + bid).to(tl.int64)
+    local_seqlen = tl.where(
+        full_seqlen > dcp_rank,
+        (full_seqlen - dcp_rank - 1) // dcp_size + 1,
+        tl.zeros([], dtype=tl.int64),
+    )
+    tl.store(dcp_seqlens_ptr + bid, local_seqlen.to(tl.int32))
+
+    if local_seqlen == 0:
+        p_offsets = tl.arange(0, max_local_pages)
+        tl.store(
+            dcp_pt_ptr + bid * dcp_pt_stride_B + p_offsets,
+            tl.zeros([max_local_pages], dtype=tl.int32),
+            mask=p_offsets < max_local_pages,
+        )
+        return
+
+    BLOCK: tl.constexpr = 128
+    num_iters = tl.cdiv(max_local_pages, BLOCK)
+    for i in range(num_iters):
+        p_offsets = tl.arange(0, BLOCK) + i * BLOCK
+        p_mask = p_offsets < max_local_pages
+
+        global_token_pos = dcp_rank + (p_offsets * page_size).to(tl.int64) * dcp_size
+        global_page_idx = global_token_pos // page_size
+
+        valid = (global_page_idx < max_global_pages) & p_mask
+        clamped_idx = tl.where(
+            global_page_idx < max_global_pages,
+            global_page_idx,
+            tl.full([BLOCK], max_global_pages - 1, dtype=tl.int64),
+        )
+
+        global_slot = tl.load(
+            global_pt_ptr + bid * global_pt_stride_B + clamped_idx,
+            mask=p_mask,
+            other=0,
+        )
+        local_slot = tl.where(valid, global_slot // dcp_size, tl.zeros([BLOCK], dtype=tl.int32))
+        tl.store(dcp_pt_ptr + bid * dcp_pt_stride_B + p_offsets, local_slot, mask=p_mask)
+
+
+def build_fa3_dcp_page_table_triton(
+    global_page_table: torch.Tensor,
+    full_seqlens: torch.Tensor,
+    max_seq_len_k: int,
+    page_size: int,
+    dcp_rank: int,
+    dcp_size: int,
+    dcp_page_table_out: torch.Tensor = None,
+    dcp_cache_seqlens_out: torch.Tensor = None,
+):
+    """Triton replacement for _init_dcp_decode_metadata's PyTorch ops.
+
+    When output buffers are provided (CUDA graph mode), writes in-place.
+    Otherwise allocates new tensors.
+    """
+    if dcp_size <= 1:
+        return global_page_table, full_seqlens.to(torch.int32)
+
+    B = full_seqlens.shape[0]
+    max_global_pages = global_page_table.shape[1]
+
+    max_local_tokens = max((max_seq_len_k - dcp_rank - 1) // dcp_size + 1, 0)
+    max_local_pages = (max_local_tokens + page_size - 1) // page_size
+
+    if max_local_pages == 0:
+        empty = global_page_table.new_empty((B, 0))
+        seqlens = full_seqlens.new_zeros(B, dtype=torch.int32)
+        if dcp_page_table_out is not None:
+            dcp_cache_seqlens_out[:B].zero_()
+        return (
+            (dcp_page_table_out[:B] if dcp_page_table_out is not None else empty),
+            (dcp_cache_seqlens_out[:B] if dcp_cache_seqlens_out is not None else seqlens),
+        )
+
+    if dcp_page_table_out is not None:
+        local_pt = dcp_page_table_out[:B, :max_local_pages]
+        local_seqlens = dcp_cache_seqlens_out[:B]
+    else:
+        local_pt = torch.empty(B, max_local_pages, dtype=torch.int32, device=global_page_table.device)
+        local_seqlens = torch.empty(B, dtype=torch.int32, device=global_page_table.device)
+
+    grid = (B,)
+    _build_fa3_dcp_page_table_kernel[grid](
+        global_page_table,
+        full_seqlens,
+        local_pt,
+        local_seqlens,
+        global_page_table.stride(0),
+        local_pt.stride(0),
+        max_global_pages,
+        max_local_pages,
+        page_size,
+        dcp_rank,
+        dcp_size,
+    )
+
+    if dcp_page_table_out is not None:
+        return dcp_page_table_out[:B], dcp_cache_seqlens_out[:B]
+    return local_pt, local_seqlens
+
+
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
     return num_page_per_block

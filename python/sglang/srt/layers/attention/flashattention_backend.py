@@ -18,7 +18,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
-from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
+from sglang.srt.layers.attention.utils import (
+    build_fa3_dcp_page_table_triton,
+    cp_lse_ag_out_rs,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -1200,7 +1203,15 @@ class FlashAttentionBackend(AttentionBackend):
                 ):
                     sched_meta = metadata.scheduler_metadata
 
-                if use_dcp:
+                # DCP Q handling: if the model already all-gathered Q
+                # (q has dcp_size * local heads), skip the gather here and
+                # return (output, lse) for model-level reduce.
+                q_already_gathered = (
+                    use_dcp
+                    and q_reshaped.shape[1]
+                    == layer.tp_q_head_num * self.dcp_size
+                )
+                if use_dcp and not q_already_gathered:
                     q_reshaped = get_dcp_group().all_gather(
                         q_reshaped.contiguous(), dim=1
                     )
@@ -1269,6 +1280,16 @@ class FlashAttentionBackend(AttentionBackend):
                         lse_2d = softmax_lse.T.contiguous()
                     else:
                         lse_2d = softmax_lse.view(B_out, H_out)
+
+                    if q_already_gathered:
+                        # Model handles reduce — return (output, lse) like MLA
+                        return (
+                            o.reshape(-1, H_out * layer.v_head_dim),
+                            lse_2d,
+                        )
+
+                    # Backend handles reduce (backward compat for models
+                    # that haven't adopted model-level Q gather yet)
                     if self.dcp_comm_backend == "a2a":
                         o = dcp_a2a_lse_reduce(
                             o,
@@ -2434,62 +2455,36 @@ class FlashAttentionBackend(AttentionBackend):
     def _init_dcp_decode_metadata(self, metadata: FlashAttentionMetadata, device):
         """Build DCP-filtered page_table and cache_seqlens for local KV shard.
 
-        DCP interleaved ownership: token at virtual position `pos` belongs to
-        rank `pos % dcp_size`. The local KV buffer stores only this rank's
-        tokens, so page_table and seqlens must be remapped to local indices.
-
-        During CUDA graph mode, writes into pre-allocated buffers from
-        decode_cuda_graph_metadata to keep tensor addresses stable.
+        Uses a single Triton kernel instead of ~9 PyTorch ops.
+        When CUDA graph buffers exist, writes directly into pre-allocated tensors.
         """
         from sglang.srt.distributed.parallel_state import get_dcp_rank
 
         N = self.dcp_size
         dcp_rank = get_dcp_rank()
+        B = metadata.cache_seqlens_int32.shape[0]
 
-        full_seqlens = metadata.cache_seqlens_int32  # [B]
-        B = full_seqlens.shape[0]
-
-        local_seqlens = ((full_seqlens - dcp_rank - 1) // N + 1).clamp(min=0)
-
-        global_pt = (
-            metadata.page_table
-        )  # [B, max_pages] (page indices, already strided)
-        max_global_pages = global_pt.shape[1]
-
-        # Derive max_local_pages from max_seq_len_k (already on CPU) to avoid
-        max_local_tokens = (metadata.max_seq_len_k - dcp_rank - 1) // N + 1
-        max_local_pages = (max_local_tokens + self.page_size - 1) // self.page_size
-
-        # Vectorized page table construction (replaces Python for-loop).
-        # For each local page p, find the global page containing its first token:
-        #   local_token_start = p * page_size
-        #   global_token_pos = dcp_rank + local_token_start * N
-        #   global_page_idx = global_token_pos // page_size
-        if max_local_pages > 0:
-            p_indices = torch.arange(max_local_pages, device=device)
-            global_token_positions = dcp_rank + (p_indices * self.page_size) * N
-            global_page_indices = global_token_positions // self.page_size
-            valid_mask = global_page_indices < max_global_pages
-            global_page_indices_clamped = global_page_indices.clamp(
-                max=max_global_pages - 1
-            )
-            local_pt = global_pt[:, global_page_indices_clamped] // N
-            # Zero out entries beyond valid global pages
-            if not valid_mask.all():
-                local_pt[:, ~valid_mask] = 0
-        else:
-            local_pt = torch.zeros(B, 0, dtype=torch.int32, device=device)
-
-        # Use pre-allocated buffers if available (CUDA graph mode)
         cg_meta = self.decode_cuda_graph_metadata
         if isinstance(cg_meta, dict) and "dcp_page_table" in cg_meta:
-            cg_meta["dcp_cache_seqlens"][:B].copy_(local_seqlens.to(torch.int32))
-            cg_meta["dcp_page_table"][:B, :max_local_pages].copy_(local_pt)
-            metadata.dcp_cache_seqlens = cg_meta["dcp_cache_seqlens"][:B]
-            metadata.dcp_page_table = cg_meta["dcp_page_table"][:B, :max_local_pages]
+            dcp_pt_out = cg_meta["dcp_page_table"]
+            dcp_sl_out = cg_meta["dcp_cache_seqlens"]
         else:
-            metadata.dcp_page_table = local_pt
-            metadata.dcp_cache_seqlens = local_seqlens.to(torch.int32)
+            dcp_pt_out = None
+            dcp_sl_out = None
+
+        local_pt, local_seqlens = build_fa3_dcp_page_table_triton(
+            global_page_table=metadata.page_table,
+            full_seqlens=metadata.cache_seqlens_int32,
+            max_seq_len_k=metadata.max_seq_len_k,
+            page_size=self.page_size,
+            dcp_rank=dcp_rank,
+            dcp_size=N,
+            dcp_page_table_out=dcp_pt_out,
+            dcp_cache_seqlens_out=dcp_sl_out,
+        )
+
+        metadata.dcp_page_table = local_pt
+        metadata.dcp_cache_seqlens = local_seqlens
 
     def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
