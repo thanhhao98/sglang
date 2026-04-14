@@ -53,6 +53,46 @@ def create_flashinfer_kv_indices_triton(
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
+@triton.jit
+def create_flashinfer_kv_indices_for_dcp_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    dcp_page_kernel_lens_ptr,
+    kv_indptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+    # find the req pool idx, this is for batch to token
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    kv_indices_offset = tl.load(kv_indptr + pid)
+    kv_start = 0
+    kv_end = 0
+    if kv_start_idx:
+        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
+        kv_end = kv_start
+    kv_end += tl.load(dcp_page_kernel_lens_ptr + pid).to(tl.int32)
+    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    for i in range(num_loop):
+        # index into req_to_token_ptr needs to be int64
+        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = offset < kv_end - kv_start
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offset * dcp_size
+            + dcp_rank,
+            mask=mask,
+        )
+        data = data / dcp_size
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
     return num_page_per_block
@@ -1394,6 +1434,7 @@ def fused_qk_rope_reshape_and_cache(
     return q_out.view(-1, qh * d), k_out, key_cache, value_cache
 
 
+# Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.12.0/vllm/attention/ops/common.py
 @triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
@@ -1556,6 +1597,7 @@ def cp_lse_ag_out_rs(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     is_lse_base_on_e: bool = False,
+    return_lse: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -1563,13 +1605,20 @@ def cp_lse_ag_out_rs(
     is_lse_base_on_e: True if LSE uses base-e (FA3), False for base-2 (FlashInfer)
     """
     if cp_group.world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
         return cp_attn_out
 
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(
+    out, lse = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, is_lse_base_on_e
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
+    if return_lse:
+        cp_num_heads = lse.shape[1] // cp_group.world_size
+        r = cp_group.rank_in_group
+        lse = lse[:, cp_num_heads * r : cp_num_heads * (r + 1)]
+        return out, lse
     return out

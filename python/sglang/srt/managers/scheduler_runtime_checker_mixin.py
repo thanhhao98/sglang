@@ -183,8 +183,14 @@ class SchedulerRuntimeCheckerMixin:
         return pool_stats
 
     def _get_token_info(self: Scheduler) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        if self.dcp_size > 1:
+            available_size = (
+                self.token_to_kv_pool_allocator.available_size() // self.dcp_size
+            )
+            evictable_size = self.tree_cache.evictable_size() // self.dcp_size
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return PoolStats(

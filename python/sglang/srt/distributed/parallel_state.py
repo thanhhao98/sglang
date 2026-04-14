@@ -45,6 +45,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -746,7 +747,7 @@ class GroupCoordinator:
         self.reduce_scatter_tensor(output_tensor, input_tensor)
 
         # Reshape before returning
-        return output_tensor.movedim(0, dim)
+        return output_tensor.movedim(0, dim).contiguous()
 
     def _reduce_scatter_tensor(
         self,
@@ -1581,6 +1582,14 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
+_DCP: Optional[GroupCoordinator] = None
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
+    return _DCP
+
+
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
@@ -2159,6 +2168,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -2171,6 +2181,7 @@ def ensure_model_parallel_initialized(
             tensor_model_parallel_size,
             expert_model_parallel_size,
             pipeline_model_parallel_size,
+            decode_context_parallel_size,
             backend,
         )
         return
@@ -2326,6 +2337,11 @@ def destroy_model_parallel():
         _TP.destroy()
     _TP = None
 
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
+
     global _PP
     if _PP:
         _PP.destroy()
@@ -2360,9 +2376,6 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
-    global _DCP
-    if _DCP:
-        _DCP.destroy()
 
 
 def destroy_distributed_environment():
