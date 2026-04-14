@@ -123,16 +123,18 @@ def _build_fa3_dcp_page_table_kernel(
     )
     tl.store(dcp_seqlens_ptr + bid, local_seqlen.to(tl.int32))
 
-    if local_seqlen == 0:
-        p_offsets = tl.arange(0, max_local_pages)
-        tl.store(
-            dcp_pt_ptr + bid * dcp_pt_stride_B + p_offsets,
-            tl.zeros([max_local_pages], dtype=tl.int32),
-            mask=p_offsets < max_local_pages,
-        )
-        return
-
     BLOCK: tl.constexpr = 128
+
+    if local_seqlen == 0:
+        num_zero_iters = tl.cdiv(max_local_pages, BLOCK)
+        for i in range(num_zero_iters):
+            p_offsets = tl.arange(0, BLOCK) + i * BLOCK
+            tl.store(
+                dcp_pt_ptr + bid * dcp_pt_stride_B + p_offsets,
+                tl.zeros([BLOCK], dtype=tl.int32),
+                mask=p_offsets < max_local_pages,
+            )
+        return
     num_iters = tl.cdiv(max_local_pages, BLOCK)
     for i in range(num_iters):
         p_offsets = tl.arange(0, BLOCK) + i * BLOCK
