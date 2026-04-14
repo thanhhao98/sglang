@@ -1206,10 +1206,16 @@ class FlashAttentionBackend(AttentionBackend):
                 # DCP Q handling: if the model already all-gathered Q
                 # (q has dcp_size * local heads), skip the gather here and
                 # return (output, lse) for model-level reduce.
+                # Compare against the backend's expected gathered count, not
+                # layer.tp_q_head_num (which may already include dcp_size).
+                expected_gathered_heads = (
+                    self.dcp_num_heads_per_tp * self.dcp_size
+                    if use_dcp
+                    else 0
+                )
                 q_already_gathered = (
                     use_dcp
-                    and q_reshaped.shape[1]
-                    == layer.tp_q_head_num * self.dcp_size
+                    and q_reshaped.shape[1] == expected_gathered_heads
                 )
                 if use_dcp and not q_already_gathered:
                     q_reshaped = get_dcp_group().all_gather(
