@@ -38,10 +38,6 @@ HASH=$(git rev-parse --short=7 HEAD)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_OUTPUT="${SCRIPT_DIR}/results/${BRANCH}_${HASH}"
 
-COMMON_ENV="NCCL_DEBUG=WARN PYTHONUNBUFFERED=1 \
-TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_AUTOGRAD_CACHE=1 \
-SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1"
-
 SCENARIO_FILTER="${1:-all}"
 RUN_MODE="${2:-all}"
 
@@ -126,8 +122,7 @@ run_perf() {
 
 start_server() {
     local cfg_name="$1"
-    local mem_frac="$2"
-    local dcp="$3"
+    local dcp="$2"
 
     local extra_args=""
     if [ "$dcp" -gt 0 ]; then
@@ -138,18 +133,14 @@ start_server() {
 
     echo "======================================================="
     echo "Starting: ${cfg_name} (${MODEL})"
-    echo "  backend=flashinfer  mem=${mem_frac}  dcp=${dcp}"
+    echo "  backend=flashinfer  dcp=${dcp}"
     echo "  server_log=${SERVER_LOG}"
     echo "======================================================="
 
-    eval "${COMMON_ENV} python3 -m sglang.launch_server \
+    python3 -m sglang.launch_server \
         --model-path ${MODEL} --host 0.0.0.0 --port ${PORT} \
-        --trust-remote-code --enable-cache-report --log-level info --tp-size 8 \
-        --chunked-prefill-size 32768 \
-        --disable-radix-cache --enable-symm-mem \
-        --mem-fraction-static ${mem_frac} \
-        --attention-backend flashinfer \
-        ${extra_args}" > "${SERVER_LOG}" 2>&1 &
+        --tp 8 --attention-backend flashinfer --enable-symm-mem \
+        ${extra_args} > "${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     echo "Server PID: ${SERVER_PID}"
 }
@@ -157,12 +148,11 @@ start_server() {
 run_config() {
     local scenario_name="$1"
     local cfg_name="$2"
-    local mem_frac="$3"
-    local dcp="$4"
-    local input_len="$5"
-    local output_len="$6"
-    local workload_tag="$7"
-    shift 7
+    local dcp="$3"
+    local input_len="$4"
+    local output_len="$5"
+    local workload_tag="$6"
+    shift 6
     local concurrencies=("$@")
 
     local OUTPUT_DIR="${BASE_OUTPUT}/${scenario_name}/${cfg_name}/${workload_tag}"
@@ -182,7 +172,7 @@ run_config() {
 
     mkdir -p "$OUTPUT_DIR"
     kill_server
-    start_server "$cfg_name" "$mem_frac" "$dcp"
+    start_server "$cfg_name" "$dcp"
 
     if ! wait_for_server; then
         local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
@@ -212,10 +202,10 @@ run_32k_4k() {
 
     local concurrencies=(1 32 48 64 80 96)
 
-    run_config "pr14982_32k_4k" "tp8_fi" "0.90" "0" \
+    run_config "pr14982_32k_4k" "tp8_fi" "0" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_4k" "tp8_dcp2_fi" "0.85" "2" \
+    run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 }
 
@@ -231,10 +221,10 @@ run_32k_8k() {
 
     local concurrencies=(1 32 48 64 80)
 
-    run_config "pr14982_32k_8k" "tp8_fi" "0.90" "0" \
+    run_config "pr14982_32k_8k" "tp8_fi" "0" \
         32000 8000 "in32k_out8k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "0.85" "2" \
+    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "2" \
         32000 8000 "in32k_out8k" "${concurrencies[@]}"
 }
 
