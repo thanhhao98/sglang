@@ -28,6 +28,7 @@ from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.utils import (
     cp_lse_ag_out_rs,
     create_flashinfer_kv_indices_for_dcp_triton,
@@ -147,6 +148,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
+        self.dcp_comm_backend = model_runner.server_args.dcp_comm_backend
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -976,7 +978,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         if self.dcp_size > 1:
-            o = cp_lse_ag_out_rs(o, s, get_dcp_group())
+            if self.dcp_comm_backend == "a2a":
+                o = dcp_a2a_lse_reduce(o, s, get_dcp_group())
+            else:
+                o = cp_lse_ag_out_rs(o, s, get_dcp_group())
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

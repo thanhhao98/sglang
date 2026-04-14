@@ -1,16 +1,14 @@
 #!/bin/bash
-# Benchmark DCP for GQA models — PR #14982 reproduction.
+# Benchmark DCP for GQA models — PR #14982 reproduction + FA3 comparison.
 #
-# Reproduces FENP's PR #14982 results: DCP for GQA with FlashInfer backend
-# on Qwen3-235B-A22B-Instruct-2507. Two workloads, two configs.
-#
-# Workloads (match PR exactly):
-#   - 32K input / 4K output
-#   - 32K input / 8K output
+# Qwen3-235B-A22B-Instruct-2507, 32K/4K workload.
 #
 # Configs:
-#   - tp8:      TP=8 baseline (no DCP)
-#   - tp8_dcp2: TP=8 + DCP=2 (FlashInfer, AG+RS)
+#   - tp8_fi:              TP=8 baseline, FlashInfer (already done)
+#   - tp8_dcp2_fi:         TP=8 + DCP=2, FlashInfer AG+RS (already done)
+#   - tp8_fa3:             TP=8 baseline, FA3
+#   - tp8_dcp2_fa3_agrs:   TP=8 + DCP=2, FA3 AG+RS
+#   - tp8_dcp2_fa3_a2a:    TP=8 + DCP=2, FA3 A2A
 #
 # Usage:
 #   bash benchmark/dcp/bench_tpa_gqa_serving.sh [scenario] [mode]
@@ -18,13 +16,8 @@
 #   Scenarios: 32k_4k, 32k_8k, all (default)
 #   Modes:     accuracy, perf, all (default)
 #
-#   Examples:
-#     bash benchmark/dcp/bench_tpa_gqa_serving.sh all accuracy   # accuracy only
-#     bash benchmark/dcp/bench_tpa_gqa_serving.sh 32k_4k perf    # perf 32K/4K only
-#     bash benchmark/dcp/bench_tpa_gqa_serving.sh all all         # full run
-#
 # Prerequisites:
-#   - 8x H100 GPUs (or H20 as in the original PR)
+#   - 8x H100 GPUs
 #   - Model downloaded: huggingface-cli download Qwen/Qwen3-235B-A22B-Instruct-2507
 
 set -euo pipefail
@@ -120,39 +113,45 @@ run_perf() {
     done
 }
 
+# start_server <cfg_name> <backend> <dcp_size> [dcp_comm_backend]
 start_server() {
     local cfg_name="$1"
-    local dcp="$2"
+    local backend="$2"
+    local dcp="$3"
+    local dcp_comm="${4:-ag_rs}"
 
     local extra_args=""
     if [ "$dcp" -gt 0 ]; then
-        extra_args="--dcp-size ${dcp}"
+        extra_args="--dcp-size ${dcp} --dcp-comm-backend ${dcp_comm}"
     fi
 
     local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
 
     echo "======================================================="
     echo "Starting: ${cfg_name} (${MODEL})"
-    echo "  backend=flashinfer  dcp=${dcp}"
+    echo "  backend=${backend}  dcp=${dcp}  comm=${dcp_comm}"
     echo "  server_log=${SERVER_LOG}"
     echo "======================================================="
 
     python3 -m sglang.launch_server \
         --model-path ${MODEL} --host 0.0.0.0 --port ${PORT} \
-        --tp 8 --attention-backend flashinfer --enable-symm-mem \
+        --tp 8 --attention-backend ${backend} --enable-symm-mem \
         ${extra_args} > "${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     echo "Server PID: ${SERVER_PID}"
 }
 
+# run_config <scenario> <cfg_name> <backend> <dcp> <dcp_comm> <in> <out> <tag> <cc...>
 run_config() {
     local scenario_name="$1"
     local cfg_name="$2"
-    local dcp="$3"
-    local input_len="$4"
-    local output_len="$5"
-    local workload_tag="$6"
-    shift 6
+    local backend="$3"
+    local dcp="$4"
+    local dcp_comm="$5"
+    local input_len="$6"
+    local output_len="$7"
+    local workload_tag="$8"
+    shift 8
     local concurrencies=("$@")
 
     local OUTPUT_DIR="${BASE_OUTPUT}/${scenario_name}/${cfg_name}/${workload_tag}"
@@ -172,7 +171,7 @@ run_config() {
 
     mkdir -p "$OUTPUT_DIR"
     kill_server
-    start_server "$cfg_name" "$dcp"
+    start_server "$cfg_name" "$backend" "$dcp" "$dcp_comm"
 
     if ! wait_for_server; then
         local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
@@ -202,10 +201,20 @@ run_32k_4k() {
 
     local concurrencies=(1 32 48 64 80 96)
 
-    run_config "pr14982_32k_4k" "tp8_fi" "0" \
+    # --- FlashInfer configs (already have results, commented out) ---
+    # run_config "pr14982_32k_4k" "tp8_fi" "flashinfer" "0" "ag_rs" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    # run_config "pr14982_32k_4k" "tp8_dcp2_fi" "flashinfer" "2" "ag_rs" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    # --- FA3 configs ---
+    run_config "pr14982_32k_4k" "tp8_fa3" "fa3" "0" "ag_rs" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" \
+    run_config "pr14982_32k_4k" "tp8_dcp2_fa3_agrs" "fa3" "2" "ag_rs" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    run_config "pr14982_32k_4k" "tp8_dcp2_fa3_a2a" "fa3" "2" "a2a" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 }
 
@@ -213,25 +222,33 @@ run_32k_4k() {
 # Workload: 32K/8K (matches PR Table 2)
 # PR results (H20): tp8 3620 TPS @ bs64, dcp2 4415 TPS @ bs80
 # ============================================================
-run_32k_8k() {
-    echo ""
-    echo "======================================================="
-    echo "Workload: Qwen3-235B 32K/8K (PR #14982 Table 2)"
-    echo "======================================================="
-
-    local concurrencies=(1 32 48 64 80)
-
-    run_config "pr14982_32k_8k" "tp8_fi" "0" \
-        32000 8000 "in32k_out8k" "${concurrencies[@]}"
-
-    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "2" \
-        32000 8000 "in32k_out8k" "${concurrencies[@]}"
-}
+# run_32k_8k() {
+#     echo ""
+#     echo "======================================================="
+#     echo "Workload: Qwen3-235B 32K/8K (PR #14982 Table 2)"
+#     echo "======================================================="
+#
+#     local concurrencies=(1 32 48 64 80)
+#
+#     # --- FlashInfer configs (already have results, commented out) ---
+#     # run_config "pr14982_32k_8k" "tp8_fi" "flashinfer" "0" "ag_rs" \
+#     #     32000 8000 "in32k_out8k" "${concurrencies[@]}"
+#     # run_config "pr14982_32k_8k" "tp8_dcp2_fi" "flashinfer" "2" "ag_rs" \
+#     #     32000 8000 "in32k_out8k" "${concurrencies[@]}"
+#
+#     # --- FA3 configs ---
+#     run_config "pr14982_32k_8k" "tp8_fa3" "fa3" "0" "ag_rs" \
+#         32000 8000 "in32k_out8k" "${concurrencies[@]}"
+#     run_config "pr14982_32k_8k" "tp8_dcp2_fa3_agrs" "fa3" "2" "ag_rs" \
+#         32000 8000 "in32k_out8k" "${concurrencies[@]}"
+#     run_config "pr14982_32k_8k" "tp8_dcp2_fa3_a2a" "fa3" "2" "a2a" \
+#         32000 8000 "in32k_out8k" "${concurrencies[@]}"
+# }
 
 
 # ---- Main ----
 echo "======================================================="
-echo "PR #14982 Reproduction: DCP for GQA (FlashInfer)"
+echo "DCP GQA Benchmark: FlashInfer vs FA3"
 echo "  Model:    ${MODEL}"
 echo "  Branch:   ${BRANCH} (${HASH})"
 echo "  Output:   ${BASE_OUTPUT}/"
@@ -242,14 +259,14 @@ echo ""
 
 case "$SCENARIO_FILTER" in
     32k_4k)  run_32k_4k ;;
-    32k_8k)  run_32k_8k ;;
+    # 32k_8k)  run_32k_8k ;;
     all)
         run_32k_4k
-        run_32k_8k
+        # run_32k_8k
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [32k_4k|32k_8k|all] [accuracy|perf|all]"
+        echo "Usage: $0 [32k_4k|all] [accuracy|perf|all]"
         exit 1
         ;;
 esac
