@@ -1203,21 +1203,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ):
                     sched_meta = metadata.scheduler_metadata
 
-                # DCP Q handling: if the model already all-gathered Q
-                # (q has dcp_size * local heads), skip the gather here and
-                # return (output, lse) for model-level reduce.
-                # Compare against the backend's expected gathered count, not
-                # layer.tp_q_head_num (which may already include dcp_size).
-                expected_gathered_heads = (
-                    self.dcp_num_heads_per_tp * self.dcp_size
-                    if use_dcp
-                    else 0
-                )
-                q_already_gathered = (
-                    use_dcp
-                    and q_reshaped.shape[1] == expected_gathered_heads
-                )
-                if use_dcp and not q_already_gathered:
+                if use_dcp:
                     q_reshaped = get_dcp_group().all_gather(
                         q_reshaped.contiguous(), dim=1
                     )
@@ -1287,15 +1273,6 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         lse_2d = softmax_lse.view(B_out, H_out)
 
-                    if q_already_gathered:
-                        # Model handles reduce — return (output, lse) like MLA
-                        return (
-                            o.reshape(-1, H_out * layer.v_head_dim),
-                            lse_2d,
-                        )
-
-                    # Backend handles reduce (backward compat for models
-                    # that haven't adopted model-level Q gather yet)
                     if self.dcp_comm_backend == "a2a":
                         o = dcp_a2a_lse_reduce(
                             o,

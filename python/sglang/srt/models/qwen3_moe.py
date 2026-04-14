@@ -540,18 +540,6 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        self.dcp_size = get_dcp_world_size()
-        self.attn_for_dcp_decode = None
-        if self.dcp_size > 1:
-            self.attn_for_dcp_decode = RadixAttention(
-                self.num_heads * self.dcp_size,
-                self.head_dim,
-                self.scaling,
-                num_kv_heads=self.num_kv_heads,
-                layer_id=layer_id,
-                prefix=add_prefix("attn", prefix),
-            )
-
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
@@ -700,42 +688,9 @@ class Qwen3MoeAttention(nn.Module):
             and self.compatible_with_fused_kv_buffer
         )
 
-        use_dcp_decode = (
-            self.attn_for_dcp_decode is not None
-            and fb.forward_mode.is_decode()
+        attn_output = self.attn(
+            q, k, v, fb, save_kv_cache=save_kv_cache,
         )
-
-        if use_dcp_decode:
-            q_3d = q.view(-1, self.num_heads, self.head_dim)
-            q_gathered = get_dcp_group().all_gather(q_3d.contiguous(), dim=1)
-            q_flat = q_gathered.reshape(-1, self.num_heads * self.dcp_size * self.head_dim)
-
-            attn_output, lse = self.attn_for_dcp_decode(
-                q_flat, k, v, fb, save_kv_cache=save_kv_cache,
-            )
-
-            attn_output = attn_output.view(
-                -1, self.num_heads * self.dcp_size, self.head_dim
-            )
-            lse = lse.contiguous()
-
-            is_base_e = True
-            dcp_comm = get_global_server_args().dcp_comm_backend
-            if dcp_comm == "a2a":
-                attn_output = dcp_a2a_lse_reduce(
-                    attn_output, lse, get_dcp_group(),
-                    is_lse_base_on_e=is_base_e,
-                )
-            else:
-                attn_output = cp_lse_ag_out_rs(
-                    attn_output, lse, get_dcp_group(),
-                    is_lse_base_on_e=is_base_e,
-                )
-            attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim)
-        else:
-            attn_output = self.attn(
-                q, k, v, fb, save_kv_cache=save_kv_cache,
-            )
 
         output, _ = self.o_proj(attn_output)
         return output
