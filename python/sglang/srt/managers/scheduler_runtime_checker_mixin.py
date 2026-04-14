@@ -307,6 +307,8 @@ class SchedulerRuntimeCheckerMixin:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
             total = self.max_total_num_tokens
+        if self.dcp_size > 1:
+            total = total // self.dcp_size
         return self._check_pool_invariant(
             "full",
             ps.full_available_size,
