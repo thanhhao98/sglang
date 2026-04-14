@@ -1920,6 +1920,14 @@ def initialize_model_parallel(
     ), "attention context model parallel group is already initialized"
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
+    elif attn_cp_size == 1:
+        group_ranks = [[rank] for rank in range(world_size)]
+        _ATTN_CP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="attn_cp",
+        )
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):

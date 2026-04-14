@@ -915,24 +915,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 if self.dcp_size > 1:
                     if use_tpa_dcp:
-                        if (
-                            self.tpa_dcp_a2a_heads_per_rank is not None
-                            and self.dcp_comm_backend == "a2a"
-                        ):
-                            o2, s2 = dcp_a2a_lse_reduce(
-                                o2,
-                                s2,
-                                get_dcp_group(),
-                                is_lse_base_on_e=False,
-                                return_lse=True,
-                            )
-                        else:
-                            o2, s2 = cp_lse_ag_out_allreduce(
-                                o2,
-                                s2,
-                                get_dcp_group(),
-                                return_lse=True,
-                            )
+                        o2, s2 = cp_lse_ag_out_allreduce(
+                            o2,
+                            s2,
+                            get_dcp_group(),
+                            return_lse=True,
+                        )
                     else:
                         o2, s2 = cp_lse_ag_out_rs(
                             o2,
@@ -959,11 +947,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
                 forward_batch.token_to_kv_pool.set_kv_buffer(*args, **kwargs)
 
-        output_heads = getattr(layer, "output_tp_q_head_num", layer.tp_q_head_num)
-        output_start = getattr(layer, "output_head_start", 0)
-        if output_heads != o.shape[1] or output_start != 0:
-            o = o[:, output_start : output_start + output_heads, :].contiguous()
-        return o.reshape(-1, output_heads * layer.head_dim)
+        return o.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
     @debug_kernel_api
     def forward_decode(
@@ -1025,11 +1009,17 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if use_dcp:
             if use_tpa_dcp:
+                has_handoff = (
+                    getattr(layer, "output_tp_q_head_num", layer.tp_q_head_num)
+                    < layer.tp_q_head_num
+                )
                 if (
-                    self.tpa_dcp_a2a_heads_per_rank is not None
+                    has_handoff
+                    and self.tpa_dcp_a2a_heads_per_rank is not None
                     and self.dcp_comm_backend == "a2a"
                 ):
                     o = dcp_a2a_lse_reduce(o, s, get_dcp_group())
+                    return o.reshape(-1, o.shape[1] * layer.head_dim)
                 else:
                     o = cp_lse_ag_out_allreduce(o, s, get_dcp_group())
             else:
@@ -1038,12 +1028,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 else:
                     o = cp_lse_ag_out_rs(o, s, get_dcp_group())
 
-        output_heads = getattr(layer, "output_tp_q_head_num", layer.tp_q_head_num)
-        output_start = getattr(layer, "output_head_start", 0)
-        if output_heads != o.shape[1] or output_start != 0:
-            o = o[:, output_start : output_start + output_heads, :].contiguous()
-
-        return o.reshape(-1, output_heads * layer.head_dim)
+        return o.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:

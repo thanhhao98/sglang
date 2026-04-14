@@ -120,20 +120,26 @@ run_perf() {
     done
 }
 
+# start_server <cfg_name> <dcp_size> [attn_tp_size] [dcp_comm_backend]
 start_server() {
     local cfg_name="$1"
     local dcp="$2"
+    local attn_tp="${3:-0}"
+    local dcp_comm="${4:-ag_rs}"
 
     local extra_args=""
     if [ "$dcp" -gt 0 ]; then
-        extra_args="--dcp-size ${dcp}"
+        extra_args="--dcp-size ${dcp} --dcp-comm-backend ${dcp_comm}"
+    fi
+    if [ "$attn_tp" -gt 0 ]; then
+        extra_args="${extra_args} --attention-tensor-parallel-size ${attn_tp}"
     fi
 
     local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
 
     echo "======================================================="
     echo "Starting: ${cfg_name} (${MODEL})"
-    echo "  backend=flashinfer  dcp=${dcp}"
+    echo "  backend=flashinfer  dcp=${dcp}  attn_tp=${attn_tp}  comm=${dcp_comm}"
     echo "  server_log=${SERVER_LOG}"
     echo "======================================================="
 
@@ -145,14 +151,17 @@ start_server() {
     echo "Server PID: ${SERVER_PID}"
 }
 
+# run_config <scenario> <cfg_name> <dcp> <attn_tp> <dcp_comm> <in> <out> <tag> <cc...>
 run_config() {
     local scenario_name="$1"
     local cfg_name="$2"
     local dcp="$3"
-    local input_len="$4"
-    local output_len="$5"
-    local workload_tag="$6"
-    shift 6
+    local attn_tp="$4"
+    local dcp_comm="$5"
+    local input_len="$6"
+    local output_len="$7"
+    local workload_tag="$8"
+    shift 8
     local concurrencies=("$@")
 
     local OUTPUT_DIR="${BASE_OUTPUT}/${scenario_name}/${cfg_name}/${workload_tag}"
@@ -172,7 +181,7 @@ run_config() {
 
     mkdir -p "$OUTPUT_DIR"
     kill_server
-    start_server "$cfg_name" "$dcp"
+    start_server "$cfg_name" "$dcp" "$attn_tp" "$dcp_comm"
 
     if ! wait_for_server; then
         local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
@@ -200,12 +209,28 @@ run_32k_4k() {
     echo "Workload: Qwen3-235B 32K/4K (PR #14982 Table 1)"
     echo "======================================================="
 
-    local concurrencies=(1 32 48 64 80 96)
+    local concurrencies=(1 48 64 80)
 
-    run_config "pr14982_32k_4k" "tp8_fi" "0" \
+    # --- Baseline + DCP AG+RS (already have results, commented out) ---
+    # run_config "pr14982_32k_4k" "tp8_fi" "0" "0" "ag_rs" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    # run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" "0" "ag_rs" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    # --- TPA AG+RS (already have results, commented out) ---
+    # run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    # run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    # --- A2A configs ---
+    run_config "pr14982_32k_4k" "tp8_dcp2_a2a_fi" "2" "0" "a2a" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" \
+    run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_a2a_fi" "2" "4" "a2a" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_a2a_fi" "4" "2" "a2a" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 }
 
@@ -221,17 +246,51 @@ run_32k_8k() {
 
     local concurrencies=(1 32 48 64 80)
 
-    run_config "pr14982_32k_8k" "tp8_fi" "0" \
+    run_config "pr14982_32k_8k" "tp8_fi" "0" "0" "ag_rs" \
         32000 8000 "in32k_out8k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "2" \
+    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "2" "0" "ag_rs" \
         32000 8000 "in32k_out8k" "${concurrencies[@]}"
+}
+
+
+# ============================================================
+# Workload: CodeQwen 7B — 4K/1.5K, all 4 configs
+# Purpose: Compare tp8 vs dcp2 vs tpa4_dcp2 vs tpa2_dcp4
+#   CodeQwen: 32 Q heads, 4 KV heads
+# ============================================================
+run_7b() {
+    echo ""
+    echo "======================================================="
+    echo "Workload: CodeQwen 7B 4K/1.5K — All TPA Configs"
+    echo "======================================================="
+
+    local model_7b="Qwen/CodeQwen1.5-7B-Chat"
+    local concurrencies=(1 8 64 128 256 512)
+
+    # Override MODEL for this scenario
+    local _save_model="$MODEL"
+    MODEL="$model_7b"
+
+    run_config "tpa_7b" "tp8_fi" "0" "0" "ag_rs" \
+        4000 1500 "in4k_out1500" "${concurrencies[@]}"
+
+    run_config "tpa_7b" "tp8_dcp2_fi" "2" "0" "ag_rs" \
+        4000 1500 "in4k_out1500" "${concurrencies[@]}"
+
+    run_config "tpa_7b" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" \
+        4000 1500 "in4k_out1500" "${concurrencies[@]}"
+
+    run_config "tpa_7b" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" \
+        4000 1500 "in4k_out1500" "${concurrencies[@]}"
+
+    MODEL="$_save_model"
 }
 
 
 # ---- Main ----
 echo "======================================================="
-echo "PR #14982 Reproduction: DCP for GQA (FlashInfer)"
+echo "DCP/TPA GQA Benchmark (FlashInfer)"
 echo "  Model:    ${MODEL}"
 echo "  Branch:   ${BRANCH} (${HASH})"
 echo "  Output:   ${BASE_OUTPUT}/"
@@ -242,14 +301,16 @@ echo ""
 
 case "$SCENARIO_FILTER" in
     32k_4k)  run_32k_4k ;;
-    32k_8k)  run_32k_8k ;;
+    # 32k_8k)  run_32k_8k ;;
+    7b)      run_7b ;;
     all)
         run_32k_4k
-        run_32k_8k
+        # run_32k_8k
+        run_7b
         ;;
     *)
         echo "Unknown scenario: $SCENARIO_FILTER"
-        echo "Usage: $0 [32k_4k|32k_8k|all] [accuracy|perf|all]"
+        echo "Usage: $0 [32k_4k|32k_8k|7b|all] [accuracy|perf|all]"
         exit 1
         ;;
 esac

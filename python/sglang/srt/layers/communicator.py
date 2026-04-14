@@ -702,6 +702,7 @@ class LayerCommunicator:
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
+            and forward_batch.dp_padding_mode is not None
             and forward_batch.dp_padding_mode.is_max_len()
         ):
             return True
@@ -934,24 +935,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
-        """Post-attention RMSNorm when attention output is already full-tensor-parallel."""
-        if get_attn_tp_context().input_scattered:
-            raise NotImplementedError(
-                "Full-tensor attention handoff is not supported with input_scattered attention"
-            )
-        if context.attn_dp_size != 1:
-            raise NotImplementedError(
-                "Full-tensor attention handoff is not implemented for attention DP > 1"
-            )
+        """Post-attention AllReduce + RMSNorm when attention output uses full-TP o_proj.
 
-        if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
-            residual, local_residual = (
-                get_local_dp_buffer(),
-                residual,
-            )
-            attn_tp_all_gather_into_tensor(residual, local_residual)
-
+        With TPA handoff, o_proj is sharded across all full_tp_size ranks
+        (reduce_results=False). Each rank has a partial sum that must be
+        combined via AllReduce before layernorm + residual addition.
+        """
         if hidden_states.shape[0] != 0:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
@@ -1108,14 +1099,14 @@ class CommunicateSummableTensorPairFn:
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return CommunicateSummableTensorPairFn._scatter_hidden_states
+            return CommunicateSummableTensorPairFn._trivial
 
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.FULL)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return CommunicateSummableTensorPairFn._scatter_hidden_states
+            return CommunicateSummableTensorPairFn._trivial
 
         if (
             (hidden_states_input_mode == ScatterMode.SCATTERED)
