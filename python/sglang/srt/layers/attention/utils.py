@@ -1622,3 +1622,35 @@ def cp_lse_ag_out_rs(
         lse = lse[:, cp_num_heads * r : cp_num_heads * (r + 1)]
         return out, lse
     return out
+
+
+def cp_lse_ag_out_allreduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    is_lse_base_on_e: bool = False,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention outputs when each rank holds the same Q heads.
+
+    Unlike ``cp_lse_ag_out_rs``, this path skips query all-gather / head
+    reduce-scatter: each rank contributes a KV-shard partial for the same
+    head layout; ``correct_attn_out`` rescales local outputs, then an
+    all-reduce sums the per-shard numerators so every rank gets the merged
+    result (used by TPA-style FlashInfer decode/extend).
+    """
+    if cp_group.world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
+        return cp_attn_out
+
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+    out, lse = correct_attn_out(
+        cp_attn_out, lses, cp_group.rank_in_group, is_lse_base_on_e
+    )
+    out = cp_group.all_reduce(out)
+    if return_lse:
+        return out, lse
+    return out

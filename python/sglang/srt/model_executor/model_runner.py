@@ -2107,6 +2107,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.decode_attention_backend_str,
         ) = self.server_args.get_attention_backends()
 
+        if self.server_args.is_attention_tpa_enabled():
+            allowed_tpa_backends = {"fa3", "fa4", "flashinfer"}
+            if (
+                self.prefill_attention_backend_str not in allowed_tpa_backends
+                or self.decode_attention_backend_str not in allowed_tpa_backends
+            ):
+                raise ValueError(
+                    f"TPA currently supports only {allowed_tpa_backends} backends."
+                )
+
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,

@@ -12,7 +12,7 @@ GroupCoordinator API.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import triton
@@ -191,7 +191,8 @@ def dcp_a2a_lse_reduce(
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """A2A-based DCP reduce: exchange head partials, then local combine.
 
     Fuses output + LSE into a single all_to_all call by packing fp32 LSE
@@ -212,6 +213,8 @@ def dcp_a2a_lse_reduce(
         [B, H_local, D] combined attention output for this rank's local heads.
     """
     if cp_group.world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
         return cp_attn_out
 
     N = cp_group.world_size
@@ -283,9 +286,15 @@ def dcp_a2a_lse_reduce(
         )
         recv_lse = recv_lse_stg
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, combined_lse = dcp_lse_combine_triton(
+        recv_output,
+        recv_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+        return_lse=return_lse,
     )
+    if return_lse:
+        assert combined_lse is not None
+        return combined, combined_lse
     return combined
 
 

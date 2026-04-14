@@ -28,7 +28,9 @@ from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.utils import (
+    cp_lse_ag_out_allreduce,
     cp_lse_ag_out_rs,
     create_flashinfer_kv_indices_for_dcp_triton,
 )
@@ -147,13 +149,26 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
+        self.dcp_comm_backend = model_runner.server_args.dcp_comm_backend
+        self.enable_tpa = model_runner.server_args.is_attention_tpa_enabled()
+        self.tpa_dcp_a2a_heads_per_rank = None
+        if self.enable_tpa and self.dcp_size > 1:
+            dcp_num_heads_per_tp = (
+                model_runner.model_config.num_attention_heads
+                // get_attention_tp_size()
+            )
+            if dcp_num_heads_per_tp % self.dcp_size == 0:
+                self.tpa_dcp_a2a_heads_per_rank = (
+                    dcp_num_heads_per_tp // self.dcp_size
+                )
 
         # Parse constants
+        dcp_head_multiplier = 1 if self.enable_tpa else self.dcp_size
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_attention_tp_size()
-            * self.dcp_size,
+            * dcp_head_multiplier,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
                 get_attention_tp_size()
             ),
@@ -885,22 +900,46 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
-                if self.dcp_size > 1:
+                use_tpa_dcp = self.dcp_size > 1 and self.enable_tpa
+                if self.dcp_size > 1 and not use_tpa_dcp:
                     q = get_dcp_group().all_gather(q, dim=1)
+                dcp_head_mult = 1 if use_tpa_dcp else self.dcp_size
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
+                    q.view(
+                        -1, layer.tp_q_head_num * dcp_head_mult, layer.head_dim
+                    ),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
                 if self.dcp_size > 1:
-                    o2, s2 = cp_lse_ag_out_rs(
-                        o2,
-                        s2,
-                        get_dcp_group(),
-                        return_lse=True,
-                    )
+                    if use_tpa_dcp:
+                        if (
+                            self.tpa_dcp_a2a_heads_per_rank is not None
+                            and self.dcp_comm_backend == "a2a"
+                        ):
+                            o2, s2 = dcp_a2a_lse_reduce(
+                                o2,
+                                s2,
+                                get_dcp_group(),
+                                is_lse_base_on_e=False,
+                                return_lse=True,
+                            )
+                        else:
+                            o2, s2 = cp_lse_ag_out_allreduce(
+                                o2,
+                                s2,
+                                get_dcp_group(),
+                                return_lse=True,
+                            )
+                    else:
+                        o2, s2 = cp_lse_ag_out_rs(
+                            o2,
+                            s2,
+                            get_dcp_group(),
+                            return_lse=True,
+                        )
                     o2 = o2.contiguous()
                     s2 = s2.contiguous()
 
@@ -920,7 +959,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
                 forward_batch.token_to_kv_pool.set_kv_buffer(*args, **kwargs)
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        output_heads = getattr(layer, "output_tp_q_head_num", layer.tp_q_head_num)
+        output_start = getattr(layer, "output_head_start", 0)
+        if output_heads != o.shape[1] or output_start != 0:
+            o = o[:, output_start : output_start + output_heads, :].contiguous()
+        return o.reshape(-1, output_heads * layer.head_dim)
 
     @debug_kernel_api
     def forward_decode(
@@ -941,7 +984,10 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        if self.dcp_size > 1:
+        use_dcp = self.dcp_size > 1
+        use_tpa_dcp = use_dcp and self.enable_tpa
+
+        if use_dcp and not use_tpa_dcp:
             with use_symmetric_memory(get_dcp_group()):
                 q = q.clone(memory_format=torch.contiguous_format)
             q = get_dcp_group().all_gather(q, dim=1)
@@ -960,25 +1006,44 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
                 kwargs = {}
-                if self.dcp_size > 1:
+                if use_dcp:
                     kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
                 forward_batch.token_to_kv_pool.set_kv_buffer(*args, **kwargs)
 
-        # Call the wrapped function
+        dcp_head_mult = 1 if use_tpa_dcp else self.dcp_size
+        num_qo_heads = layer.tp_q_head_num * dcp_head_mult
+
         with use_symmetric_memory(get_dcp_group()):
             o, s = decode_wrapper.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
+                q.view(-1, num_qo_heads, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
-        if self.dcp_size > 1:
-            o = cp_lse_ag_out_rs(o, s, get_dcp_group())
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        if use_dcp:
+            if use_tpa_dcp:
+                if (
+                    self.tpa_dcp_a2a_heads_per_rank is not None
+                    and self.dcp_comm_backend == "a2a"
+                ):
+                    o = dcp_a2a_lse_reduce(o, s, get_dcp_group())
+                else:
+                    o = cp_lse_ag_out_allreduce(o, s, get_dcp_group())
+            else:
+                if self.dcp_comm_backend == "a2a":
+                    o = dcp_a2a_lse_reduce(o, s, get_dcp_group())
+                else:
+                    o = cp_lse_ag_out_rs(o, s, get_dcp_group())
+
+        output_heads = getattr(layer, "output_tp_q_head_num", layer.tp_q_head_num)
+        output_start = getattr(layer, "output_head_start", 0)
+        if output_heads != o.shape[1] or output_start != 0:
+            o = o[:, output_start : output_start + output_heads, :].contiguous()
+
+        return o.reshape(-1, output_heads * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -1006,6 +1071,7 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.enable_tpa = attn_backend.enable_tpa
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1238,13 +1304,15 @@ class FlashInferIndicesUpdaterDecode:
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
+        dcp_head_mult = 1 if self.enable_tpa else dcp_size
+        num_qo_heads_for_wrapper = self.num_qo_heads * dcp_head_mult
+
         if wrapper_uses_fast_decode_plan:
-            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads * dcp_size,
+                num_qo_heads_for_wrapper,
                 self.num_kv_heads,
                 self.head_dim,
                 1,
@@ -1258,12 +1326,11 @@ class FlashInferIndicesUpdaterDecode:
                 global_override_indptr_cpu=global_override_indptr_cpu,
             )
         else:
-            # When using original begin_forward, don't pass global_override_indptr_cpu
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads * dcp_size,
+                num_qo_heads_for_wrapper,
                 self.num_kv_heads,
                 self.head_dim,
                 1,
@@ -1295,6 +1362,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
         self.page_size = attn_backend.page_size
+        self.enable_tpa = attn_backend.enable_tpa
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1493,6 +1561,9 @@ class FlashInferIndicesUpdaterPrefill:
             dcp_size = 1
             dcp_rank = 0
 
+        dcp_head_mult = 1 if self.enable_tpa else dcp_size
+        num_qo_heads_for_wrapper = self.num_qo_heads * dcp_head_mult
+
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
@@ -1610,7 +1681,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs_eff],
-            self.num_qo_heads * dcp_size,
+            num_qo_heads_for_wrapper,
             self.num_kv_heads,
             self.head_dim,
             1,
