@@ -706,14 +706,12 @@ class Qwen3MoeAttention(nn.Module):
         )
 
         if use_dcp_decode:
-            self.attn(q, k, v, fb, save_kv_cache=save_kv_cache)
-
             q_3d = q.view(-1, self.num_heads, self.head_dim)
             q_gathered = get_dcp_group().all_gather(q_3d.contiguous(), dim=1)
             q_flat = q_gathered.reshape(-1, self.num_heads * self.dcp_size * self.head_dim)
 
             attn_output, lse = self.attn_for_dcp_decode(
-                q_flat, None, None, fb, save_kv_cache=False,
+                q_flat, k, v, fb, save_kv_cache=save_kv_cache,
             )
 
             attn_output = attn_output.view(
