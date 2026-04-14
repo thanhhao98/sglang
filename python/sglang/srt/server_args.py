@@ -451,6 +451,7 @@ class ServerArgs:
     load_balance_method: str = "auto"
 
     attn_cp_size: int = 1
+    attention_tensor_parallel_size: Optional[int] = None
     moe_dp_size: int = 1
     dcp_size: int = 1
     dcp_comm_backend: str = "ag_rs"
@@ -1207,7 +1208,10 @@ class ServerArgs:
         # 17. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 18. CUDA Graph debug mode
+        # 18. Phase-1 TPA
+        if self.is_attention_tpa_enabled():
+            self.disable_piecewise_cuda_graph = True
+        # 19. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
 
@@ -2744,6 +2748,37 @@ class ServerArgs:
             assert (
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
+
+        if self.attention_tensor_parallel_size is not None:
+            if self.attention_tensor_parallel_size <= 0:
+                raise ValueError("--attention-tensor-parallel-size must be positive")
+            if self.attention_tensor_parallel_size >= self.tp_size:
+                if self.attention_tensor_parallel_size == self.tp_size:
+                    self.attention_tensor_parallel_size = None
+                else:
+                    raise ValueError(
+                        "--attention-tensor-parallel-size must be less than or equal to --tp-size"
+                    )
+
+        if self.attention_tensor_parallel_size is not None:
+            if self.tp_size % self.attention_tensor_parallel_size != 0:
+                raise ValueError(
+                    "--tp-size must be divisible by --attention-tensor-parallel-size"
+                )
+            if self.attn_cp_size > 1:
+                raise ValueError(
+                    "Phase-1 TPA does not support --attention-context-parallel-size > 1"
+                )
+            if self.enable_dp_attention:
+                raise ValueError("Phase-1 TPA does not support DP attention")
+            if self.pp_size > 1:
+                raise ValueError("Phase-1 TPA does not support pipeline parallelism")
+            expected_dcp = self.tp_size // self.attention_tensor_parallel_size
+            if self.dcp_size != expected_dcp:
+                raise ValueError(
+                    "--dcp-size must equal --tp-size / --attention-tensor-parallel-size "
+                    f"for phase-1 TPA (expected {expected_dcp}, got {self.dcp_size})"
+                )
 
         if self.dcp_comm_backend == "a2a" and self.dcp_size <= 1:
             raise ValueError("--dcp-comm-backend a2a requires --dcp-size > 1")
@@ -4420,6 +4455,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
+        )
+        parser.add_argument(
+            "--attention-tensor-parallel-size",
+            "--attn-tp-size",
+            type=int,
+            default=ServerArgs.attention_tensor_parallel_size,
+            help="Phase-1 TPA: use a smaller tensor-parallel size for attention while keeping the rest of the model on full TP.",
         )
         parser.add_argument(
             "--decode-context-parallel-size",
@@ -6428,6 +6470,18 @@ class ServerArgs:
             return self.model_config
         self.model_config = ModelConfig.from_server_args(self)
         return self.model_config
+
+    def is_attention_tpa_enabled(self) -> bool:
+        return (
+            self.attention_tensor_parallel_size is not None
+            and self.attention_tensor_parallel_size < self.tp_size
+        )
+
+    def get_attention_tp_size(self) -> int:
+        if self.attention_tensor_parallel_size is not None:
+            return self.attention_tensor_parallel_size
+        attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+        return self.tp_size // attn_dp_size // self.attn_cp_size
 
     def get_attention_backends(self):
         prefill_attention_backend_str = (

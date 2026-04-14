@@ -69,6 +69,8 @@ class RadixAttention(nn.Module):
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
+        self.output_tp_q_head_num = num_heads
+        self.output_head_start = 0
         self.tp_k_head_num = num_kv_heads
         self.tp_v_head_num = num_kv_heads
         self.head_dim = head_dim
@@ -96,6 +98,35 @@ class RadixAttention(nn.Module):
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
 
+    def set_output_head_partition(
+        self, output_tp_q_head_num: int, output_head_start: int = 0
+    ):
+        assert output_tp_q_head_num > 0
+        assert output_head_start >= 0
+        assert output_head_start + output_tp_q_head_num <= self.tp_q_head_num
+        self.output_tp_q_head_num = output_tp_q_head_num
+        self.output_head_start = output_head_start
+
+    def _maybe_slice_output_heads(self, output: torch.Tensor) -> torch.Tensor:
+        if (
+            self.output_tp_q_head_num == self.tp_q_head_num
+            and self.output_head_start == 0
+        ):
+            return output
+        per_head = (
+            self.v_head_dim
+            if self.qk_head_dim != self.v_head_dim
+            else self.head_dim
+        )
+        out = output.view(-1, self.tp_q_head_num, per_head)
+        out = out[
+            :,
+            self.output_head_start : self.output_head_start
+            + self.output_tp_q_head_num,
+            :,
+        ]
+        return out.reshape(output.shape[0], -1)
+
     def forward(
         self,
         q,
@@ -122,9 +153,9 @@ class RadixAttention(nn.Module):
             unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
-            return output
+            return self._maybe_slice_output_heads(output)
         else:
-            return forward_batch.attn_backend.forward(
+            ret = forward_batch.attn_backend.forward(
                 q,
                 k,
                 v,
@@ -133,6 +164,7 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+            return self._maybe_slice_output_heads(ret)
 
 
 @register_custom_op(mutates_args=["output"])

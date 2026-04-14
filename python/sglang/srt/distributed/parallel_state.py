@@ -1806,6 +1806,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
+    attention_tensor_parallel_size: Optional[int] = None,
     moe_data_model_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
@@ -1909,7 +1910,9 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    attn_tp_size = attention_tensor_parallel_size or (
+        tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    )
 
     global _ATTN_CP
     assert (
@@ -1952,18 +1955,37 @@ def initialize_model_parallel(
         _ATTN_TP = _TP
     else:
         group_ranks = []
-        for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
-                st = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + cp_dp_combined_idx * attn_tp_size
-                )
-                en = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + (cp_dp_combined_idx + 1) * attn_tp_size
-                )
-                ranks = list(range(st, en))
-                group_ranks.append(ranks)
+        if attention_tensor_parallel_size is not None:
+            assert attn_cp_size == 1, "Phase-1 TPA does not support attention CP"
+            assert attn_dp_size == 1, "Phase-1 TPA does not support attention DP"
+            assert (
+                tensor_model_parallel_size
+                == attention_tensor_parallel_size * decode_context_parallel_size
+            ), "Phase-1 TPA requires tp_size == attention_tensor_parallel_size * dcp_size"
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                tp_group_base = tp_group_idx * tensor_model_parallel_size
+                for dcp_rank in range(decode_context_parallel_size):
+                    ranks = list(
+                        range(
+                            tp_group_base + dcp_rank,
+                            tp_group_base + tensor_model_parallel_size,
+                            decode_context_parallel_size,
+                        )
+                    )
+                    group_ranks.append(ranks)
+        else:
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
+                    st = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + cp_dp_combined_idx * attn_tp_size
+                    )
+                    en = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + (cp_dp_combined_idx + 1) * attn_tp_size
+                    )
+                    ranks = list(range(st, en))
+                    group_ranks.append(ranks)
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,

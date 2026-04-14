@@ -427,6 +427,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        use_full_tp_attention_handoff: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -434,6 +435,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.use_full_tp_attention_handoff = use_full_tp_attention_handoff
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -447,9 +449,14 @@ class LayerCommunicator:
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
+        post_attn_hidden_mode = (
+            ScatterMode.FULL
+            if self.use_full_tp_attention_handoff
+            else self.layer_scatter_modes.attn_mode
+        )
         self._communicate_with_all_reduce_and_layer_norm_fn = (
             CommunicateWithAllReduceAndLayerNormFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
+                hidden_states_input_mode=post_attn_hidden_mode,
                 residual_input_mode=self.layer_scatter_modes.layer_input_mode,
                 hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
                 residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
@@ -874,6 +881,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
+            (hidden_states_input_mode == ScatterMode.FULL)
+            and (
+                residual_input_mode
+                in (ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL)
+            )
+            and (hidden_states_output_mode == ScatterMode.FULL)
+            and (residual_output_mode == ScatterMode.FULL)
+        ):
+            return partial(
+                CommunicateWithAllReduceAndLayerNormFn._post_attn_ln_full_hidden_states,
+                residual_input_mode=residual_input_mode,
+            )
+
+        if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (
                 residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
@@ -902,6 +923,37 @@ class CommunicateWithAllReduceAndLayerNormFn:
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
+
+    @staticmethod
+    def _post_attn_ln_full_hidden_states(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+        *,
+        residual_input_mode,
+    ):
+        """Post-attention RMSNorm when attention output is already full-tensor-parallel."""
+        if get_attn_tp_context().input_scattered:
+            raise NotImplementedError(
+                "Full-tensor attention handoff is not supported with input_scattered attention"
+            )
+        if context.attn_dp_size != 1:
+            raise NotImplementedError(
+                "Full-tensor attention handoff is not implemented for attention DP > 1"
+            )
+
+        if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
+            residual, local_residual = (
+                get_local_dp_buffer(),
+                residual,
+            )
+            attn_tp_all_gather_into_tensor(residual, local_residual)
+
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
 
     @staticmethod
     def _simple(
@@ -1054,6 +1106,13 @@ class CommunicateSummableTensorPairFn:
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (output_mode == ScatterMode.TP_ATTN_FULL)
+        ):
+            return CommunicateSummableTensorPairFn._scatter_hidden_states
+
+        if (
+            (hidden_states_input_mode == ScatterMode.FULL)
+            and (residual_input_mode == ScatterMode.FULL)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
             return CommunicateSummableTensorPairFn._scatter_hidden_states
