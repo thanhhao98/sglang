@@ -28,18 +28,24 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_attn_context_model_parallel_rank,
     get_attn_context_model_parallel_world_size,
+    get_dcp_rank,
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -476,6 +482,30 @@ class Qwen3MoeAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.use_full_tp_attention_handoff = False
+        self.full_tp_local_num_heads = self.num_heads
+
+        full_tp_rank = get_tensor_model_parallel_rank()
+        full_tp_size = get_tensor_model_parallel_world_size()
+
+        if (
+            get_global_server_args().is_attention_tpa_enabled()
+            and full_tp_size > attn_tp_size
+            and self.total_num_heads % full_tp_size == 0
+        ):
+            dcp_size = full_tp_size // attn_tp_size
+            full_tp_local_num_heads = self.total_num_heads // full_tp_size
+            if self.num_heads % dcp_size == 0:
+                self.use_full_tp_attention_handoff = True
+                self.full_tp_local_num_heads = full_tp_local_num_heads
+
+        o_proj_tp_rank = (
+            full_tp_rank if self.use_full_tp_attention_handoff else attn_tp_rank
+        )
+        o_proj_tp_size = (
+            full_tp_size if self.use_full_tp_attention_handoff else attn_tp_size
+        )
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -493,8 +523,8 @@ class Qwen3MoeAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=o_proj_tp_rank,
+            tp_size=o_proj_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -535,6 +565,11 @@ class Qwen3MoeAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        if self.use_full_tp_attention_handoff:
+            self.attn.set_output_head_partition(
+                self.full_tp_local_num_heads,
+                get_dcp_rank() * self.full_tp_local_num_heads,
+            )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -765,6 +800,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
+        if self.self_attn.use_full_tp_attention_handoff:
+            self.layer_scatter_modes.middle_residual_mode = ScatterMode.FULL
 
         if self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
@@ -790,6 +827,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            use_full_tp_attention_handoff=self.self_attn.use_full_tp_attention_handoff,
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
