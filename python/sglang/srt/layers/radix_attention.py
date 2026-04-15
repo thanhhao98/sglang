@@ -118,6 +118,9 @@ class RadixAttention(nn.Module):
             if self.qk_head_dim != self.v_head_dim
             else self.head_dim
         )
+        expected_partitioned = self.output_tp_q_head_num * per_head
+        if output.shape[-1] == expected_partitioned:
+            return output
         out = output.view(-1, self.tp_q_head_num, per_head)
         out = out[
             :,
