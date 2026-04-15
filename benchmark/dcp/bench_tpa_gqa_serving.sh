@@ -120,12 +120,13 @@ run_perf() {
     done
 }
 
-# start_server <cfg_name> <dcp_size> [attn_tp_size] [dcp_comm_backend]
+# start_server <cfg_name> <dcp_size> [attn_tp_size] [dcp_comm_backend] [backend]
 start_server() {
     local cfg_name="$1"
     local dcp="$2"
     local attn_tp="${3:-0}"
     local dcp_comm="${4:-ag_rs}"
+    local backend="${5:-flashinfer}"
 
     local extra_args=""
     if [ "$dcp" -gt 0 ]; then
@@ -139,29 +140,30 @@ start_server() {
 
     echo "======================================================="
     echo "Starting: ${cfg_name} (${MODEL})"
-    echo "  backend=flashinfer  dcp=${dcp}  attn_tp=${attn_tp}  comm=${dcp_comm}"
+    echo "  backend=${backend}  dcp=${dcp}  attn_tp=${attn_tp}  comm=${dcp_comm}"
     echo "  server_log=${SERVER_LOG}"
     echo "======================================================="
 
     python3 -m sglang.launch_server \
         --model-path ${MODEL} --host 0.0.0.0 --port ${PORT} \
-        --tp 8 --attention-backend flashinfer --enable-symm-mem \
+        --tp 8 --attention-backend ${backend} --enable-symm-mem \
         ${extra_args} > "${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     echo "Server PID: ${SERVER_PID}"
 }
 
-# run_config <scenario> <cfg_name> <dcp> <attn_tp> <dcp_comm> <in> <out> <tag> <cc...>
+# run_config <scenario> <cfg_name> <dcp> <attn_tp> <dcp_comm> <backend> <in> <out> <tag> <cc...>
 run_config() {
     local scenario_name="$1"
     local cfg_name="$2"
     local dcp="$3"
     local attn_tp="$4"
     local dcp_comm="$5"
-    local input_len="$6"
-    local output_len="$7"
-    local workload_tag="$8"
-    shift 8
+    local backend="$6"
+    local input_len="$7"
+    local output_len="$8"
+    local workload_tag="$9"
+    shift 9
     local concurrencies=("$@")
 
     local OUTPUT_DIR="${BASE_OUTPUT}/${scenario_name}/${cfg_name}/${workload_tag}"
@@ -181,7 +183,7 @@ run_config() {
 
     mkdir -p "$OUTPUT_DIR"
     kill_server
-    start_server "$cfg_name" "$dcp" "$attn_tp" "$dcp_comm"
+    start_server "$cfg_name" "$dcp" "$attn_tp" "$dcp_comm" "$backend"
 
     if ! wait_for_server; then
         local SERVER_LOG="/tmp/sglang_server_${cfg_name}.log"
@@ -212,25 +214,27 @@ run_32k_4k() {
     local concurrencies=(1 48 64 80)
 
     # --- Baseline + DCP AG+RS (already have results, commented out) ---
-    # run_config "pr14982_32k_4k" "tp8_fi" "0" "0" "ag_rs" \
+    # run_config "pr14982_32k_4k" "tp8_fi" "0" "0" "ag_rs" "flashinfer" \
     #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-    # run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" "0" "ag_rs" \
+    # run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" "0" "ag_rs" "flashinfer" \
     #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
 
     # --- TPA AG+RS (already have results, commented out) ---
-    # run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" \
+    # run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" "flashinfer" \
     #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-    # run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" \
+    # run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" "flashinfer" \
     #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
 
-    # --- A2A configs ---
-    run_config "pr14982_32k_4k" "tp8_dcp2_a2a_fi" "2" "0" "a2a" \
-        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    # --- A2A configs (already have results, commented out) ---
+    # run_config "pr14982_32k_4k" "tp8_dcp2_a2a_fi" "2" "0" "a2a" "flashinfer" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    # run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_a2a_fi" "2" "4" "a2a" "flashinfer" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    # run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_a2a_fi" "4" "2" "a2a" "flashinfer" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_a2a_fi" "2" "4" "a2a" \
-        32000 4000 "in32k_out4k" "${concurrencies[@]}"
-
-    run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_a2a_fi" "4" "2" "a2a" \
+    # --- FA3 baseline ---
+    run_config "pr14982_32k_4k" "tp8_fa3" "0" "0" "ag_rs" "fa3" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
 }
 
@@ -246,10 +250,10 @@ run_32k_8k() {
 
     local concurrencies=(1 32 48 64 80)
 
-    run_config "pr14982_32k_8k" "tp8_fi" "0" "0" "ag_rs" \
+    run_config "pr14982_32k_8k" "tp8_fi" "0" "0" "ag_rs" "flashinfer" \
         32000 8000 "in32k_out8k" "${concurrencies[@]}"
 
-    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "2" "0" "ag_rs" \
+    run_config "pr14982_32k_8k" "tp8_dcp2_fi" "2" "0" "ag_rs" "flashinfer" \
         32000 8000 "in32k_out8k" "${concurrencies[@]}"
 }
 
@@ -272,16 +276,16 @@ run_7b() {
     local _save_model="$MODEL"
     MODEL="$model_7b"
 
-    run_config "tpa_7b" "tp8_fi" "0" "0" "ag_rs" \
+    run_config "tpa_7b" "tp8_fi" "0" "0" "ag_rs" "flashinfer" \
         4000 1500 "in4k_out1500" "${concurrencies[@]}"
 
-    run_config "tpa_7b" "tp8_dcp2_fi" "2" "0" "ag_rs" \
+    run_config "tpa_7b" "tp8_dcp2_fi" "2" "0" "ag_rs" "flashinfer" \
         4000 1500 "in4k_out1500" "${concurrencies[@]}"
 
-    run_config "tpa_7b" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" \
+    run_config "tpa_7b" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" "flashinfer" \
         4000 1500 "in4k_out1500" "${concurrencies[@]}"
 
-    run_config "tpa_7b" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" \
+    run_config "tpa_7b" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" "flashinfer" \
         4000 1500 "in4k_out1500" "${concurrencies[@]}"
 
     MODEL="$_save_model"
