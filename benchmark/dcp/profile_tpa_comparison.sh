@@ -36,7 +36,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BASE_OUTPUT="${SCRIPT_DIR}/profiles/${BRANCH}_${HASH}_${MODEL_SHORT}_${TIMESTAMP}"
 
 NSYS_TRACES="cuda,nvtx,nccl,osrt"
-NSYS_EXTRA="--cuda-graph-trace=node --gpu-metrics-device=all --gpu-metrics-frequency=20000"
+NSYS_EXTRA="--cuda-graph-trace=node"
 TORCH_PROFILE_STEPS=10
 
 FILTER="${1:-all}"
