@@ -2202,6 +2202,15 @@ class ServerArgs:
         is_h20_device = (
             device_name and "H20" in device_name and "H200" not in device_name
         )
+        # Disable auto-enable of FlashInfer allreduce fusion when DCP > 1:
+        # its TRT-LLM workspace uses a fixed TCP/socket rendezvous port per
+        # host, but DCP launches multiple scheduler processes on the same
+        # host (one per dcp rank). They collide on the port, half the ranks
+        # fail with "[Errno 98] Address already in use", and the resulting
+        # inconsistent state (some ranks have fusion, some don't) deadlocks
+        # CUDA graph capture on Qwen3-235B at B200. Users can still opt in
+        # explicitly with --enable-flashinfer-allreduce-fusion if they know
+        # their environment handles the port conflict.
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
@@ -2221,6 +2230,7 @@ class ServerArgs:
             and self.tp_size > 1
             and not self.enable_dp_attention
             and self.attn_cp_size <= 1
+            and self.dcp_size <= 1
             and self.nnodes == 1
             and not is_h20_device
             and self.moe_a2a_backend == "none"

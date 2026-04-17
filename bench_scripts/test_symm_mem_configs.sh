@@ -112,6 +112,10 @@ run_cfg() {
     local server_pid=$!
 
     # Wait for ready
+    # NOTE: "Address already in use" from FlashInfer's TRT-LLM workspace init
+    # is a non-fatal warning ("Disabling flashinfer allreduce fusion
+    # permanently") — the server falls back to standard NCCL and continues.
+    # Don't treat it as a startup failure.
     local ready=0
     local start=$(date +%s)
     while true; do
@@ -119,7 +123,7 @@ run_cfg() {
             ready=1
             break
         fi
-        if grep -qE "Scheduler watchdog timeout|SIGQUIT received|Address already in use|Out of memory|CUDA error" "$log" 2>/dev/null; then
+        if grep -qE "Scheduler watchdog timeout|SIGQUIT received|Out of memory|CUDA error|RuntimeError:|uncorrectable" "$log" 2>/dev/null; then
             break
         fi
         if ! kill -0 "$server_pid" 2>/dev/null; then
