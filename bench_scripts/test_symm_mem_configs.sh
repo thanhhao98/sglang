@@ -14,9 +14,12 @@ MODEL="Qwen/Qwen3-235B-A22B-Instruct-2507"
 PORT=30000
 LOG_DIR=/tmp/symm_mem_test
 READY_TIMEOUT=360     # seconds to wait for "fired up and ready to roll"
-ACC_PARALLEL=32
-ACC_MAX_NEW=256
-ACC_NUM_QUESTIONS=80
+# Match the original (error.md) reproduction so a fix here is a real fix
+# for the user-reported case. All configs are expected to complete under
+# --parallel 128 on Qwen3-235B at B200.
+ACC_PARALLEL=128
+ACC_MAX_NEW=512
+ACC_NUM_QUESTIONS=200
 
 mkdir -p "$LOG_DIR"
 

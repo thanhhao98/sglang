@@ -76,6 +76,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
     monkey_patch_vllm_parallel_state,
@@ -3354,22 +3356,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         get_nccl_mem_pool(get_tp_group())
         torch.distributed.barrier()
 
+        prealloc_gb = envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()
+
+        # Every GroupCoordinator with symm-mem enabled maintains its OWN NCCL
+        # mempool; allocations from one group's pool never fall back to
+        # another group's chunks. Without a prealloc in each active group,
+        # the FIRST ``use_symmetric_memory(group)`` call on that group during
+        # serving fires ``ncclMemAlloc`` + ``ncclCommWindowRegister`` (a
+        # group-collective) under asynchronous request load, which can
+        # deadlock when ranks enter the context at different times.
+        #
+        # We prealloc TP (always), DCP (when dcp_size > 1) and MoE TP
+        # (when moe_tp_size > 1 and differs from TP group). Each prealloc
+        # tensor is immediately dropped so its chunk returns to the pool's
+        # free list and is reused by live allocations during serving.
+        groups_to_prealloc: list[tuple[str, GroupCoordinator, int]] = []
+        groups_to_prealloc.append(("tp", get_tp_group(), prealloc_gb))
+
+        if get_dcp_world_size() > 1:
+            # DCP allocations (Q all-gather, attention output merge) are
+            # small relative to TP (head dim × batch tokens), so 1 GiB is
+            # usually enough; cap at the configured size.
+            dcp_gb = min(1, prealloc_gb) if prealloc_gb >= 1 else prealloc_gb
+            groups_to_prealloc.append(("dcp", get_dcp_group(), dcp_gb))
+
         # Memory allocation is tied to a cuda stream, use the forward stream.
-        # The tensor is allowed to go out of scope so its 4 GiB is returned to
-        # the symm-mem mempool's free list, where it can be reused by smaller
+        # Each tensor is allowed to go out of scope so its chunk is returned
+        # to the mempool's free list, where it can be reused by smaller
         # NCCL allocations during serving (avoiding fragmentation). PyTorch's
         # caching mempool keeps the chunk reserved without calling
         # ncclMemFree, so no collective free is triggered at process exit.
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            logger.info(
-                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
-            )
-            with use_symmetric_memory(get_tp_group()):
-                torch.empty(
-                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
-                    dtype=torch.uint8,
-                    device=self.device,
+            for group_name, group, size_gb in groups_to_prealloc:
+                if size_gb <= 0:
+                    continue
+                logger.info(
+                    f"Pre-allocating symmetric memory pool for group '{group_name}' with {size_gb} GiB"
                 )
+                # Ensure the mempool exists for this group BEFORE the
+                # collective alloc, to serialize JIT + pool construction
+                # across ranks.
+                get_nccl_mem_pool(group)
+                torch.distributed.barrier()
+
+                with use_symmetric_memory(group):
+                    torch.empty(
+                        (size_gb * 1024 * 1024 * 1024,),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
