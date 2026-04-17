@@ -1398,6 +1398,20 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 4 * 1024
 
+            # Reserve memory for the NCCL symmetric memory prealloc pool.
+            # When --enable-symm-mem is set, prealloc_symmetric_memory_pool()
+            # holds a SGLANG_SYMM_MEM_PREALLOC_GB_SIZE chunk (default 4 GiB)
+            # in a separate mempool that the regular CUDA caching allocator
+            # cannot use. Without this reservation, large CUDA graph captures
+            # + prealloc can leave the prefill/decode path with insufficient
+            # contiguous memory and OOM at the first prefill batch.
+            if self.enable_symm_mem:
+                symm_mem_gb = envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()
+                if symm_mem_gb is None or symm_mem_gb <= 0:
+                    # mirrors the default applied below
+                    symm_mem_gb = 4
+                reserved_mem += symm_mem_gb * 1024
+
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
                 if gpu_mem is not None

@@ -3354,15 +3354,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         get_nccl_mem_pool(get_tp_group())
         torch.distributed.barrier()
 
-        # Memory allocation is tied to a cuda stream, use the forward stream
+        # Memory allocation is tied to a cuda stream, use the forward stream.
+        # The tensor is allowed to go out of scope so its 4 GiB is returned to
+        # the symm-mem mempool's free list, where it can be reused by smaller
+        # NCCL allocations during serving (avoiding fragmentation). PyTorch's
+        # caching mempool keeps the chunk reserved without calling
+        # ncclMemFree, so no collective free is triggered at process exit.
         with torch.get_device_module(self.device).stream(self.forward_stream):
             logger.info(
                 f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
             )
             with use_symmetric_memory(get_tp_group()):
-                # Keep the tensor alive so ncclMemFree (another collective) is
-                # never called on process-level teardown at divergent times.
-                self._symm_mem_prealloc = torch.empty(
+                torch.empty(
                     (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
                     dtype=torch.uint8,
                     device=self.device,
