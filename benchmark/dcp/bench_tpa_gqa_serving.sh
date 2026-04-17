@@ -213,29 +213,29 @@ run_32k_4k() {
 
     local concurrencies=(1 48 64 80)
 
-    # --- Baseline + DCP AG+RS (already have results, commented out) ---
-    # run_config "pr14982_32k_4k" "tp8_fi" "0" "0" "ag_rs" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-    # run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" "0" "ag_rs" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-
-    # --- TPA AG+RS (already have results, commented out) ---
-    # run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-    # run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-
-    # --- A2A configs (already have results, commented out) ---
-    # run_config "pr14982_32k_4k" "tp8_dcp2_a2a_fi" "2" "0" "a2a" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-    # run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_a2a_fi" "2" "4" "a2a" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-    # run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_a2a_fi" "4" "2" "a2a" "flashinfer" \
-    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
-
-    # --- FA3 baseline ---
-    run_config "pr14982_32k_4k" "tp8_fa3" "0" "0" "ag_rs" "fa3" \
+    # --- Baseline + DCP AG+RS ---
+    run_config "pr14982_32k_4k" "tp8_fi" "0" "0" "ag_rs" "flashinfer" \
         32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    run_config "pr14982_32k_4k" "tp8_dcp2_fi" "2" "0" "ag_rs" "flashinfer" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    # --- TPA AG+RS ---
+    run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_fi" "2" "4" "ag_rs" "flashinfer" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_fi" "4" "2" "ag_rs" "flashinfer" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    # --- A2A configs ---
+    run_config "pr14982_32k_4k" "tp8_dcp2_a2a_fi" "2" "0" "a2a" "flashinfer" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    run_config "pr14982_32k_4k" "tp8_tpa4_dcp2_a2a_fi" "2" "4" "a2a" "flashinfer" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+    run_config "pr14982_32k_4k" "tp8_tpa2_dcp4_a2a_fi" "4" "2" "a2a" "flashinfer" \
+        32000 4000 "in32k_out4k" "${concurrencies[@]}"
+
+    # --- FA3 baseline (disabled: FA3 not supported on B200/SM100) ---
+    # run_config "pr14982_32k_4k" "tp8_fa3" "0" "0" "ag_rs" "fa3" \
+    #     32000 4000 "in32k_out4k" "${concurrencies[@]}"
 }
 
 # ============================================================
