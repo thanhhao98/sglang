@@ -797,6 +797,8 @@ class CudaGraphRunner:
             profile_context = self._init_profile_context_and_memory_record()
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
+            import time as _time
+
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -808,6 +810,11 @@ class CudaGraphRunner:
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
+            _debug_symm = (
+                self.model_runner.server_args.enable_symm_mem
+                and envs.SGLANG_DEBUG_CUDA_GRAPH_CAPTURE.get()
+            )
+            _rank = get_tensor_model_parallel_rank()
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -817,6 +824,11 @@ class CudaGraphRunner:
                     )
                     capture_range.set_description(
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    )
+                if _debug_symm:
+                    _t0 = _time.perf_counter()
+                    logger.warning(
+                        f"[cuda-graph-dbg rank={_rank}] START bs={bs} i={i}"
                     )
 
                 with patch_model(
@@ -833,6 +845,12 @@ class CudaGraphRunner:
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
+
+                if _debug_symm:
+                    logger.warning(
+                        f"[cuda-graph-dbg rank={_rank}] END   bs={bs} i={i} "
+                        f"dt={_time.perf_counter() - _t0:.2f}s"
+                    )
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1101,18 +1119,47 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
+        _debug_symm = (
+            self.model_runner.server_args.enable_symm_mem
+            and envs.SGLANG_DEBUG_CUDA_GRAPH_CAPTURE.get()
+        )
+        _rank = get_tensor_model_parallel_rank()
+
+        for warmup_idx in range(2):
             self.device_module.synchronize()
+            if _debug_symm:
+                logger.warning(
+                    f"[cuda-graph-dbg rank={_rank}] warmup bs={bs} idx={warmup_idx} "
+                    f"before barrier"
+                )
             self.model_runner.tp_group.barrier()
+            if _debug_symm:
+                logger.warning(
+                    f"[cuda-graph-dbg rank={_rank}] warmup bs={bs} idx={warmup_idx} "
+                    f"after barrier, running forward"
+                )
             run_once()
+            if _debug_symm:
+                logger.warning(
+                    f"[cuda-graph-dbg rank={_rank}] warmup bs={bs} idx={warmup_idx} "
+                    f"forward complete"
+                )
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+        if _debug_symm:
+            logger.warning(
+                f"[cuda-graph-dbg rank={_rank}] bs={bs} starting capture_graph"
+            )
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
+        if _debug_symm:
+            logger.warning(
+                f"[cuda-graph-dbg rank={_rank}] bs={bs} capture_graph complete"
+            )
 
         return graph, out
 

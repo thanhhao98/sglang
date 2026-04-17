@@ -535,6 +535,9 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # CUDA graph capture diagnostics (for investigating symm-mem + graph capture hangs)
+    SGLANG_DEBUG_CUDA_GRAPH_CAPTURE = EnvBool(False)
+
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on

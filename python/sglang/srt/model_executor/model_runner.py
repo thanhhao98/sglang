@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -2220,6 +2221,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return True
 
+    @contextmanager
+    def _disable_symm_mem(self):
+        """Temporarily disable symmetric memory during warmup phases.
+
+        The ``use_symmetric_memory()`` context manager triggers NCCL collective
+        operations (``ncclMemAlloc`` + ``ncclCommWindowRegister`` with
+        ``NCCL_WIN_COLL_SYMMETRIC``) that require identical sizes/ordering
+        across ranks. During CUDA graph capture warmup and autotune, ranks can
+        diverge (e.g., MoE expert routing, differing kernel configurations),
+        causing deadlocks at ``ncclCommWindowRegister``.
+
+        This helper flips ``server_args.enable_symm_mem`` so that
+        ``is_symmetric_memory_enabled()`` returns ``False`` and all
+        ``use_symmetric_memory(...)`` sites short-circuit to ``nullcontext()``
+        during the wrapped phase. The graphs captured this way use the
+        standard allreduce path, which is safe to replay even when symm-mem
+        is re-enabled for the live serving path.
+        """
+        saved = self.server_args.enable_symm_mem
+        self.server_args.enable_symm_mem = False
+        try:
+            yield
+        finally:
+            self.server_args.enable_symm_mem = saved
+
     def _flashinfer_autotune(self):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
@@ -2228,9 +2254,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+        # Also disable symm-mem during autotune: autotune explores different kernel
+        # configurations per rank, and use_symmetric_memory() triggers collective
+        # NCCL ops (ncclCommWindowRegister) that deadlock across diverging ranks.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune():
+            with self._disable_symm_mem(), torch.inference_mode(), autotune():
                 self._dummy_run(
                     batch_size=self.req_to_token_pool.size, run_ctx=autotune()
                 )
@@ -2594,7 +2623,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "npu": NPUGraphRunner,
             },
         )
-        self.graph_runner = graph_runners[self.device](self)
+        # Disable symm-mem during capture to avoid NCCL deadlocks.
+        # use_symmetric_memory() performs collective ncclCommWindowRegister
+        # calls that can deadlock when ranks diverge during capture warmups
+        # (MoE expert routing variance, different CUDA graph pool states, etc.).
+        # See `_disable_symm_mem` docstring for details.
+        with self._disable_symm_mem():
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2708,7 +2743,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        # Disable symm-mem during capture to avoid NCCL deadlocks (see
+        # `_disable_symm_mem` docstring and `init_device_graphs` note).
+        with self._disable_symm_mem():
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
@@ -3303,13 +3341,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
+        # JIT-compile the NCCL allocator and construct the mempool BEFORE any
+        # collective memory operations. The JIT compile can take ~90s and
+        # finishes at different times on different ranks. Without this barrier,
+        # the first rank to finish would call ncclMemAlloc /
+        # ncclCommWindowRegister (collective ops) while other ranks are still
+        # compiling, causing a hang.
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            get_nccl_mem_pool,
+        )
+
+        get_nccl_mem_pool(get_tp_group())
+        torch.distributed.barrier()
+
         # Memory allocation is tied to a cuda stream, use the forward stream
         with torch.get_device_module(self.device).stream(self.forward_stream):
             logger.info(
                 f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
             )
             with use_symmetric_memory(get_tp_group()):
-                torch.empty(
+                # Keep the tensor alive so ncclMemFree (another collective) is
+                # never called on process-level teardown at divergent times.
+                self._symm_mem_prealloc = torch.empty(
                     (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
                     dtype=torch.uint8,
                     device=self.device,

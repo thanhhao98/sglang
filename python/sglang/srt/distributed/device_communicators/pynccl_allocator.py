@@ -76,6 +76,10 @@ _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
 
+# Debug counters for diagnosing CUDA graph capture hangs with symm-mem.
+_symm_ctx_enter_count = 0
+_symm_ctx_enter_during_capture_count = 0
+
 
 def is_symmetric_memory_enabled():
     try:
@@ -170,6 +174,18 @@ class SymmetricMemoryContext:
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
+
+        global _symm_ctx_enter_count, _symm_ctx_enter_during_capture_count
+        _symm_ctx_enter_count += 1
+        if self.is_graph_capture:
+            _symm_ctx_enter_during_capture_count += 1
+            if envs.SGLANG_DEBUG_CUDA_GRAPH_CAPTURE.get():
+                group = self.group_coordinator.group_name
+                rank = self.group_coordinator.rank_in_group
+                _symm_mem_logger.warning(
+                    f"[symm-ctx rank={rank} group={group}] ENTER during capture "
+                    f"count={_symm_ctx_enter_during_capture_count}"
+                )
 
         if self.is_graph_capture:
             assert (
