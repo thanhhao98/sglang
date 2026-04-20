@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -2217,6 +2218,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return True
 
+    @contextmanager
+    def _disable_symm_mem(self):
+        """Temporarily disable symmetric memory for the wrapped block.
+
+        ``use_symmetric_memory()`` triggers NCCL collective operations
+        (``ncclMemAlloc`` + ``ncclCommWindowRegister`` with
+        ``NCCL_WIN_COLL_SYMMETRIC``) that require identical allocation sizes
+        and ordering across all ranks in the communicator. During CUDA graph
+        capture, each rank runs its own warmup forwards; small per-rank
+        timing jitter (MoE expert routing variance, cuBLAS/cuDNN heuristic
+        picks, kernel-launch overhead) eventually lands different ranks on
+        different allocation sizes for the same capture step, and the
+        ``ncclCommWindowRegister`` call deadlocks.
+
+        Flipping ``server_args.enable_symm_mem`` to ``False`` for the duration
+        of graph capture makes ``is_symmetric_memory_enabled()`` return
+        ``False`` so every ``use_symmetric_memory(...)`` site short-circuits
+        to ``nullcontext()``. The captured graph uses the standard NCCL
+        allreduce path, which is correct and safe to replay even after
+        symm-mem is re-enabled for live serving.
+        """
+        saved = self.server_args.enable_symm_mem
+        self.server_args.enable_symm_mem = False
+        try:
+            yield
+        finally:
+            self.server_args.enable_symm_mem = saved
+
     def _flashinfer_autotune(self):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
@@ -2583,18 +2612,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        if current_platform.is_out_of_tree():
-            GraphRunnerCls = current_platform.get_graph_runner_cls()
-            self.graph_runner = GraphRunnerCls(self)
-        else:
-            graph_runners = defaultdict(
-                lambda: CudaGraphRunner,
-                {
-                    "cpu": CPUGraphRunner,
-                    "npu": NPUGraphRunner,
-                },
-            )
-            self.graph_runner = graph_runners[self.device](self)
+        # Disable symm-mem during capture to avoid NCCL deadlocks.
+        # ``use_symmetric_memory()`` performs collective
+        # ``ncclCommWindowRegister`` calls that can deadlock when ranks
+        # diverge during capture warmups (e.g. MoE expert routing variance,
+        # different kernel heuristic picks). See ``_disable_symm_mem`` for
+        # the full rationale.
+        with self._disable_symm_mem():
+            if current_platform.is_out_of_tree():
+                GraphRunnerCls = current_platform.get_graph_runner_cls()
+                self.graph_runner = GraphRunnerCls(self)
+            else:
+                graph_runners = defaultdict(
+                    lambda: CudaGraphRunner,
+                    {
+                        "cpu": CPUGraphRunner,
+                        "npu": NPUGraphRunner,
+                    },
+                )
+                self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2712,7 +2748,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        # Disable symm-mem during capture to avoid NCCL deadlocks.
+        # See ``_disable_symm_mem`` and ``init_device_graphs`` for the
+        # full rationale.
+        with self._disable_symm_mem():
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
