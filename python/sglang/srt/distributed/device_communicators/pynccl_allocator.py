@@ -75,6 +75,7 @@ _mem_pool = None
 _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
+_force_barrier_on_enter = False
 
 
 def is_symmetric_memory_enabled():
@@ -87,6 +88,28 @@ def is_symmetric_memory_enabled():
 def set_graph_pool_id(graph_pool_id):
     global _graph_pool_id
     _graph_pool_id = graph_pool_id
+
+
+def set_force_barrier_on_enter(enabled: bool) -> None:
+    """Toggle a CPU barrier at every ``SymmetricMemoryContext.__enter__``.
+
+    ``ncclCommWindowRegister`` is a collective that deadlocks if ranks
+    issue it in different orders. During CUDA graph warmups a full MoE
+    forward triggers thousands of such collectives; per-rank drift
+    (cuBLAS/cuDNN heuristic picks, kernel-launch jitter) can shift the
+    relative ordering enough for the next collective to see ranks out
+    of sync. A CPU barrier at ``__enter__`` re-aligns ranks cheaply
+    before each symm-mem block — enough to walk past the drift window.
+
+    Enabled only around graph runner construction; inference runs
+    without it so per-forward overhead stays zero.
+    """
+    global _force_barrier_on_enter
+    _force_barrier_on_enter = enabled
+
+
+def is_force_barrier_on_enter_enabled() -> bool:
+    return _force_barrier_on_enter
 
 
 def disable_symmetric_memory_context():
@@ -161,6 +184,15 @@ class SymmetricMemoryContext:
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
+
+        # When enabled (only around graph runner construction), hold ranks
+        # on a cheap CPU barrier right before the symm-mem block. The next
+        # tensor allocation inside this block will issue a collective
+        # ``ncclCommWindowRegister``; aligning ranks here keeps the
+        # collective ordering consistent across ranks even when per-rank
+        # drift has accumulated during a long sequence of warmups.
+        if _force_barrier_on_enter:
+            self.group_coordinator.barrier()
 
         if self.is_graph_capture:
             assert (

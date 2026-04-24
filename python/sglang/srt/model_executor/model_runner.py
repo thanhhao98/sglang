@@ -2612,13 +2612,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        # Disable symm-mem during capture to avoid NCCL deadlocks.
-        # ``use_symmetric_memory()`` performs collective
-        # ``ncclCommWindowRegister`` calls that can deadlock when ranks
-        # diverge during capture warmups (e.g. MoE expert routing variance,
-        # different kernel heuristic picks). See ``_disable_symm_mem`` for
-        # the full rationale.
-        with self._disable_symm_mem():
+        # Force a CPU barrier on every ``SymmetricMemoryContext.__enter__``
+        # for the duration of capture. ``use_symmetric_memory()`` blocks
+        # perform collective ``ncclCommWindowRegister`` calls that
+        # deadlock if ranks issue them out of order; per-rank drift
+        # (cuBLAS/cuDNN heuristic picks, MoE routing variance) accumulates
+        # across the many warmup forwards of graph capture. A cheap
+        # barrier at each symm-mem block re-aligns ranks before the
+        # collective without disabling symm-mem — so the captured graph
+        # still bakes in the NCCL symm-mem allreduce path.
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            set_force_barrier_on_enter,
+        )
+
+        set_force_barrier_on_enter(True)
+        try:
             if current_platform.is_out_of_tree():
                 GraphRunnerCls = current_platform.get_graph_runner_cls()
                 self.graph_runner = GraphRunnerCls(self)
@@ -2631,6 +2639,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     },
                 )
                 self.graph_runner = graph_runners[self.device](self)
+        finally:
+            set_force_barrier_on_enter(False)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2748,11 +2758,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        # Disable symm-mem during capture to avoid NCCL deadlocks.
-        # See ``_disable_symm_mem`` and ``init_device_graphs`` for the
-        # full rationale.
-        with self._disable_symm_mem():
+        # Same barrier gating as ``init_device_graphs`` — keep symm-mem
+        # enabled and align ranks at each symm-mem block via CPU barrier
+        # on ``SymmetricMemoryContext.__enter__``.
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            set_force_barrier_on_enter,
+        )
+
+        set_force_barrier_on_enter(True)
+        try:
             self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        finally:
+            set_force_barrier_on_enter(False)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
