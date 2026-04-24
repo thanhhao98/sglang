@@ -1062,15 +1062,26 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        # Warmups: run with symm-mem disabled to avoid the
+        # ``ncclCommWindowRegister`` collective deadlock that otherwise
+        # occurs when per-rank drift (cuBLAS/cuDNN heuristic picks, MoE
+        # routing variance) lands ranks on different allocation sizes.
+        # After the two warmups, heuristic caches are populated and the
+        # barrier below aligns ranks, so the single captured forward
+        # allocates rank-identically even with symm-mem re-enabled.
+        # See ``ModelRunner._disable_symm_mem`` for full rationale.
+        with self.model_runner._disable_symm_mem():
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+        # Actual capture runs with symm-mem enabled so the captured graph
+        # bakes in NCCL symm-mem buffers + the symm-mem allreduce path.
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )

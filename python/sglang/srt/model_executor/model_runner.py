@@ -2226,18 +2226,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (``ncclMemAlloc`` + ``ncclCommWindowRegister`` with
         ``NCCL_WIN_COLL_SYMMETRIC``) that require identical allocation sizes
         and ordering across all ranks in the communicator. During CUDA graph
-        capture, each rank runs its own warmup forwards; small per-rank
-        timing jitter (MoE expert routing variance, cuBLAS/cuDNN heuristic
-        picks, kernel-launch overhead) eventually lands different ranks on
-        different allocation sizes for the same capture step, and the
-        ``ncclCommWindowRegister`` call deadlocks.
+        capture, each rank runs multiple warmup forwards per batch-size;
+        per-rank drift (MoE expert routing variance, cuBLAS/cuDNN heuristic
+        picks, kernel-launch overhead) accumulates across warmups until
+        ranks request different allocation sizes for the same step and
+        ``ncclCommWindowRegister`` deadlocks.
 
-        Flipping ``server_args.enable_symm_mem`` to ``False`` for the duration
-        of graph capture makes ``is_symmetric_memory_enabled()`` return
-        ``False`` so every ``use_symmetric_memory(...)`` site short-circuits
-        to ``nullcontext()``. The captured graph uses the standard NCCL
-        allreduce path, which is correct and safe to replay even after
-        symm-mem is re-enabled for live serving.
+        Flipping ``server_args.enable_symm_mem`` to ``False`` for the wrapped
+        block makes ``is_symmetric_memory_enabled()`` return ``False`` so
+        every ``use_symmetric_memory(...)`` site short-circuits to
+        ``nullcontext()``.
+
+        Scope: apply this ONLY around the warmup forwards inside the graph
+        runners, NOT around the actual stream-captured forward. If it is
+        wrapped around the capture itself the captured graph bakes in the
+        non-symm-mem path, and replay never exercises symm-mem. After
+        warmups, cuBLAS heuristic caches are populated and ranks are
+        barriered before capture, so the single captured forward allocates
+        rank-identically and no deadlock occurs.
         """
         saved = self.server_args.enable_symm_mem
         self.server_args.enable_symm_mem = False
@@ -2612,25 +2618,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        # Disable symm-mem during capture to avoid NCCL deadlocks.
-        # ``use_symmetric_memory()`` performs collective
-        # ``ncclCommWindowRegister`` calls that can deadlock when ranks
-        # diverge during capture warmups (e.g. MoE expert routing variance,
-        # different kernel heuristic picks). See ``_disable_symm_mem`` for
-        # the full rationale.
-        with self._disable_symm_mem():
-            if current_platform.is_out_of_tree():
-                GraphRunnerCls = current_platform.get_graph_runner_cls()
-                self.graph_runner = GraphRunnerCls(self)
-            else:
-                graph_runners = defaultdict(
-                    lambda: CudaGraphRunner,
-                    {
-                        "cpu": CPUGraphRunner,
-                        "npu": NPUGraphRunner,
-                    },
-                )
-                self.graph_runner = graph_runners[self.device](self)
+        # NOTE: symm-mem is disabled narrowly inside the graph runner around
+        # warmup forwards only (see ``_disable_symm_mem`` and
+        # ``CudaGraphRunner.capture_one_batch_size``). The actual stream
+        # capture runs with symm-mem enabled so replayed graphs exercise
+        # the NCCL symm-mem allreduce path.
+        if current_platform.is_out_of_tree():
+            GraphRunnerCls = current_platform.get_graph_runner_cls()
+            self.graph_runner = GraphRunnerCls(self)
+        else:
+            graph_runners = defaultdict(
+                lambda: CudaGraphRunner,
+                {
+                    "cpu": CPUGraphRunner,
+                    "npu": NPUGraphRunner,
+                },
+            )
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2748,11 +2752,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        # Disable symm-mem during capture to avoid NCCL deadlocks.
-        # See ``_disable_symm_mem`` and ``init_device_graphs`` for the
-        # full rationale.
-        with self._disable_symm_mem():
-            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        # NOTE: symm-mem is disabled narrowly inside the piecewise runner
+        # around warmup forwards only (see ``_disable_symm_mem`` and
+        # ``PiecewiseCudaGraphRunner``). The actual stream capture runs with
+        # symm-mem enabled so replayed graphs exercise the NCCL symm-mem
+        # allreduce path.
+        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem

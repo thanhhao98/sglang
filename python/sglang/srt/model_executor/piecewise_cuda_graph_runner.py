@@ -287,8 +287,13 @@ class PiecewiseCudaGraphRunner:
                 language_model.model, self.compile_config.compiler
             ) as patched_model:
 
-                # Dummy warmup for jit kernel
-                self.warmup_compile(num_tokens=self.capture_num_tokens[0])
+                # ``warmup_compile`` runs full eager forwards to populate
+                # torch.compile / kernel-heuristic caches. Disable symm-mem
+                # around these to avoid ncclCommWindowRegister deadlocks
+                # from rank drift (see ``ModelRunner._disable_symm_mem``).
+                with self.model_runner._disable_symm_mem():
+                    # Dummy warmup for jit kernel
+                    self.warmup_compile(num_tokens=self.capture_num_tokens[0])
 
                 install_torch_compiled(
                     patched_model,
@@ -304,19 +309,21 @@ class PiecewiseCudaGraphRunner:
                         if get_tensor_model_parallel_rank() == 0
                         else reversed(self.capture_num_tokens)
                     )
-                    for _, num_tokens in enumerate(compile_range):
-                        if get_tensor_model_parallel_rank() == 0:
-                            compile_range.set_description(
-                                f"Compiling num tokens ({num_tokens=})"
-                            )
-                        self.warmup_compile(num_tokens=num_tokens)
+                    with self.model_runner._disable_symm_mem():
+                        for _, num_tokens in enumerate(compile_range):
+                            if get_tensor_model_parallel_rank() == 0:
+                                compile_range.set_description(
+                                    f"Compiling num tokens ({num_tokens=})"
+                                )
+                            self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
-                # Capture
+                # Capture runs with symm-mem enabled so captured pieces
+                # bake in the NCCL symm-mem allreduce path.
                 self.capture()
 
         self.raw_num_tokens = 0
@@ -605,10 +612,16 @@ class PiecewiseCudaGraphRunner:
 
         # run twice for warmup at the first time and cuda graph capture at the second time
         # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
-        for _ in range(2):
+        # Warmup iter: symm-mem off (avoid ncclCommWindowRegister deadlock).
+        # Capture iter: symm-mem on (captured pieces bake in symm-mem path).
+        # See ``ModelRunner._disable_symm_mem``.
+        with self.model_runner._disable_symm_mem():
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        run_once()
 
         return
 
