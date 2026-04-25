@@ -2201,6 +2201,16 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm_routed as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
+                    # Port of pending sgl-project/sglang#22744: TF32 matmul for FP32
+                    # router gemm. Minimax-M2.5 measured +7% throughput / -8% latency
+                    # at batch=64, GPQA accuracy preserved. The FP32 cast from PR
+                    # #21660 still happens upstream of the matmul; this only changes
+                    # the matmul kernel to use TF32 tensor cores when available.
+                    import torch
+                    torch.set_float32_matmul_precision("high")
+                    logger.info(
+                        "Enabled TF32 matmul precision for FP32 router gemm on sm100 for Glm4MoeForCausalLM"
+                    )
 
         elif model_arch in [
             "FalconH1ForCausalLM",
