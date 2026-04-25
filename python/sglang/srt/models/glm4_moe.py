@@ -353,12 +353,35 @@ class Glm4MoeAttention(nn.Module):
 
 
 class Glm4MoeGate(nn.Module):
+    # Class-level flag: ensure torch.set_float32_matmul_precision is called once
+    # per worker process. The previous attempt set this in ServerArgs.__post_init__
+    # (parent process only) — the spawn-based worker processes did not inherit
+    # the PyTorch state, so the FP32 router gemm continued to use strict FP32
+    # cuBLAS kernels instead of TF32 tensor cores. Setting it here guarantees
+    # each worker enables TF32 before the FP32 matmul fires.
+    # Microbench (B200, F.linear(64x5120, 160x5120) FP32→FP32):
+    #   highest:  45.7 us  (strict FP32, no tensor cores)
+    #   high:     14.4 us  (TF32 tensor cores) — 3.18x faster
+    _tf32_set = False
+
     def __init__(
         self,
         config,
         prefix: str = "",
     ):
         super().__init__()
+        if not Glm4MoeGate._tf32_set:
+            # Port of pending sgl-project/sglang#22744 — TF32 for FP32 router gemm.
+            # Idempotent; safe to call repeatedly (would only re-fire if class
+            # is reloaded). Process-local: each TP rank's worker sets it once.
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            Glm4MoeGate._tf32_set = True
+            logger.info(
+                "Glm4MoeGate: enabled TF32 matmul precision for FP32 router gemm "
+                "(applies to this worker process)."
+            )
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
