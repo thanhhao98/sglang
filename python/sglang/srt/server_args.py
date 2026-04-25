@@ -2259,9 +2259,9 @@ class ServerArgs:
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
+                    self.moe_runner_backend = "flashinfer_trtllm_routed"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
+                        "Use flashinfer_trtllm_routed as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
 
         elif model_arch in [
