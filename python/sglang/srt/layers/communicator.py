@@ -149,9 +149,22 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+# GLM-4.7 v5 (A1a / cursor-plan L5): bumped from 2048 → 8192 to extend
+# AR+RMSNorm fusion to prefill batches. Prefill packs 4-8 reqs × 1-2K tokens
+# per batch, which cleanly fits under 8K. flashinfer auto-selects oneshot vs
+# twoshot based on token count, so the higher cap just opens up more eligible
+# calls without forcing a bad kernel choice. Workspace cost: ~84 MB / rank
+# at hidden=5120 bf16 (vs 21 MB at 2048) — negligible vs KV cache.
+# NOTE: a 16384 cap was the first attempt but caused CUDA-graph-capture stall
+# at TP=8 sm100 (workspace = 167 MB / rank stuck during recording at bs=256
+# of 52 captures). 8192 captures fine.
+# Profile motivation: explore/glm47/profiles/2026-04-26 captured 38 prefill /
+# 0 decode steps, all of which fell out of fusion at the old 2048 cap.
+# Original comment retained for reference:
+#   According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+#   the original 128 cap was for min-latency oneshot; subsequent bump to 2048
+#   covered decode but still excluded prefill.
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 8192
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
