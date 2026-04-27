@@ -153,11 +153,19 @@ def _forward_with_allreduce_fusion(
                 if fused_result is not None:
                     return fused_result
             else:
+                # GLM-4.7 v5: pass max_token_num=8192 to match the bumped cap in
+                # communicator.py:FUSE_ALLREDUCE_MAX_BATCH_SIZE so prefill batches
+                # don't trip the wrapper's `input_tensor.shape[0] <= max_token_num`
+                # assertion. Workspace re-allocates once on first prefill; reused
+                # for subsequent calls.
+                # NOTE: a 16384 cap was the first attempt but deadlocked CUDA-graph
+                # capture at bs=256 for nvfp4_tp8 sm100. 8192 captures fine.
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
+                    max_token_num=8192,
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
