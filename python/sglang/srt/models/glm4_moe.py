@@ -464,19 +464,31 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        # GLM-4.7 v6 (L16): drop redundant gatherTopK by setting use_grouped_topk=False
+        # and shifting the routed_scaling_factor multiply to the post-experts hook
+        # (model forward), avoiding both:
+        #   1. The "Not implemented" assertion at topk.py:1153 in the
+        #      use_grouped_topk=False × apply_routed_scaling_factor_on_output=True
+        #      path
+        #   2. The TorchDynamo / piecewise-CUDA-graph fake-tensor-dispatch recursion
+        #      that fires when the kernel-side multiply is traced inline (py-spy
+        #      stack confirmed: stuck in compile_inner → __torch_dispatch__ recursion
+        #      during init_piecewise_cuda_graphs)
+        # By setting apply_routed_scaling_factor_on_output=False, the topk kernel
+        # produces unscaled weights; the post-experts multiply at forward_normal
+        # (and dual-stream variant) is the cleanup that applies scaling after
+        # experts run — far from the dynamo trace boundary.
         self.topk = TopK(
             top_k=self.top_k + self.num_fused_shared_experts,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
-            use_grouped_topk=True,
+            use_grouped_topk=False,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            apply_routed_scaling_factor_on_output=getattr(
-                self.experts, "should_fuse_routed_scaling_factor_in_topk", False
-            ),
+            apply_routed_scaling_factor_on_output=False,
             fused_shared_experts_scaling_factor=1,
         )
 
@@ -624,8 +636,11 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
-                final_hidden_states *= self.routed_scaling_factor
+            # GLM-4.7 v6 (L16): always apply routed_scaling_factor here since we
+            # forced apply_routed_scaling_factor_on_output=False in TopK to avoid
+            # the dynamo recursion. The previous _is_cuda guard relied on the
+            # kernel doing the multiply internally — that path is now disabled.
+            final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
@@ -653,8 +668,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not _use_aiter:
-            final_hidden_states *= self.routed_scaling_factor
+        # GLM-4.7 v6 (L16): always apply routed_scaling_factor here since we
+        # forced apply_routed_scaling_factor_on_output=False in TopK construction
+        # to avoid the dynamo recursion in non-grouped topk.
+        final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
                 parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
