@@ -578,10 +578,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
             ):
+                # GLM-4.7 v8 (L13): allow dual-stream MoE forward even when
+                # num_fused_shared_experts != 0. The forward_normal_dual_stream
+                # body now guards `final_hidden_states += shared_output` against
+                # the None case (which is what _forward_shared_experts returns
+                # when shared experts are folded into the routed kernel).
                 return self.forward_normal_dual_stream(
                     hidden_states,
                     should_allreduce_fusion,
@@ -615,7 +619,11 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
+        # GLM-4.7 v8 (L13): _forward_shared_experts returns None when shared
+        # experts are folded into the routed kernel (num_fused_shared_experts != 0).
+        # Skip the add in that case — the routed kernel already incorporated shared.
+        if shared_output is not None:
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
