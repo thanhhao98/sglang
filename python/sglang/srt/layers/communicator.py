@@ -543,6 +543,14 @@ class LayerCommunicator:
                 expert_weights, expanded_idx_to_permuted_idx, routed_scaling_factor = (
                     hidden_states._sglang_l1_data
                 )
+                # On the routed backend with disable_shared_experts_fusion=True
+                # (auto-set in server_args.py for routed), the model computes
+                # shared_output separately and stashes it on the marker tensor.
+                # When num_fused_shared_experts > 0, the runner has already fused
+                # shared into routed and shared_expert_output is None.
+                shared_expert_output = getattr(
+                    hidden_states, "_sglang_l1_shared_output", None
+                )
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_moe_finalize_ar_fusion(
                         allreduce_in=hidden_states,
@@ -550,7 +558,7 @@ class LayerCommunicator:
                         expert_weights=expert_weights,
                         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                         routed_scaling_factor=routed_scaling_factor,
-                        shared_expert_output=None,  # GLM-4.7 fuses shared into routed
+                        shared_expert_output=shared_expert_output,
                         use_attn_tp_group=False,
                     )
                 )

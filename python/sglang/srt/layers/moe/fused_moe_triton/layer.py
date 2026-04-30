@@ -1017,10 +1017,18 @@ class FusedMoE(torch.nn.Module):
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
+            # GLM-4.7 L1 (--enable-l1-moe-finalize-ar-fusion): the runner
+            # stashes _sglang_l1_data on its result tensor; the slice+contig
+            # below creates a new tensor that drops user attrs, so capture
+            # and re-attach. Note: this getattr fails on FakeTensor during
+            # Dynamo trace, so L1 only runs with --disable-piecewise-cuda-graph.
+            _l1_marker_data = getattr(final_hidden_states, "_sglang_l1_data", None)
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+            if _l1_marker_data is not None:
+                final_hidden_states._sglang_l1_data = _l1_marker_data
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

@@ -656,13 +656,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         #   --enable-l1-moe-finalize-ar-fusion implies
         #   --enable-flashinfer-allreduce-fusion AND
         #   --moe-runner-backend=flashinfer_trtllm_routed.
-        # GLM-4.7 always has num_fused_shared_experts > 0, so shared_output is
-        # always None; the L1 kernel handles the (None) shared-expert input fine.
+        # The original gate also required num_fused_shared_experts > 0 and
+        # shared_output is None, but the routed backend auto-disables shared-
+        # experts fusion (server_args.py: disable_shared_experts_fusion = True),
+        # forcing num_fused_shared_experts = 0 and shared_output != None for
+        # every L1-eligible call. The kernel itself accepts a separate
+        # shared_expert_output, so we relax the gate and forward shared_output
+        # through to the wrapper.
         use_l1_fusion = (
             should_allreduce_fusion
             and self._enable_l1_moe_finalize_ar_fusion
-            and self.num_fused_shared_experts > 0
-            and shared_output is None
             and hidden_states.shape[0] > 0
         )
 
@@ -684,6 +687,11 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 "Check fused_experts_none_to_flashinfer_trtllm_fp4 honored "
                 "runner_config.l1_defer_finalize=True."
             )
+            # When the routed backend disables shared-experts fusion (the only
+            # config L1 currently runs in), shared_output is computed separately
+            # and must be passed to the L1 kernel. Stash on the marker tensor so
+            # communicator.prepare_attn at the next layer can pick it up.
+            final_hidden_states._sglang_l1_shared_output = shared_output
             final_hidden_states._sglang_needs_moe_finalize_ar_fusion = True
             return final_hidden_states
 

@@ -571,32 +571,35 @@ def flashinfer_moe_finalize_allreduce_rmsnorm(
     if world_size <= 1:
         return None, None
 
-    # Validate layouts before calling the kernel — these are the hard contract
-    # from the FlashInfer test, NOT the (misleading) docstring at trtllm_ar.py:1150.
+    # Reshape to match the kernel's expected layout. Kernel signature
+    # (verified via help(trtllm_moe_finalize_allreduce_fusion)):
+    #     allreduce_in:                  [token_num, top_k, hidden_dim]   (3-D)
+    #     residual_in:                   [token_num, hidden_dim]
+    #     expanded_idx_to_permuted_idx:  [token_num, top_k]               (2-D)
+    #     expert_scale_factor:           [token_num, top_k]
+    # FlashInfer's routed-MoE returns (do_finalize=False):
+    #     gemm2_output:                  [seq_len*top_k_padded, hidden]   (2-D, may be padded
+    #                                                                       to a per-expert
+    #                                                                       tile boundary)
+    #     expert_weights:                [seq_len, top_k]                 (already 2-D)
+    #     expanded_idx_to_permuted_idx:  [seq_len*top_k]                  (1-D, flat)
     seq_len, hidden_size = residual.shape
-    top_k = expanded_idx_to_permuted_idx.shape[1]
-    assert allreduce_in.dim() == 2 and allreduce_in.shape[1] == hidden_size, (
-        f"L1 allreduce_in expected [seq_len*top_k, hidden_size]={seq_len*top_k}x{hidden_size}, "
-        f"got {tuple(allreduce_in.shape)}"
+    assert expert_weights.dim() == 2 and expert_weights.shape[0] == seq_len, (
+        f"L1 expert_weights expected [seq_len={seq_len}, top_k], "
+        f"got {tuple(expert_weights.shape)}"
     )
+    top_k = expert_weights.shape[1]
+    if allreduce_in.shape[0] != seq_len * top_k:
+        # routed-MoE pads gemm2_output to a per-expert tile boundary; slice to
+        # the kernel's expected size before reshaping.
+        allreduce_in = allreduce_in[: seq_len * top_k].contiguous()
+    allreduce_in = allreduce_in.view(seq_len, top_k, hidden_size)
+    if expanded_idx_to_permuted_idx.dim() == 1:
+        expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.view(seq_len, top_k)
     assert expanded_idx_to_permuted_idx.shape == (seq_len, top_k), (
         f"L1 expanded_idx_to_permuted_idx expected [{seq_len}, {top_k}], "
         f"got {tuple(expanded_idx_to_permuted_idx.shape)}"
     )
-    assert expert_weights.shape == (seq_len, top_k), (
-        f"L1 expert_weights expected [{seq_len}, {top_k}], "
-        f"got {tuple(expert_weights.shape)}"
-    )
-    if allreduce_in.shape[0] != seq_len * top_k:
-        # The routed FlashInfer MoE pads gemm2_output to a per-expert tile boundary
-        # (max_num_padded_tokens). Slice to the kernel's expected size.
-        # This is a known integration risk; if it ever fails we need to revisit.
-        logger.debug(
-            "L1: gemm2_output padded to %d, slicing to %d for fusion kernel",
-            allreduce_in.shape[0],
-            seq_len * top_k,
-        )
-        allreduce_in = allreduce_in[: seq_len * top_k].contiguous()
 
     # Workspace pre-init (size to v5's FUSE_AR_MAX_BS = 8K)
     if not ensure_workspace_initialized(
@@ -623,7 +626,7 @@ def flashinfer_moe_finalize_allreduce_rmsnorm(
         residual_out=residual_out,
         quant_out=None,  # FP8/FP4 quant fusion not yet wired
         scale_out=None,
-        workspace_ptrs=workspace_manager.workspace,
+        workspace_ptrs=workspace_manager.workspace.workspace_tensor,
         launch_with_pdl=True,
         world_rank=world_rank,
         world_size=world_size,
