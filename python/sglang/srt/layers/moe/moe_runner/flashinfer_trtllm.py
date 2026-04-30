@@ -326,14 +326,67 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     use_routing_scales_on_input: bool = False
 
 
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _pack_topk_kernel(
+    ids_ptr,  # int64 input
+    weights_ptr,  # bf16 input
+    out_ptr,  # int32 output
+    n_elements,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+
+    ids = tl.load(ids_ptr + offsets, mask=mask).to(tl.int32)
+    # Bit-reinterpret bf16 -> int16, then zero-extend to int32 (low 16 bits only).
+    weights_bf16 = tl.load(weights_ptr + offsets, mask=mask)
+    weights_int16 = weights_bf16.to(tl.int16, bitcast=True)
+    weights_int32 = weights_int16.to(tl.int32) & 0xFFFF
+
+    packed = (ids << 16) | weights_int32
+    tl.store(out_ptr + offsets, packed, mask=mask)
+
+
 def _pack_topk_for_flashinfer_routed(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor
 ) -> torch.Tensor:
-    """Pack routed top-k tensors into FlashInfer's int32 format."""
-    packed_ids = topk_ids.to(torch.int32)
-    packed_weights = topk_weights.to(torch.bfloat16)
-    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    return packed
+    """Pack routed top-k tensors into FlashInfer's int32 format.
+
+    GLM-4.7 v6.10 (L17): the previous torch-op formulation issued 3-5
+    separate direct_copy_kernel launches per call (int64 -> int32 on
+    IDs, an optional bf16 -> bf16 on weights, int16 -> int32 on the
+    bit-cast weights, plus the shift+or). Each launch carries ~5 us of
+    CPU overhead, contributing the bulk of the 6112 launch-overhead-
+    bound copies seen in the v6.9 cc=128 decode profile (5634 of them
+    under 20 us). This function fires once per MoE layer per forward
+    (89 layers x N forwards) so its CPU cost is the dominant per-token
+    overhead at low cc, where it shows up as the routed-vs-non-routed
+    cc=1 throughput regression (-9 to -19 % across all TPs).
+
+    The triton kernel below collapses the entire pack into a single
+    launch. The kernel layout: each element in the output int32 has the
+    id in the high 16 bits and the bf16 weight bit-pattern (zero-extended
+    from int16) in the low 16 bits, matching the layout the FlashInfer
+    routed-MoE kernel expects. No torch fallback — the triton kernel is
+    the only path; failures will surface immediately rather than mask as
+    silent perf regression.
+    """
+    n = topk_ids.numel()
+    # Allocate a fresh contiguous output (empty_like preserves stride from a
+    # non-contiguous input, which then can't be flattened with .view(-1)).
+    out = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+    # Ensure inputs are contiguous so flat-indexed pointer arithmetic is correct.
+    ids_flat = topk_ids.contiguous().view(-1)
+    weights_flat = topk_weights.to(torch.bfloat16).contiguous().view(-1)
+    BLOCK = 1024
+    grid = (triton.cdiv(n, BLOCK),)
+    _pack_topk_kernel[grid](ids_flat, weights_flat, out.view(-1), n, BLOCK=BLOCK)
+    return out
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
