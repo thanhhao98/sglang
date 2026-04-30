@@ -700,24 +700,32 @@ def biased_grouped_topk_impl(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-    group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
-        .sum(dim=-1)
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
-    )  # [n, e]
-    tmp_scores = scores_for_choice.masked_fill(
-        ~score_mask.bool(), float("-inf")
-    )  # [n, e]
+    # GLM-4.7 v6 (L16): when num_expert_group==1, the grouping operations below are
+    # mathematical no-ops (group_scores=[n,1], group_idx=[0], mask all-1, masked_fill
+    # has no effect). Skip the 2 dead torch.topk + scatter to save the 5,073 redundant
+    # gatherTopK calls measured in deep profile (363 ms / 7.8 % busy at TP=8 cc=128).
+    # tmp_scores is bit-equivalent to scores_for_choice for n_group=1.
+    if num_expert_group is None or num_expert_group == 1:
+        tmp_scores = scores_for_choice
+    else:
+        group_scores = (
+            scores_for_choice.view(num_token, num_expert_group, -1)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )  # [n, n_group]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+            1
+        ]  # [n, top_k_group]
+        group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+        group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+            .reshape(num_token, -1)
+        )  # [n, e]
+        tmp_scores = scores_for_choice.masked_fill(
+            ~score_mask.bool(), float("-inf")
+        )  # [n, e]
     _, topk_ids = torch.topk(
         tmp_scores,
         k=topk,
