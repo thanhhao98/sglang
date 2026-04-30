@@ -617,6 +617,16 @@ def flashinfer_moe_finalize_allreduce_rmsnorm(
     norm_out = torch.empty_like(residual)
     residual_out = torch.empty_like(residual)
 
+    # IMPORTANT: pass routed_scaling_factor=None.
+    # GLM-4.7 (and similar configs) sets `apply_routed_scaling_factor_on_output=True`
+    # in topk, which multiplies topk_weights by routed_scaling_factor *inside* the
+    # topk function (see topk.py:613). The routed-MoE kernel then propagates these
+    # pre-scaled weights into expert_scale_factor. The L1 fusion kernel itself
+    # also multiplies by routed_scaling_factor (trtllm_moe_allreduce_fusion.cu:133-134
+    # — defaults to 1.0 when None). Passing the actual scaling factor here would
+    # cause a *double* multiplication and produce a constant-factor accuracy drop
+    # (verified empirically: GSM8K = 0.809 with double-multiply vs ~0.945 expected).
+    # Matches FlashInfer's reference usage at flashinfer/comm/allreduce.py:730.
     trtllm_moe_finalize_allreduce_fusion(
         allreduce_in=allreduce_in,
         residual_in=residual,
@@ -633,7 +643,7 @@ def flashinfer_moe_finalize_allreduce_rmsnorm(
         eps=eps,
         shared_expert_output=shared_expert_output,
         expert_scale_factor=expert_weights,
-        routed_scaling_factor=routed_scaling_factor,
+        routed_scaling_factor=None,  # see comment above; topk pre-applies it
     )
 
     return norm_out, residual_out
