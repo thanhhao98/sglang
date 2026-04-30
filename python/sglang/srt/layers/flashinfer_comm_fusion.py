@@ -502,6 +502,140 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def flashinfer_moe_finalize_allreduce_rmsnorm(
+    allreduce_in: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    routed_scaling_factor: float,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    use_attn_tp_group: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """GLM-4.7 v7 (L1): fuse MoE-finalize (combine + permute) + shared-add + AR + residual + RMSNorm.
+
+    Wraps ``flashinfer.comm.trtllm_moe_finalize_allreduce_fusion``. Replaces the
+    sequence ``moe::dev::finalize → vec_add(shared) → bare AR → next-layer RMSNorm``
+    with a single fused kernel.
+
+    Layout assumptions (from
+    ``flashinfer/tests/comm/test_trtllm_moe_allreduce_fusion_finalize.py:307-310``):
+
+    * ``allreduce_in`` (= ``gemm2_output``): ``[seq_len * top_k, hidden_size]`` in
+      the permuted-flat layout. The kernel computes ``token_num = size / hidden_dim``
+      to size its work; **kOneShotMaxToken=128** means ``seq_len * top_k > 128``
+      will trigger a "performance degradation" warning but still execute.
+    * ``expanded_idx_to_permuted_idx``: ``[seq_len, top_k]``, int32, maps each
+      (token, expert-slot) pair to its index in the permuted layout.
+    * ``expert_weights``: ``[seq_len, top_k]``, the per-token-per-expert routing
+      weights to combine with.
+    * ``residual``, ``norm_weight``, ``norm_out``, ``residual_out``:
+      ``[seq_len, hidden_size]`` each.
+    * ``shared_expert_output``: ``None`` for GLM-4.7 (shared expert is fused into
+      the routed kernel as the 9th expert; no separate output exists).
+
+    Returns ``(norm_out, residual_out)`` matching the
+    ``flashinfer_allreduce_residual_rmsnorm`` contract used by v5. Returns
+    ``(None, None)`` if the workspace can't be initialized — caller should fall
+    back to the unfused path.
+
+    See: ``explore/glm47/docs/tasks/v7-l1-implementation/DESIGN.md``.
+    """
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        logger.debug("FlashInfer not available; skipping L1 MoE finalize+AR fusion")
+        return None, None
+
+    # Lazy import — flashinfer.comm.trtllm_ar may not be installed in some envs.
+    try:
+        from flashinfer.comm.trtllm_ar import trtllm_moe_finalize_allreduce_fusion
+    except ImportError as e:
+        logger.warning(
+            "Cannot import flashinfer.comm.trtllm_ar.trtllm_moe_finalize_allreduce_fusion (%s); "
+            "falling back to unfused AR path",
+            e,
+        )
+        return None, None
+
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+        world_rank = get_attn_tensor_model_parallel_rank()
+    else:
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+            world_rank = get_moe_expert_parallel_rank()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+            world_rank = get_moe_tensor_parallel_rank()
+
+    if world_size <= 1:
+        return None, None
+
+    # Validate layouts before calling the kernel — these are the hard contract
+    # from the FlashInfer test, NOT the (misleading) docstring at trtllm_ar.py:1150.
+    seq_len, hidden_size = residual.shape
+    top_k = expanded_idx_to_permuted_idx.shape[1]
+    assert allreduce_in.dim() == 2 and allreduce_in.shape[1] == hidden_size, (
+        f"L1 allreduce_in expected [seq_len*top_k, hidden_size]={seq_len*top_k}x{hidden_size}, "
+        f"got {tuple(allreduce_in.shape)}"
+    )
+    assert expanded_idx_to_permuted_idx.shape == (seq_len, top_k), (
+        f"L1 expanded_idx_to_permuted_idx expected [{seq_len}, {top_k}], "
+        f"got {tuple(expanded_idx_to_permuted_idx.shape)}"
+    )
+    assert expert_weights.shape == (seq_len, top_k), (
+        f"L1 expert_weights expected [{seq_len}, {top_k}], "
+        f"got {tuple(expert_weights.shape)}"
+    )
+    if allreduce_in.shape[0] != seq_len * top_k:
+        # The routed FlashInfer MoE pads gemm2_output to a per-expert tile boundary
+        # (max_num_padded_tokens). Slice to the kernel's expected size.
+        # This is a known integration risk; if it ever fails we need to revisit.
+        logger.debug(
+            "L1: gemm2_output padded to %d, slicing to %d for fusion kernel",
+            allreduce_in.shape[0],
+            seq_len * top_k,
+        )
+        allreduce_in = allreduce_in[: seq_len * top_k].contiguous()
+
+    # Workspace pre-init (size to v5's FUSE_AR_MAX_BS = 8K)
+    if not ensure_workspace_initialized(
+        max_token_num=8192,
+        hidden_dim=hidden_size,
+        dtype=residual.dtype,
+        token_num=seq_len,
+        use_oneshot=True,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        logger.debug("L1: workspace not available; falling back")
+        return None, None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    norm_out = torch.empty_like(residual)
+    residual_out = torch.empty_like(residual)
+
+    trtllm_moe_finalize_allreduce_fusion(
+        allreduce_in=allreduce_in,
+        residual_in=residual,
+        norm_weight=norm_weight,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        norm_out=norm_out,
+        residual_out=residual_out,
+        quant_out=None,  # FP8/FP4 quant fusion not yet wired
+        scale_out=None,
+        workspace_ptrs=workspace_manager.workspace,
+        launch_with_pdl=True,
+        world_rank=world_rank,
+        world_size=world_size,
+        eps=eps,
+        shared_expert_output=shared_expert_output,
+        expert_scale_factor=expert_weights,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    return norm_out, residual_out
+
+
 def pre_initialize_workspaces(
     max_token_num: int,
     hidden_dim: int,

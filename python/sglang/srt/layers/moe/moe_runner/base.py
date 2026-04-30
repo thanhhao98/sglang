@@ -48,6 +48,13 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    # GLM-4.7 v7 (L1) hook: when True, supported runner backends call the
+    # underlying MoE kernel with do_finalize=False and stash the 3-tuple on
+    # the returned tensor as `_sglang_l1_data`. Mutated per-call by
+    # Glm4MoeSparseMoeBlock.forward_normal when --enable-l1-moe-finalize-ar-fusion
+    # is set AND should_allreduce_fusion is True.
+    # See: explore/glm47/docs/tasks/v7-l1-implementation/DESIGN.md
+    l1_defer_finalize: bool = False
 
 
 @dataclass

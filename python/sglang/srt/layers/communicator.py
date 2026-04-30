@@ -524,7 +524,37 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
+            # GLM-4.7 v7 (L1) — check NEW marker FIRST. When set, the previous
+            # layer's MoE returned gemm2_output (permuted layout) instead of
+            # finalized hidden_states, plus the 3-tuple needed for the fused
+            # combine+AR+RMSNorm. See:
+            #   models/glm4_moe.py Glm4MoeSparseMoeBlock.forward_normal
+            #   layers/flashinfer_comm_fusion.py flashinfer_moe_finalize_allreduce_rmsnorm
+            #   docs/tasks/v7-l1-implementation/DESIGN.md
             if (
+                residual is not None
+                and hasattr(hidden_states, "_sglang_needs_moe_finalize_ar_fusion")
+                and hidden_states._sglang_needs_moe_finalize_ar_fusion
+                and apply_flashinfer_allreduce_fusion(residual.shape[0])
+                and hasattr(
+                    self.input_layernorm, "forward_with_moe_finalize_ar_fusion"
+                )
+            ):
+                expert_weights, expanded_idx_to_permuted_idx, routed_scaling_factor = (
+                    hidden_states._sglang_l1_data
+                )
+                hidden_states, residual = (
+                    self.input_layernorm.forward_with_moe_finalize_ar_fusion(
+                        allreduce_in=hidden_states,
+                        residual=residual,
+                        expert_weights=expert_weights,
+                        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                        routed_scaling_factor=routed_scaling_factor,
+                        shared_expert_output=None,  # GLM-4.7 fuses shared into routed
+                        use_attn_tp_group=False,
+                    )
+                )
+            elif (
                 residual is not None
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion

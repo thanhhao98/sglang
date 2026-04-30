@@ -612,6 +612,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     This function handles the FP4 TRTLLM MoE path that was previously in
     ModelOptNvFp4FusedMoEMethod.apply.
+
+    GLM-4.7 v7 (L1) hook: when ``runner_config.l1_defer_finalize`` is True AND
+    ``use_routed_topk`` is True, calls the routed kernel with ``do_finalize=False``
+    so the per-token combine is deferred to a downstream
+    ``trtllm_moe_finalize_allreduce_fusion`` invocation. The 3 extra tensors
+    (``expert_weights``, ``expanded_idx_to_permuted_idx``, ``routed_scaling_factor``)
+    are stashed as attributes on the returned ``hidden_states`` tensor under
+    ``_sglang_l1_data`` so the next layer's ``prepare_attn`` can consume them.
+    See: ``explore/glm47/docs/tasks/v7-l1-implementation/DESIGN.md``.
     """
     from flashinfer.fused_moe import (
         trtllm_fp4_block_scale_moe,
@@ -651,7 +660,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         packed_topk_ids = _pack_topk_for_flashinfer_routed(
             topk_output.topk_ids, topk_output.topk_weights
         )
-        result = trtllm_fp4_block_scale_routed_moe(
+        # GLM-4.7 v7 (L1): defer finalize when the runner config requests it,
+        # so the downstream trtllm_moe_finalize_allreduce_fusion can do it
+        # together with the AR + RMSNorm.
+        defer_finalize = bool(getattr(runner_config, "l1_defer_finalize", False))
+        do_finalize = not defer_finalize
+
+        kwargs = dict(
             topk_ids=packed_topk_ids,
             routing_bias=None,
             hidden_states=hs_fp4,
@@ -677,10 +692,34 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             local_num_experts=quant_info.local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
-            do_finalize=True,
+            do_finalize=do_finalize,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            output=symm_output,
-        )[0]
+        )
+        if do_finalize:
+            kwargs["output"] = symm_output
+
+        raw_result = trtllm_fp4_block_scale_routed_moe(**kwargs)
+        if do_finalize:
+            result = raw_result[0]
+        else:
+            # raw_result = [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
+            # Stash the 3-tuple as attributes on gemm2_output for the downstream
+            # consumer (Glm4MoeSparseMoeBlock.forward_normal sets
+            # _sglang_needs_moe_finalize_ar_fusion = True; communicator.py picks
+            # the marker up at the next layer's prepare_attn).
+            assert (
+                isinstance(raw_result, (list, tuple)) and len(raw_result) == 3
+            ), (
+                f"L1: expected 3-tuple from trtllm_fp4_block_scale_routed_moe(do_finalize=False), "
+                f"got {type(raw_result).__name__} of len {len(raw_result) if hasattr(raw_result, '__len__') else 'N/A'}"
+            )
+            gemm2_output, expert_weights, expanded_idx_to_permuted_idx = raw_result
+            result = gemm2_output
+            result._sglang_l1_data = (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                runner_config.routed_scaling_factor,
+            )
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 

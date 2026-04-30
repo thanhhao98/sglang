@@ -544,6 +544,13 @@ class ServerArgs:
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
+    # GLM-4.7 v7 (L1): opt-in flag for trtllm_moe_finalize_allreduce_fusion.
+    # Fuses MoE-finalize (combine + permute) + shared-add + residual + AR + RMSNorm
+    # into one kernel. Requires: enable_flashinfer_allreduce_fusion=True AND
+    # moe_runner_backend=flashinfer_trtllm_routed AND modelopt_fp4 quant on sm100.
+    # Without all preconditions met, falls back to the v5 deferred-AR-fusion path.
+    # See: explore/glm47/docs/tasks/v7-l1-implementation/DESIGN.md
+    enable_l1_moe_finalize_ar_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -2310,6 +2317,31 @@ class ServerArgs:
                 "FlashInfer allreduce fusion is forcibly disabled "
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
+
+        # GLM-4.7 v7 (L1): validate enable_l1_moe_finalize_ar_fusion preconditions.
+        # The L1 path requires the existing AR fusion to be on AND the routed MoE backend.
+        # Without these, fall back silently to the v5 path.
+        if self.enable_l1_moe_finalize_ar_fusion:
+            if not self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "--enable-l1-moe-finalize-ar-fusion requires "
+                    "--enable-flashinfer-allreduce-fusion. Disabling L1 fusion."
+                )
+                self.enable_l1_moe_finalize_ar_fusion = False
+            elif self.moe_runner_backend != "flashinfer_trtllm_routed":
+                logger.warning(
+                    "--enable-l1-moe-finalize-ar-fusion requires "
+                    "--moe-runner-backend=flashinfer_trtllm_routed (got %s). "
+                    "Disabling L1 fusion.",
+                    self.moe_runner_backend,
+                )
+                self.enable_l1_moe_finalize_ar_fusion = False
+            else:
+                logger.info(
+                    "L1 MoE finalize + AR fusion: ENABLED for %s. "
+                    "Note: kOneShotMaxToken=128 may degrade kernel perf at high cc.",
+                    model_arch,
+                )
 
     def _handle_mamba_radix_cache(
         self,
@@ -5459,6 +5491,16 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--enable-l1-moe-finalize-ar-fusion",
+            action="store_true",
+            help="GLM-4.7 v7 (L1): fuse MoE-finalize + shared-add + AR + RMSNorm into "
+            "one kernel via flashinfer.comm.trtllm_moe_finalize_allreduce_fusion. "
+            "Requires --enable-flashinfer-allreduce-fusion AND "
+            "--moe-runner-backend=flashinfer_trtllm_routed AND modelopt_fp4 quant on sm100. "
+            "Note: kernel performance degrades for cc>=14 due to kOneShotMaxToken=128. "
+            "Bench before enabling in production.",
         )
         parser.add_argument(
             "--enforce-disable-flashinfer-allreduce-fusion",

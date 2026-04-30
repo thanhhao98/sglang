@@ -454,6 +454,57 @@ class RMSNorm(MultiPlatformOp):
             self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
         )
 
+    def forward_with_moe_finalize_ar_fusion(
+        self,
+        allreduce_in: torch.Tensor,
+        residual: torch.Tensor,
+        expert_weights: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        routed_scaling_factor: float,
+        shared_expert_output: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """GLM-4.7 v7 (L1): MoE-finalize + shared-add + AR + residual + RMSNorm fused.
+
+        See: ``flashinfer_comm_fusion.flashinfer_moe_finalize_allreduce_rmsnorm``
+        and ``explore/glm47/docs/tasks/v7-l1-implementation/DESIGN.md``.
+
+        Returns ``(norm_out, residual_out)`` matching the
+        ``forward_with_allreduce_fusion`` contract. Falls back to a regular
+        AR + residual + RMSNorm when the fused path is unavailable.
+        """
+        from sglang.srt.distributed import (
+            moe_tensor_model_parallel_all_reduce,
+        )
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_moe_finalize_allreduce_rmsnorm,
+        )
+
+        norm_out, residual_out = flashinfer_moe_finalize_allreduce_rmsnorm(
+            allreduce_in=allreduce_in,
+            residual=residual,
+            norm_weight=self.weight,
+            eps=self.variance_epsilon,
+            expert_weights=expert_weights,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            routed_scaling_factor=routed_scaling_factor,
+            shared_expert_output=shared_expert_output,
+            use_attn_tp_group=use_attn_tp_group,
+        )
+        if norm_out is not None:
+            return norm_out, residual_out
+
+        # Fallback path is intentionally NOT implemented — if we get here it means
+        # the L1 fused kernel was selected but FlashInfer couldn't run it (e.g.,
+        # workspace init failed or the function isn't importable). Surface the
+        # failure loudly rather than silently doing the wrong combine math; the
+        # caller (Glm4MoeSparseMoeBlock) should not have entered this path.
+        raise RuntimeError(
+            "L1 MoE finalize + AR fusion was selected but FlashInfer kernel "
+            "is unavailable. Disable --enable-l1-moe-finalize-ar-fusion and "
+            "fall back to v5 (existing AR fusion)."
+        )
+
 
 class LayerNorm(MultiPlatformOp):
     def __init__(

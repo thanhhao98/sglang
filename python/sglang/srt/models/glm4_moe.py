@@ -558,6 +558,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+        # GLM-4.7 v7 (L1): cache the server-args flag once at init.
+        # Validation in server_args._post_init guarantees this flag implies
+        # enable_flashinfer_allreduce_fusion=True AND
+        # moe_runner_backend=flashinfer_trtllm_routed.
+        self._enable_l1_moe_finalize_ar_fusion = (
+            get_global_server_args().enable_l1_moe_finalize_ar_fusion
+        )
+
     def get_moe_weights(self):
         return [
             x.data
@@ -639,6 +647,45 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        # GLM-4.7 v7 (L1): when the next layer will absorb our AR via
+        # trtllm_moe_finalize_allreduce_fusion, ask the routed kernel to skip its
+        # internal finalize step (returns the gemm2_output + 3-tuple stashed on
+        # tensor attributes). The next layer's prepare_attn picks up the marker.
+        # Preconditions are validated at server-arg parsing time:
+        #   --enable-l1-moe-finalize-ar-fusion implies
+        #   --enable-flashinfer-allreduce-fusion AND
+        #   --moe-runner-backend=flashinfer_trtllm_routed.
+        # GLM-4.7 always has num_fused_shared_experts > 0, so shared_output is
+        # always None; the L1 kernel handles the (None) shared-expert input fine.
+        use_l1_fusion = (
+            should_allreduce_fusion
+            and self._enable_l1_moe_finalize_ar_fusion
+            and self.num_fused_shared_experts > 0
+            and shared_output is None
+            and hidden_states.shape[0] > 0
+        )
+
+        if use_l1_fusion:
+            # Mutate the runner config per-call. Safe because the model forward
+            # is GIL-serial within a worker process.
+            old_defer = self.experts.moe_runner_config.l1_defer_finalize
+            self.experts.moe_runner_config.l1_defer_finalize = True
+            try:
+                final_hidden_states = self.experts(hidden_states, topk_output)
+            finally:
+                self.experts.moe_runner_config.l1_defer_finalize = old_defer
+            # The fused func attached _sglang_l1_data on the gemm2_output tensor.
+            # Set the marker the next layer's prepare_attn watches for. We must
+            # NOT do the routed_scaling_factor multiply here (the L1 kernel
+            # applies it as `expert_scale_factor * routed_scaling_factor`).
+            assert hasattr(final_hidden_states, "_sglang_l1_data"), (
+                "L1: routed MoE runner did not stash _sglang_l1_data on its output. "
+                "Check fused_experts_none_to_flashinfer_trtllm_fp4 honored "
+                "runner_config.l1_defer_finalize=True."
+            )
+            final_hidden_states._sglang_needs_moe_finalize_ar_fusion = True
+            return final_hidden_states
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
