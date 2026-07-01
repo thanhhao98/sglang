@@ -339,6 +339,13 @@ class BaseRunner(ABC):
 
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
+        # Optional (flashinfer PR #3187): synchronize per-tactic autotune
+        # timings across TP ranks. Falls back to a no-op on older flashinfer.
+        try:
+            from flashinfer.autotuner import set_autotune_process_group
+        except ImportError:
+            set_autotune_process_group = None
+
         mr = self.model_runner
         cache_path = self._flashinfer_autotune_cache_path()
         if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
@@ -357,17 +364,29 @@ class BaseRunner(ABC):
                 autotune_cache,
             )
 
+        # Synchronize per-tactic timings across TP ranks so every rank picks the
+        # same kernel tactic. Without this, sub-millisecond GPU timing noise makes
+        # ranks diverge on tactic choice, which later deadlocks
+        # ``ncclCommWindowRegister`` under ``--enable-symm-mem`` during CUDA graph
+        # capture (e.g. Qwen3-235B + TP=8 hangs at bs=144). See flashinfer #3186.
+        if set_autotune_process_group is not None and mr.tp_size > 1:
+            set_autotune_process_group(mr.tp_group.cpu_group)
+
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         mr.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(mr.device).stream(mr.forward_stream):
-            with (
-                torch.inference_mode(),
-                autotune(True, cache=str(autotune_cache)),
-                autotune_dummy_run_mode(),
-            ):
-                self._dummy_run(batch_size=batch_size, buffers=buffers)
-        torch.cuda.current_stream().wait_stream(mr.forward_stream)
+        try:
+            with torch.get_device_module(mr.device).stream(mr.forward_stream):
+                with (
+                    torch.inference_mode(),
+                    autotune(True, cache=str(autotune_cache)),
+                    autotune_dummy_run_mode(),
+                ):
+                    self._dummy_run(batch_size=batch_size, buffers=buffers)
+            torch.cuda.current_stream().wait_stream(mr.forward_stream)
+        finally:
+            if set_autotune_process_group is not None and mr.tp_size > 1:
+                set_autotune_process_group(None)
         logger.info("FlashInfer autotune completed.")
 
     def _flashinfer_autotune_cache_path(self) -> Path:
