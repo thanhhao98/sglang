@@ -21,8 +21,11 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
+    get_decode_cp_strategy,
     init_cp_strategy,
+    init_decode_cp_strategy,
     is_cp_enabled,
+    is_dcp_active,
     is_interleave,
     is_zigzag,
 )
@@ -48,8 +51,11 @@ __all__ = [
     "ZigzagContextParallelMetadata",
     "get_cp_strategy",
     "get_cp_strategy_kind",
+    "get_decode_cp_strategy",
     "init_cp_strategy",
+    "init_decode_cp_strategy",
     "is_cp_enabled",
+    "is_dcp_active",
     "is_interleave",
     "is_zigzag",
 ]

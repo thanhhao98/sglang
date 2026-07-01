@@ -5303,9 +5303,13 @@ class ServerArgs:
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
 
-        from sglang.srt.layers.cp.base import init_cp_strategy
+        from sglang.srt.layers.cp.base import (
+            init_cp_strategy,
+            init_decode_cp_strategy,
+        )
 
         init_cp_strategy(self)
+        init_decode_cp_strategy(self)
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

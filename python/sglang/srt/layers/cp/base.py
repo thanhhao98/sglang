@@ -193,6 +193,70 @@ class ContextParallelStrategy(ABC):
         """Optional attention metadata rewrite for strategies that need it."""
         return None
 
+    # -- Decode context-parallel (DCP) contract (P2) --------------------------
+    # DCP runs on the separate ``_DCP`` process group (owner rule
+    # ``pos % dcp_size == dcp_rank``), orthogonal to the prefill ``attn_cp`` axis
+    # used by the methods above. These are NON-abstract with NotImplementedError
+    # defaults so the prefill strategies (zigzag/interleave) are untouched; only
+    # ``DecodeContextParallelStrategy`` (layers/cp/dcp/strategy.py) overrides them.
+    def supports_decode(self) -> bool:
+        """Whether this strategy implements the decode-CP contract below."""
+        return False
+
+    def _no_decode(self, op: str) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement the decode-CP contract "
+            f"({op}); use DecodeContextParallelStrategy for decode context parallel."
+        )
+
+    def decode_cp_size(self) -> int:
+        return self._no_decode("decode_cp_size")
+
+    def decode_cp_rank(self) -> int:
+        return self._no_decode("decode_cp_rank")
+
+    def decode_cp_group(self) -> Any:
+        return self._no_decode("decode_cp_group")
+
+    def local_decode_kv_lens(
+        self, lens: Any, dcp_size: int, dcp_rank: int, start: Any = None
+    ) -> Any:
+        """Per-rank visible KV length under the owner rule (returns a new tensor)."""
+        return self._no_decode("local_decode_kv_lens")
+
+    def update_local_decode_kv_lens(self, kv_len_arr: Any) -> None:
+        """In-place per-rank KV length (start=0 case); preserves buffer identity."""
+        self._no_decode("update_local_decode_kv_lens")
+
+    def shard_decode_kv_indices(self, kv_indices: Any) -> Any:
+        """Keep only this rank's owned KV indices, remapped to local slot ids."""
+        return self._no_decode("shard_decode_kv_indices")
+
+    def build_decode_metadata(self, **kwargs: Any) -> Any:
+        """Build the per-forward DCP decode metadata (prefix-cache sharding)."""
+        return self._no_decode("build_decode_metadata")
+
+    def plan_decode_metadata(self, **kwargs: Any) -> Any:
+        """Plan/replay the per-rank decode kv-len + index buffers (CUDA-graph safe)."""
+        return self._no_decode("plan_decode_metadata")
+
+    def gather_decode_query(self, q_nope_out: Any, q_pe: Any) -> Any:
+        """All-gather the sharded decode query heads across the DCP group (MLA)."""
+        return self._no_decode("gather_decode_query")
+
+    def merge_decode_attention(
+        self,
+        cp_attn_out: Any,
+        cp_attn_lse: Any,
+        cp_group: Any,
+        *,
+        backend: str,
+        return_lse: bool = False,
+        ctx: Any = None,
+    ) -> Any:
+        """Merge per-rank partial attention via LSE rescale; ``backend`` in {mha, mla}."""
+        return self._no_decode("merge_decode_attention")
+
 
 def _is_dsa_active() -> bool:
     from sglang.srt.server_args import get_global_server_args
@@ -275,3 +339,62 @@ def is_zigzag() -> bool:
 
 def is_interleave() -> bool:
     return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
+
+
+# -- Decode context-parallel (DCP) strategy singleton (P2) --------------------
+# Independent of the prefill CP strategy above: DCP runs on the ``_DCP`` group
+# and is configured by ``dcp_size`` (not ``attn_cp_size``/``cp_strategy``). It is
+# platform-agnostic (``dcp_size > 1`` on both CUDA-MLA and AMD-HIP-MHA); callers
+# keep their own platform/mode gates (``dcp_enabled()`` for MLA, ``dcp_size > 1``
+# for the Triton MHA path) and route only the operation through the strategy.
+_DECODE_STRATEGY: Optional[ContextParallelStrategy] = None
+
+
+def init_decode_cp_strategy(server_args: ServerArgs) -> None:
+    """Bind the decode-context-parallel strategy for this process."""
+    global _DECODE_STRATEGY
+
+    if getattr(server_args, "dcp_size", 1) > 1:
+        from sglang.srt.layers.cp.dcp.strategy import DecodeContextParallelStrategy
+
+        _DECODE_STRATEGY = DecodeContextParallelStrategy(cp_size=server_args.dcp_size)
+    else:
+        _DECODE_STRATEGY = None
+
+
+def get_decode_cp_strategy() -> Optional[ContextParallelStrategy]:
+    """Return the decode-CP strategy, lazily initializing from global server args.
+
+    Mirrors ``get_cp_strategy``'s lazy pattern so pickled worker processes recover
+    the singleton. Returns None when DCP is not configured (``dcp_size <= 1``).
+    """
+    global _DECODE_STRATEGY
+
+    if _DECODE_STRATEGY is None:
+        from sglang.srt.server_args import get_global_server_args
+
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            return None
+        if server_args is not None and getattr(server_args, "dcp_size", 1) > 1:
+            init_decode_cp_strategy(server_args)
+    return _DECODE_STRATEGY
+
+
+def is_dcp_active(forward_batch: Optional[ForwardBatch] = None) -> bool:
+    """True if decode context parallel is configured. When ``forward_batch`` is
+    given, additionally require the current forward to be a decode.
+
+    NOTE: this is the *configuration* check (``dcp_size > 1``), which is broader
+    than ``layers.cp.dcp.comm.dcp_enabled()`` — the latter also requires CUDA and
+    is the MLA-path gate. Use ``dcp_enabled()`` where the CUDA-specific gate is
+    intended; use this to fetch/branch on the strategy's existence.
+    """
+    strategy = get_decode_cp_strategy()
+    if strategy is None:
+        return False
+    if forward_batch is None:
+        return True
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    return forward_mode is None or forward_mode.is_decode()

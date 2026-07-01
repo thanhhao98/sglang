@@ -15,10 +15,9 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp import get_decode_cp_strategy
 from sglang.srt.layers.cp.dcp import (
     all_gather_kv_cache_for_mla_extend,
-    all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs_mla,
     dcp_enabled,
     get_attention_dcp_world_size,
 )
@@ -543,9 +542,8 @@ class DeepseekMLAForwardMixin:
         if dcp_enabled():
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
-                q_nope_out, q_pe = all_gather_q_for_mla_decode(
-                    q_nope_out=q_nope_out,
-                    q_pe=q_pe,
+                q_nope_out, q_pe = get_decode_cp_strategy().gather_decode_query(
+                    q_nope_out, q_pe
                 )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
@@ -774,7 +772,9 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+            attn_output = get_decode_cp_strategy().merge_decode_attention(
+                attn_output, lse, get_dcp_group(), backend="mla"
+            )
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

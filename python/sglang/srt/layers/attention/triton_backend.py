@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
+from sglang.srt.layers.cp import get_decode_cp_strategy
 from sglang.srt.layers.cp.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -1696,7 +1697,9 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            o = get_decode_cp_strategy().merge_decode_attention(
+                o_for_decode, local_lse, group, backend="mha"
+            )
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
