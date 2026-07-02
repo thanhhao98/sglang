@@ -140,7 +140,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
 class DeepGemmRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        assert self.config.activation == "silu"
+        # SiTU (Kimi K3) is applied outside the GEMMs in python, so it only
+        # needs the masked-gemm activation site to branch (see _run_masked_gemm).
+        assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = False
@@ -487,28 +489,37 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
 
         # Act.
-        topk_ids_rs = running_state.get("topk_ids")
-        num_real_tokens = (
-            topk_ids_rs.shape[0]
-            if (
-                use_mxfp8
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and topk_ids_rs is not None
-                and "src2dst" in running_state
+        if self.config.activation == "situ":
+            down_input, down_input_scale = _masked_situ_mul_quant(
+                gateup_output,
+                masked_m,
+                group_size=128,
+                situ_beta=self.config.gemm1_alpha,
+                situ_linear_beta=self.config.gemm1_clamp_limit,
             )
-            else None
-        )
-        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
-            gateup_output,
-            masked_m,
-            group_size=scale_block_size,
-            topk=self.config.top_k,
-            swiglu_limit=swiglu_limit_arg,
-            swizzle=self.use_swizzle,
-            gemm1_alpha=self.config.gemm1_alpha,
-            gemm1_clamp_limit=self.config.gemm1_clamp_limit,
-            num_real_tokens=num_real_tokens,
-        )
+        else:
+            topk_ids_rs = running_state.get("topk_ids")
+            num_real_tokens = (
+                topk_ids_rs.shape[0]
+                if (
+                    use_mxfp8
+                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                    and topk_ids_rs is not None
+                    and "src2dst" in running_state
+                )
+                else None
+            )
+            down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
+                gateup_output,
+                masked_m,
+                group_size=scale_block_size,
+                topk=self.config.top_k,
+                swiglu_limit=swiglu_limit_arg,
+                swizzle=self.use_swizzle,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                num_real_tokens=num_real_tokens,
+            )
         del gateup_output
 
         # Down activation is quantised locally at scale_block_size (never DeepEP-LL),
@@ -1062,6 +1073,45 @@ def _varlen_deep_gemm_silu_mul_quant(
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
         )
     return down_input, down_input_scale
+
+
+def _masked_situ_mul_quant(
+    gateup_output: torch.Tensor,
+    masked_m: torch.Tensor,
+    group_size: int,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SiTU (Kimi K3) gated activation + per-token-group fp8 quant for the
+    masked-gemm path: gate' = beta*tanh(gate/beta)*sigmoid(gate),
+    up' = linear_beta*tanh(up/linear_beta), out = gate'*up'.
+
+    gateup_output layout is non-interleaved [gate; up] halves (K3 loads w1/w3
+    into separate halves, matching silu_and_mul / the marlin SiTU branch).
+    Unfused reference implementation; masked (invalid) rows are computed on
+    garbage but never consumed by the downstream masked GEMM.
+    """
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_8bit,
+    )
+
+    assert situ_beta is not None and situ_linear_beta is not None
+    E, M, N2 = gateup_output.shape
+    N = N2 // 2
+    gate = gateup_output[..., :N].float()
+    up = gateup_output[..., N:].float()
+    gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+    up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+    down_input_bf16 = (gate * up).to(torch.bfloat16)
+    return sglang_per_token_group_quant_8bit(
+        x=down_input_bf16,
+        dst_dtype=torch.float8_e4m3fn,
+        group_size=group_size,
+        masked_m=masked_m,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
 
 
 def _apply_swiglu_limit(

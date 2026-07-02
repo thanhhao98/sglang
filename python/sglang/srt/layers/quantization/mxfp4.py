@@ -333,6 +333,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
+        # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
+        # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
+        # activations are quantized to fp8 per-token-group-128.
+        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
         self.flashinfer_mxfp4_moe_precision = (
             get_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -389,6 +393,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
+        elif self.use_deep_gemm:
+            # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
+            # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
+            pass
         elif is_sm100_supported():
             if self.use_flashinfer:
                 # FlashInfer trtllm-gen FP4 kernel actual alignment:
@@ -541,6 +549,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
+            return
+
+        if self.use_deep_gemm:
+            from deep_gemm import transform_sf_into_required_layout
+
+            # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
+            layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+            layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+            # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
+            # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
+            # Round-trip through fp32 is exact (values are powers of two).
+            for scale_name, weight in (
+                ("w13_weight_scale", layer.w13_weight),
+                ("w2_weight_scale", layer.w2_weight),
+            ):
+                scale = getattr(layer, scale_name)
+                num_experts, n, _ = scale.data.shape
+                k = weight.shape[2] * 2
+                scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+                scale.data = transform_sf_into_required_layout(
+                    scale_f32,
+                    mn=n,
+                    k=k,
+                    recipe=(1, 32),
+                    num_groups=num_experts,
+                    disable_ue8m0_cast=False,
+                )
+            layer._mxfp4_backend = "deep_gemm"
             return
 
         if self._fi_kernel == "cutlass_sm90":
@@ -1101,6 +1137,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif (
@@ -1216,6 +1253,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
             )
+
+        if self.use_deep_gemm:
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[128, 128],
+                is_fp4_experts=True,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)
