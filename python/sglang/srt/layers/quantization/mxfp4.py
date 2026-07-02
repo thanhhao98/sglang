@@ -1190,6 +1190,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        if self.use_deep_gemm:
+            # Handles standard AND deepep_ll/deepep_normal dispatch formats via
+            # the runner's registered pre/post-permute functions. Must run
+            # before the `.topk_output` unpack below: deepep dispatch outputs
+            # carry topk_ids/topk_weights directly and have no `.topk_output`.
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[128, 128],
+                is_fp4_experts=True,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         if _is_cpu:
@@ -1253,21 +1271,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
             )
-
-        if self.use_deep_gemm:
-            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-
-            assert TopKOutputChecker.format_is_standard(topk_output)
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                block_shape=[128, 128],
-                is_fp4_experts=True,
-            )
-            return self.runner.run(dispatch_output, quant_info)
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)

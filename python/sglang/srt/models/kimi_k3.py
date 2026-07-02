@@ -292,10 +292,17 @@ class KimiK3MoE(nn.Module):
         # Experts
         final_hidden_states = self.experts(routed_input, topk_output)
 
+        # With an a2a backend (deepep etc.), the combine step already returns
+        # the COMPLETE routed sum; all-reducing again would multiply by tp_size.
+        # Only plain-TP partial sums (a2a=none) need the reduction here.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        routed_needs_reduce = self.tp_size > 1 and get_moe_a2a_backend().is_none()
+
         if self.use_latent_moe:
             # TP-partial routed outputs must be summed in latent space BEFORE
             # non-linear transforms (RMSNorm): sum(RMSNorm(x_i)) != RMSNorm(sum(x_i)).
-            if self.tp_size > 1:
+            if routed_needs_reduce:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )

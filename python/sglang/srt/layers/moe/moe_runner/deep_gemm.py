@@ -233,7 +233,30 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if self.config.activation == "situ":
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            situ_beta = self.config.gemm1_alpha
+            situ_linear_beta = self.config.gemm1_clamp_limit
+            assert situ_beta is not None and situ_linear_beta is not None
+            gate = gateup_output[:, : N // 2].float()
+            up = gateup_output[:, N // 2 :].float()
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            down_input = (gate * up).to(torch.bfloat16)
+            del gateup_output
+
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input,
+                scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del down_input
+        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -824,7 +847,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_weights,
         num_recv_tokens_per_expert,
     ) = dispatch_output
-    assert runner_config.activation == "silu"
+    assert runner_config.activation in ("silu", "situ")
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens

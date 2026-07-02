@@ -111,6 +111,15 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_moe_runner_backend().is_deep_gemm()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # MXFP4 experts (e.g. Kimi K3) on the DeepGEMM fp8_fp4 W4A8 path:
+            # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
+            self.deprecate_flag = True
+        elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()
