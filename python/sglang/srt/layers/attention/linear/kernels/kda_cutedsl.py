@@ -73,6 +73,11 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs.get("lower_bound") is not None:
+            raise NotImplementedError(
+                "KDA safe gate (lower_bound) is not implemented in the CuTe DSL "
+                "decode kernel; use --linear-attn-decode-backend triton."
+            )
         return cutedsl_fused_sigmoid_gating_kda_update(
             A_log=A_log,
             dt_bias=dt_bias,

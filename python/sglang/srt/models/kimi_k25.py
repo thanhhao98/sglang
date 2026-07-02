@@ -108,11 +108,13 @@ class MoonViTEncoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        qkv_hidden_size: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
-        self.hidden_size_per_attention_head = self.hidden_dim // self.num_heads
+        proj_size = qkv_hidden_size if qkv_hidden_size is not None else hidden_dim
+        self.hidden_size_per_attention_head = proj_size // self.num_heads
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -127,7 +129,7 @@ class MoonViTEncoderLayer(nn.Module):
         self.attn = VisionAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
-            projection_size=hidden_dim,
+            projection_size=proj_size,
             use_qkv_parallel=True,
             qkv_bias=attn_bias,
             proj_bias=attn_bias,
@@ -444,9 +446,8 @@ class MoonViT3dEncoder(nn.Module):
             video_attn_type == "spatial_temporal"
         ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
         self.video_attn_type = video_attn_type
-        self.rope_2d = Rope2DPosEmbRepeated(
-            block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
-        )
+        qkv_hs = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
+        self.rope_2d = Rope2DPosEmbRepeated(qkv_hs // block_cfg["num_heads"], 512, 512)
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
@@ -529,17 +530,21 @@ class MoonViT3dPretrainedModel(nn.Module):
             pos_emb_type=config.pos_emb_type,
         )
 
+        qkv_hidden_size = getattr(config, "qkv_hidden_size", None)
+        block_cfg = {
+            "num_heads": config.num_attention_heads,
+            "hidden_dim": config.hidden_size,
+            "mlp_dim": config.intermediate_size,
+            "activation": PytorchGELUTanh(),
+            "attn_bias": getattr(config, "attn_bias", True),
+            "use_data_parallel": use_data_parallel,
+        }
+        if qkv_hidden_size is not None:
+            block_cfg["qkv_hidden_size"] = qkv_hidden_size
         self.encoder = MoonViT3dEncoder(
             hidden_dim=config.hidden_size,
             num_layers=config.num_hidden_layers,
-            block_cfg={
-                "num_heads": config.num_attention_heads,
-                "hidden_dim": config.hidden_size,
-                "mlp_dim": config.intermediate_size,
-                "activation": PytorchGELUTanh(),
-                "attn_bias": True,
-                "use_data_parallel": use_data_parallel,
-            },
+            block_cfg=block_cfg,
             video_attn_type=config.video_attn_type,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),

@@ -414,6 +414,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     ht,
     ssm_state_indices,
     scale,
+    lower_bound,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -428,6 +429,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
@@ -475,8 +477,14 @@ def fused_recurrent_kda_packed_decode_kernel(
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
 
     x = b_a + b_dt
-    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
-    b_g = -tl.exp(A_log_val) * softplus_x  # [BK]
+    if USE_LOWER_BOUND:
+        # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (g + bias)),
+        # matching the chunked prefill kernel (kda.py) and FLA reference.
+        b_g = lower_bound * tl.sigmoid(tl.exp(A_log_val) * x)  # [BK]
+    else:
+        # Standard gate: -exp(A_log) * softplus(g + bias)
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        b_g = -tl.exp(A_log_val) * softplus_x  # [BK]
 
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
     # Keep beta in fp32 (no bf16 round-trip) to match the generic decode
@@ -508,6 +516,7 @@ def fused_recurrent_kda_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA T=1 decode fast path. Mirrors ``fused_recurrent_gated_delta_rule_packed_decode``
     but the gate ``g`` is a per-K vector instead of a scalar.
@@ -641,6 +650,7 @@ def fused_recurrent_kda_packed_decode(
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         scale=scale,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,
@@ -655,6 +665,7 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -391,10 +391,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         elif is_sm100_supported():
             if self.use_flashinfer:
+                # FlashInfer trtllm-gen FP4 kernel actual alignment:
+                # intermediate: scale shuffle needs M%128==0 → intermediate%64==0
+                # hidden: finalize kernel needs K%32==0, block quant needs K%32==0
+                # Using 128 alignment (not 256) since 256 was overly conservative
+                # and causes 60GB/GPU waste for models like K3 (384 intermediate).
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, 256
+                    intermediate_size_per_partition, 128
                 )
-                hidden_size = round_up(hidden_size, 256)
+                hidden_size = round_up(hidden_size, 128)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, triton_kernels_padding_alignment
@@ -463,6 +468,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w13_weight_scale.quant_method = "group"
 
         w13_weight_bias = torch.nn.Parameter(
             torch.zeros(
@@ -499,6 +505,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        w2_weight_scale.quant_method = "group"
 
         w2_weight_bias = torch.nn.Parameter(
             torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
@@ -517,14 +524,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if not is_sm90_supported() and not is_sm120_supported():
-                raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+            if (
+                not is_sm90_supported()
+                and not is_sm100_supported()
+                and not is_sm120_supported()
+            ):
+                raise RuntimeError("MXFP4 Marlin requires SM90+.")
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
                 )
 
-            if self.moe_runner_config.gemm1_alpha is not None:
+            if self.moe_runner_config.gemm1_alpha is not None and getattr(
+                self.moe_runner_config, "gate_up_interleaved", True
+            ):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
@@ -534,9 +547,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm90_cutlass(layer)
             return
         if self.use_flashinfer:
-            # TODO: these values are hardcoded for now, we need to get them from the model
+            _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
+            _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
             layer.gemm1_alpha = Parameter(
-                torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
+                torch.tensor([_alpha] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
             layer.gemm1_beta = Parameter(
@@ -544,7 +558,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             layer.gemm1_clamp_limit = Parameter(
-                torch.tensor([7.0] * self.num_experts, dtype=torch.float32).cuda(),
+                torch.tensor([_limit] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
             sf_block_size = 32  # mxfp4 block size
@@ -613,9 +627,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 new_shape = list(shape)
                 return x.reshape(*new_shape)
 
-            w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
-            w13_weight = swap_every_two_rows(w13_weight, -2)
-            w13_bias = swap_every_two_rows(w13_bias, -1)
+            if getattr(layer.moe_runner_config, "gate_up_interleaved", True):
+                w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
+                w13_weight = swap_every_two_rows(w13_weight, -2)
+                w13_bias = swap_every_two_rows(w13_bias, -1)
+            else:
+                # Non-interleaved layout (e.g. K3 Latent MoE): first half=gate, second half=up
+                # Swap halves to match trtllm-gen's expected [up, gate] order
+                half = w13_weight.shape[-2] // 2
+                w13_weight = torch.cat(
+                    [w13_weight[..., half:, :], w13_weight[..., :half, :]], dim=-2
+                )
+                half_s = w13_weight_scale.shape[-2] // 2
+                w13_weight_scale = torch.cat(
+                    [
+                        w13_weight_scale[..., half_s:, :],
+                        w13_weight_scale[..., :half_s, :],
+                    ],
+                    dim=-2,
+                )
+                half_b = w13_bias.shape[-1] // 2
+                w13_bias = torch.cat(
+                    [w13_bias[..., half_b:], w13_bias[..., :half_b]], dim=-1
+                )
 
             # Shuffle weights and scaling factors for transposed mma output
             gemm1_weights_mxfp4_shuffled = []
@@ -943,11 +977,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # half along its row dim (N) from N_un to N_pad with zeros, and along
         # its last dim (K) from K_un (or K_un / sf_block_size) to K_pad.
 
+        _interleaved = getattr(layer.moe_runner_config, "gate_up_interleaved", True)
+
         def _stack_up_gate_w13(unpadded_w13, last_pad, last_un):
             # unpadded_w13: [E, 2*N_un, last_un]
             # Returns: [E, 2*N_pad, last_pad] in [up_padded; gate_padded] order.
-            gate_rows = unpadded_w13[:, 0::2, :]  # [E, N_un, last_un]
-            up_rows = unpadded_w13[:, 1::2, :]  # [E, N_un, last_un]
+            if _interleaved:
+                gate_rows = unpadded_w13[:, 0::2, :]  # [E, N_un, last_un]
+                up_rows = unpadded_w13[:, 1::2, :]  # [E, N_un, last_un]
+            else:
+                # Non-interleaved: first half=gate, second half=up
+                gate_rows = unpadded_w13[:, :N_un, :]
+                up_rows = unpadded_w13[:, N_un:, :]
             out = torch.zeros(
                 E, 2 * N_pad, last_pad, dtype=unpadded_w13.dtype, device=device
             )
@@ -966,8 +1007,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             K_un // sf_block_size,
         )
         # Bias: same de-interleave on dim=-1.
-        w13_bias_gate = layer.w13_weight_bias.data[:, 0::2]  # [E, N_un]
-        w13_bias_up = layer.w13_weight_bias.data[:, 1::2]  # [E, N_un]
+        if _interleaved:
+            w13_bias_gate = layer.w13_weight_bias.data[:, 0::2]  # [E, N_un]
+            w13_bias_up = layer.w13_weight_bias.data[:, 1::2]  # [E, N_un]
+        else:
+            w13_bias_gate = layer.w13_weight_bias.data[:, :N_un]
+            w13_bias_up = layer.w13_weight_bias.data[:, N_un:]
         w13_bias_padded = torch.zeros(E, 2 * N_pad, dtype=bias_dtype, device=device)
         w13_bias_padded[:, :N_un] = w13_bias_up
         w13_bias_padded[:, N_pad : N_pad + N_un] = w13_bias_gate
@@ -989,9 +1034,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
-        # ---- Per-expert SwiGLU scalars (GPT-OSS defaults) ------------------
+        # ---- Per-expert SwiGLU scalars (read from runner config, fallback to GPT-OSS defaults)
+        _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
+        _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
         layer.swiglu_alpha = Parameter(
-            torch.full((E,), 1.702, dtype=torch.float32, device=device),
+            torch.full((E,), _sm90_alpha, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_beta = Parameter(
@@ -999,7 +1046,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.swiglu_limit = Parameter(
-            torch.full((E,), 7.0, dtype=torch.float32, device=device),
+            torch.full((E,), _sm90_limit, dtype=torch.float32, device=device),
             requires_grad=False,
         )
 

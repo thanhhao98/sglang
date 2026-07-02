@@ -265,6 +265,16 @@ def fused_marlin_moe(
         )
     elif activation == "silu" and is_gated:
         silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "situ" and is_gated:
+        d = gemm1_n // 2
+        x = intermediate_cache1.view(-1, gemm1_n)
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
+        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        if clamp_limit is not None:
+            up = clamp_limit * torch.tanh(up / clamp_limit)
+        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:

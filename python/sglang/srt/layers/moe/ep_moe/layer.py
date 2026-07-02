@@ -257,7 +257,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
     ):
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_normal(
             layer=self,
@@ -268,7 +268,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_ll(
             layer=self,

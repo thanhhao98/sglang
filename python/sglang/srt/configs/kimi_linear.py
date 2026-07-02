@@ -51,6 +51,13 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_nope: bool | None = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        attn_res_block_size: int | None = None,
+        routed_expert_hidden_size: int | None = None,
+        latent_moe_use_norm: bool = False,
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
+        mla_use_output_gate: bool = False,
+        max_position_embeddings: int = 4096,
         **kwargs,
     ):
         self.model_type = model_type
@@ -96,6 +103,14 @@ class KimiLinearConfig(PretrainedConfig):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.num_nextn_predict_layers = num_nextn_predict_layers
+
+        self.attn_res_block_size = attn_res_block_size
+        self.routed_expert_hidden_size = routed_expert_hidden_size
+        self.latent_moe_use_norm = latent_moe_use_norm
+        self.activation_situ_beta = activation_situ_beta
+        self.activation_situ_linear_beta = activation_situ_linear_beta
+        self.mla_use_output_gate = mla_use_output_gate
+        self.max_position_embeddings = max_position_embeddings
 
         if linear_attn_config is not None:
             assert linear_attn_config["kda_layers"] is not None

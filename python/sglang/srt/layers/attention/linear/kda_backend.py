@@ -327,6 +327,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                lower_bound=getattr(layer, "lower_bound", None),
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
@@ -350,6 +351,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=getattr(layer, "lower_bound", None),
         )
 
     def forward_extend(

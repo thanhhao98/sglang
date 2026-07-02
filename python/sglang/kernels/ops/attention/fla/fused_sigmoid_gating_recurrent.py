@@ -12,6 +12,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     dt_bias,
     softplus_beta,
     softplus_threshold,
+    lower_bound,
     q,
     k,
     v,
@@ -47,6 +48,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
@@ -159,16 +161,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_a = tl.load(p_a).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        if USE_LOWER_BOUND:
+            # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (a + dt_bias))
+            b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+        else:
+            # Compute g = -exp(A_log) * softplus(a + dt_bias)
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
@@ -254,6 +260,7 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
+    lower_bound: Optional[float] = None,
     # Optional parameters for target_verify support
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
@@ -325,6 +332,7 @@ def fused_sigmoid_gating_delta_rule_update(
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         q=q,
         k=k,
         v=v,
@@ -358,6 +366,7 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        USE_LOWER_BOUND=lower_bound is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,

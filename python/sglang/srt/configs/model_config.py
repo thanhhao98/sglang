@@ -873,18 +873,20 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
-        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+        elif (
+            "KimiLinearForCausalLM" in self.hf_config.architectures
+            or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+        ):
+            tc = self.hf_text_config
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.kv_lora_rank = tc.kv_lora_rank
+            self.qk_rope_head_dim = tc.qk_rope_head_dim
+            self.v_head_dim = tc.v_head_dim
+            self.qk_nope_head_dim = tc.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            if getattr(tc, "rope_scaling", None):
+                self.scaling = compute_mla_mscale_scaling(tc.rope_scaling, self.scaling)
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
