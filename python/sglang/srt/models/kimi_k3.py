@@ -114,10 +114,10 @@ def _fused_attn_res_kernel(
         for h0 in tl.static_range(0, H, BLOCK_H):
             offs_h = h0 + tl.arange(0, BLOCK_H)
             if j < NVB:
-                v = tl.load(block_ptr + pid * stride_bm + j * stride_bb + offs_h)
+                v_raw = tl.load(block_ptr + pid * stride_bm + j * stride_bb + offs_h)
             else:
-                v = tl.load(prefix_ptr + pid * stride_pm + offs_h)
-            v = v.to(tl.float32)
+                v_raw = tl.load(prefix_ptr + pid * stride_pm + offs_h)
+            v = v_raw.to(tl.float32)
             nw = tl.load(nw_ptr + offs_h).to(tl.float32)
             pw = tl.load(pw_ptr + offs_h).to(tl.float32)
             sumsq += tl.sum(v * v)
@@ -138,11 +138,11 @@ def _fused_attn_res_kernel(
         acc = tl.zeros([BLOCK_H], tl.float32)
         for j in range(0, NVB + 1):
             if j < NVB:
-                v = tl.load(block_ptr + pid * stride_bm + j * stride_bb + offs_h)
+                v_raw = tl.load(block_ptr + pid * stride_bm + j * stride_bb + offs_h)
             else:
-                v = tl.load(prefix_ptr + pid * stride_pm + offs_h)
+                v_raw = tl.load(prefix_ptr + pid * stride_pm + offs_h)
             p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
-            acc += p_j * v.to(tl.float32)
+            acc += p_j * v_raw.to(tl.float32)
         tl.store(
             out_ptr + pid * stride_om + offs_h,
             acc.to(out_ptr.dtype.element_ty),
