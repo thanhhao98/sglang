@@ -506,15 +506,46 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         # Decide fusion strategy
-        # Full-rank gate changes the fusion layout, so disable fusion for now.
         # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
-        self.do_fuse_qkvbfg = (
-            quant_config is None
-            and not self.use_full_rank_gate
-            and self.attn_tp_size == self.tp_size
+        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
+        # experts; attention linears resolve to UnquantizedLinearMethod, so a
+        # non-None quant_config is fine for the merged projection.
+        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
+            quant_config is None or self.use_full_rank_gate
         )
 
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_qkvbfg and self.use_full_rank_gate:
+            # One wide GEMM: [q, k, v, b, g] column-parallel + [f_a] replicated.
+            # f_b stays a separate small GEMV (128 -> proj) on the bottleneck.
+            self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
+                self.hidden_size,
+                [
+                    projection_size,
+                    projection_size,
+                    projection_size,
+                    self.num_heads,
+                    projection_size,
+                ],
+                [self.head_dim],
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkvbfg_a_proj",
+            )
+            self.split_sizes = [
+                3 * projection_size // self.tp_size,
+                self.num_heads // self.tp_size,
+                projection_size // self.tp_size,
+                self.head_dim,
+            ]
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=f"{prefix}.f_b_proj",
+            )
+        elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
                 projection_size,
@@ -698,10 +729,16 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
-        qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
-        forget_gate, g_proj_states = self.fused_fg_b_proj(
-            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
-        )
+        if self.use_full_rank_gate:
+            qkv, beta, g_proj_states, f_a = torch.split(
+                fused_states, self.split_sizes, dim=-1
+            )
+            forget_gate = self.f_b_proj(f_a)[0]
+        else:
+            qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
+            forget_gate, g_proj_states = self.fused_fg_b_proj(
+                fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+            )
         return qkv, beta, forget_gate, g_proj_states
 
     def forward(
@@ -1196,18 +1233,37 @@ class KimiK3LinearForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        use_full_rank_gate = bool(
+            (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
+        )
+        if use_full_rank_gate:
+            # Fused layout (K3): [q, k, v, b, g] column-parallel + [f_a]
+            # replicated; f_b is a standalone module loaded by name.
+            fused_qkvbfg_mapping = [
+                (".fused_qkvbfg_a_proj", ".q_proj", 0),
+                (".fused_qkvbfg_a_proj", ".k_proj", 1),
+                (".fused_qkvbfg_a_proj", ".v_proj", 2),
+                (".fused_qkvbfg_a_proj", ".b_proj", 3),
+                (".fused_qkvbfg_a_proj", ".g_proj", 4),
+                (".fused_qkvbfg_a_proj", ".f_a_proj", 5),
+            ]
+        else:
+            # Fused layout (low-rank gate): [q, k, v, b] + [f_a, g_a]
+            fused_qkvbfg_mapping = [
+                (".fused_qkvbfg_a_proj", ".q_proj", 0),
+                (".fused_qkvbfg_a_proj", ".k_proj", 1),
+                (".fused_qkvbfg_a_proj", ".v_proj", 2),
+                (".fused_qkvbfg_a_proj", ".b_proj", 3),
+                (".fused_qkvbfg_a_proj", ".f_a_proj", 4),
+                (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
+                (".fused_fg_b_proj", ".f_b_proj", 0),
+                (".fused_fg_b_proj", ".g_b_proj", 1),
+            ]
+
         stacked_params_mapping = [
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
-            # Fused path (KDA, low-rank gate)
-            (".fused_qkvbfg_a_proj", ".q_proj", 0),
-            (".fused_qkvbfg_a_proj", ".k_proj", 1),
-            (".fused_qkvbfg_a_proj", ".v_proj", 2),
-            (".fused_qkvbfg_a_proj", ".b_proj", 3),
-            (".fused_qkvbfg_a_proj", ".f_a_proj", 4),
-            (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
-            (".fused_fg_b_proj", ".f_b_proj", 0),
-            (".fused_fg_b_proj", ".g_b_proj", 1),
+            *fused_qkvbfg_mapping,
             # Unfused QKV path
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
