@@ -10,6 +10,8 @@ from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.srt.configs.kimi_k3 import KimiK3Config
@@ -79,6 +81,74 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+@triton.jit
+def _fused_attn_res_kernel(
+    prefix_ptr,  # [T, H]
+    block_ptr,  # [T, NB_total, H]
+    nw_ptr,  # [H] rmsnorm weight
+    pw_ptr,  # [H] proj weight (hidden -> 1 score)
+    out_ptr,  # [T, H]
+    NVB,  # num valid blocks (runtime, rows 0..NVB-1 of block_ptr; prefix is row NVB)
+    eps,
+    stride_pm,
+    stride_bm,
+    stride_bb,
+    stride_om,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MAX_B: tl.constexpr,
+):
+    """Fused attention-residual aggregation (one CTA per token):
+    v_j = blocks[0..NVB-1], prefix; s_j = dot(RMSNorm(v_j), pw);
+    p = softmax(s); out = sum_j p_j * v_j.
+    Replaces cat + RMSNorm + proj GEMV + softmax + bmm (6+ kernels).
+    """
+    pid = tl.program_id(0)
+    offs_b = tl.arange(0, MAX_B)
+    scores = tl.full([MAX_B], float("-inf"), tl.float32)
+
+    # Pass 1: per-row sumsq + weighted dot -> score
+    for j in range(0, NVB + 1):
+        sumsq = 0.0
+        dotv = 0.0
+        for h0 in tl.static_range(0, H, BLOCK_H):
+            offs_h = h0 + tl.arange(0, BLOCK_H)
+            if j < NVB:
+                v = tl.load(block_ptr + pid * stride_bm + j * stride_bb + offs_h)
+            else:
+                v = tl.load(prefix_ptr + pid * stride_pm + offs_h)
+            v = v.to(tl.float32)
+            nw = tl.load(nw_ptr + offs_h).to(tl.float32)
+            pw = tl.load(pw_ptr + offs_h).to(tl.float32)
+            sumsq += tl.sum(v * v)
+            dotv += tl.sum(v * nw * pw)
+        rrms = 1.0 / tl.sqrt(sumsq / H + eps)
+        s_j = dotv * rrms
+        scores = tl.where(offs_b == j, s_j, scores)
+
+    # Softmax over rows 0..NVB
+    mask_b = offs_b <= NVB
+    m = tl.max(tl.where(mask_b, scores, float("-inf")), axis=0)
+    e = tl.where(mask_b, tl.exp(scores - m), 0.0)
+    p = e / tl.sum(e, axis=0)
+
+    # Pass 2: weighted sum
+    for h0 in tl.static_range(0, H, BLOCK_H):
+        offs_h = h0 + tl.arange(0, BLOCK_H)
+        acc = tl.zeros([BLOCK_H], tl.float32)
+        for j in range(0, NVB + 1):
+            if j < NVB:
+                v = tl.load(block_ptr + pid * stride_bm + j * stride_bb + offs_h)
+            else:
+                v = tl.load(prefix_ptr + pid * stride_pm + offs_h)
+            p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
+            acc += p_j * v.to(tl.float32)
+        tl.store(
+            out_ptr + pid * stride_om + offs_h,
+            acc.to(out_ptr.dtype.element_ty),
+        )
+
+
 def _apply_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -86,6 +156,39 @@ def _apply_attn_res(
     norm: RMSNorm,
     num_valid_blocks: int,
 ) -> torch.Tensor:
+    if num_valid_blocks <= 0:
+        return prefix_sum
+
+    T, H = prefix_sum.shape
+    out = torch.empty_like(prefix_sum)
+    _fused_attn_res_kernel[(T,)](
+        prefix_sum,
+        block_residual,
+        norm.weight,
+        proj.weight.view(-1),
+        out,
+        num_valid_blocks,
+        norm.variance_epsilon,
+        prefix_sum.stride(0),
+        block_residual.stride(0),
+        block_residual.stride(1),
+        out.stride(0),
+        H=H,
+        BLOCK_H=1024,
+        MAX_B=16,
+        num_warps=8,
+    )
+    return out
+
+
+def _apply_attn_res_torch(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: ReplicatedLinear,
+    norm: RMSNorm,
+    num_valid_blocks: int,
+) -> torch.Tensor:
+    """Eager reference implementation (kept for testing/fallback)."""
     if num_valid_blocks <= 0:
         return prefix_sum
 

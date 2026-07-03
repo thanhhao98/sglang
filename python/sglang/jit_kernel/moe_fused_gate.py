@@ -309,7 +309,10 @@ def moe_fused_gate(
     # stay occupancy-bound. Swept on H100/B200: this beats the AOT kernels across
     # shapes, whereas larger tiles / more warps regress (register pressure).
     BLOCK_M = max(1, min(4, 256 // BLOCK_N))
-    num_warps = 1
+    # For wide rows (e.g. Kimi K3: 896 experts, BLOCK_N 1024) the K sequential
+    # argmax passes dominate and benefit from more warps despite the
+    # cross-warp reduction cost.
+    num_warps = 1 if BLOCK_N <= 512 else 4
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}
