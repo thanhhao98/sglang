@@ -515,27 +515,44 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
-            # One wide GEMM: [q, k, v, b, g] column-parallel + [f_a] replicated.
-            # f_b stays a separate small GEMV (128 -> proj) on the bottleneck.
-            self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
+            # Fuse only the alignment-friendly wide projections [q, k, v, g]
+            # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
+            # in as well skews the output dim to 6284 and measurably degrades
+            # the GEMM kernel selection; they stay as separate tiny GEMVs.
+            self.fused_qkvg_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [
                     projection_size,
                     projection_size,
                     projection_size,
-                    self.num_heads,
                     projection_size,
                 ],
-                [self.head_dim],
+                bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
                 3 * projection_size // self.tp_size,
-                self.num_heads // self.tp_size,
                 projection_size // self.tp_size,
-                self.head_dim,
             ]
+            self.b_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=f"{prefix}.b_proj",
+            )
+            self.f_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_a_proj",
+            )
             self.f_b_proj = ColumnParallelLinear(
                 self.head_dim,
                 projection_size,
@@ -728,13 +745,13 @@ class KimiK3DeltaAttention(nn.Module):
         return qkv, beta, forget_gate, g_proj_states
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
-        fused_states = self.fused_qkvbfg_a_proj(hidden_states)
         if self.use_full_rank_gate:
-            qkv, beta, g_proj_states, f_a = torch.split(
-                fused_states, self.split_sizes, dim=-1
-            )
-            forget_gate = self.f_b_proj(f_a)[0]
+            fused_states, _ = self.fused_qkvg_proj(hidden_states)
+            qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+            beta = self.b_proj(hidden_states)[0]
+            forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
+            fused_states = self.fused_qkvbfg_a_proj(hidden_states)
             qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
             forget_gate, g_proj_states = self.fused_fg_b_proj(
                 fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
@@ -1237,15 +1254,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
         if use_full_rank_gate:
-            # Fused layout (K3): [q, k, v, b, g] column-parallel + [f_a]
-            # replicated; f_b is a standalone module loaded by name.
+            # Fused layout (K3): [q, k, v, g] column-parallel; b / f_a / f_b
+            # are standalone modules loaded by name.
             fused_qkvbfg_mapping = [
-                (".fused_qkvbfg_a_proj", ".q_proj", 0),
-                (".fused_qkvbfg_a_proj", ".k_proj", 1),
-                (".fused_qkvbfg_a_proj", ".v_proj", 2),
-                (".fused_qkvbfg_a_proj", ".b_proj", 3),
-                (".fused_qkvbfg_a_proj", ".g_proj", 4),
-                (".fused_qkvbfg_a_proj", ".f_a_proj", 5),
+                (".fused_qkvg_proj", ".q_proj", 0),
+                (".fused_qkvg_proj", ".k_proj", 1),
+                (".fused_qkvg_proj", ".v_proj", 2),
+                (".fused_qkvg_proj", ".g_proj", 3),
             ]
         else:
             # Fused layout (low-rank gate): [q, k, v, b] + [f_a, g_a]
@@ -1322,7 +1337,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 # Fused projections only apply to KDA layers
-                if param_name in {".fused_qkvbfg_a_proj", ".fused_fg_b_proj"}:
+                if param_name in {
+                    ".fused_qkvbfg_a_proj",
+                    ".fused_fg_b_proj",
+                    ".fused_qkvg_proj",
+                }:
                     layer_id = int(name.split(".")[2])
                     if not self.config.is_kda_layer(layer_id):
                         continue
