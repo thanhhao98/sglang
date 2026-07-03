@@ -327,6 +327,55 @@ def _attn_res_prefix_update(
     return new
 
 
+@triton.jit
+def _attn_res_combine_kernel(
+    prefix_ptr,
+    block_ptr,
+    scores_ptr,  # [T, MAX_B] fp32
+    out_ptr,  # [T, H]
+    NVB,
+    stride_pm,
+    stride_bm,
+    stride_bb,
+    stride_sm,
+    stride_om,
+    BLOCK_H: tl.constexpr,
+    MAX_B: tl.constexpr,
+):
+    """out[t, chunk] = sum_j softmax(scores)_j * v_j[chunk]. (T, H-chunks)
+    grid: the small-T/decode variant — a fused output norm is impossible here
+    (needs full-row sumsq), but the chunked grid keeps SMs busy at bs=1."""
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    offs_b = tl.arange(0, MAX_B)
+    mask_b = offs_b <= NVB
+    scores = tl.load(
+        scores_ptr + pid_t * stride_sm + offs_b,
+        mask=mask_b,
+        other=float("-inf"),
+    )
+    m = tl.max(scores, axis=0)
+    e = tl.where(mask_b, tl.exp(scores - m), 0.0)
+    p = e / tl.sum(e, axis=0)
+
+    acc = tl.zeros([BLOCK_H], tl.float32)
+    for j in range(0, NVB + 1):
+        if j < NVB:
+            v_raw = tl.load(block_ptr + pid_t * stride_bm + j * stride_bb + offs_h)
+        else:
+            v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
+        p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
+        acc += p_j * v_raw.to(tl.float32)
+    tl.store(out_ptr + pid_t * stride_om + offs_h, acc.to(out_ptr.dtype.element_ty))
+
+
+# Below this token count, the norm-fused (T,)-grid combine cannot fill the
+# SMs (one CTA per token); use the chunked combine + separate norm instead.
+_ATTN_RES_FUSED_NORM_MIN_T = 64
+
+
 def _attn_res_combine_norm(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -336,6 +385,23 @@ def _attn_res_combine_norm(
 ) -> torch.Tensor:
     T, H = prefix_sum.shape
     out = torch.empty_like(prefix_sum)
+    if T < _ATTN_RES_FUSED_NORM_MIN_T:
+        _attn_res_combine_kernel[(T, H // _ATTN_RES_BLOCK_H)](
+            prefix_sum,
+            block_residual,
+            scores,
+            out,
+            num_valid_blocks,
+            prefix_sum.stride(0),
+            block_residual.stride(0),
+            block_residual.stride(1),
+            scores.stride(0),
+            out.stride(0),
+            BLOCK_H=_ATTN_RES_BLOCK_H,
+            MAX_B=_ATTN_RES_MAX_B,
+            num_warps=4,
+        )
+        return out_norm(out)
     _attn_res_combine_norm_kernel[(T,)](
         prefix_sum,
         block_residual,
