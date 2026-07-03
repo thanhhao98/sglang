@@ -348,7 +348,14 @@ def _attn_res_combine_kernel(
 # Below this token count, the norm-fused (T,)-grid combine cannot fill the
 # SMs (one CTA per token); use the chunked combine + separate norm instead.
 # Env-overridable for A/B testing.
-_ATTN_RES_FUSED_NORM_MIN_T = int(os.environ.get("SGLANG_K3_ATTN_RES_FUSED_MIN_T", "64"))
+# A/B on 8xB300 (2026-07-03): the norm-fused (T,)-grid combine + shared
+# dual-scores path LOSES at every tested size — bs=1 (single-CTA rows) AND
+# bs=64 decode (650 vs 673 tok/s: 64 CTAs underfill 148 SMs), while prefill
+# (T>=1024) shows no measurable difference (attn-res is a tiny fraction of
+# GEMM-dominated prefill). Disabled by default; kernels kept for retuning.
+_ATTN_RES_FUSED_NORM_MIN_T = int(
+    os.environ.get("SGLANG_K3_ATTN_RES_FUSED_MIN_T", "999999")
+)
 
 
 def _attn_res_combine_norm(
