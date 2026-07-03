@@ -342,7 +342,12 @@ class KimiK3DeltaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        # KDA is an attention layer: all head-sharded params must follow the
+        # attention-TP group (= tp under plain TP, = 1 under DP attention),
+        # matching the mamba state cache sizing (KimiLinearCacheParams uses
+        # get_attention_tp_size). Mirrors GLM5-next's head_shard_size pattern.
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -353,8 +358,8 @@ class KimiK3DeltaAttention(nn.Module):
         self.head_v_dim = config.v_head_dim
         self.layer_idx = layer_idx
         self.prefix = prefix
-        assert self.num_heads % self.tp_size == 0
-        self.local_num_heads = divide(self.num_heads, self.tp_size)
+        assert self.num_heads % self.attn_tp_size == 0
+        self.local_num_heads = divide(self.num_heads, self.attn_tp_size)
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
@@ -364,8 +369,13 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         # Decide fusion strategy
-        # Full-rank gate changes the fusion layout, so disable fusion for now
-        self.do_fuse_qkvbfg = quant_config is None and not self.use_full_rank_gate
+        # Full-rank gate changes the fusion layout, so disable fusion for now.
+        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
+        self.do_fuse_qkvbfg = (
+            quant_config is None
+            and not self.use_full_rank_gate
+            and self.attn_tp_size == self.tp_size
+        )
 
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -395,7 +405,7 @@ class KimiK3DeltaAttention(nn.Module):
                 2, self.head_dim, projection_size, dtype=_dtype
             )
         else:
-            attn_tp_rank = get_parallel().attn_tp_rank
+            attn_tp_rank = self.attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -421,6 +431,8 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.f_b_proj",
             )
             self.b_proj = ColumnParallelLinear(
@@ -428,6 +440,8 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.b_proj",
             )
 
@@ -437,6 +451,8 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
+                    tp_rank=attn_tp_rank,
+                    tp_size=self.attn_tp_size,
                     prefix=f"{prefix}.g_proj",
                 )
             else:
@@ -452,11 +468,13 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
+                    tp_rank=attn_tp_rank,
+                    tp_size=self.attn_tp_size,
                     prefix=f"{prefix}.g_b_proj",
                 )
 
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+            torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
@@ -465,6 +483,8 @@ class KimiK3DeltaAttention(nn.Module):
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
             params_dtype=torch.float32,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
             prefix=f"{prefix}.qkv_conv1d",
         )
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
@@ -505,6 +525,8 @@ class KimiK3DeltaAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -607,11 +629,15 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         )
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
+            # Shard by attn-TP to match the attention output (DSV2 MLA shards
+            # heads across the attention-TP group, not the global TP group).
             self.g_proj = ColumnParallelLinear(
                 config.hidden_size,
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
+                tp_rank=get_parallel().attn_tp_rank,
+                tp_size=get_parallel().attn_tp_size,
                 prefix=f"{prefix}.g_proj",
             )
             # Output gate must multiply the TP-local attention output right
