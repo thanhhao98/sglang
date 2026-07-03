@@ -151,48 +151,6 @@ def _attn_res_scores_kernel(
 
 
 @triton.jit
-def _attn_res_prefix_kernel(
-    old_ptr,  # [T, H] previous prefix_sum (ignored when HAS_OLD=False)
-    delta_ptr,  # [T, H] sublayer output to accumulate
-    new_ptr,  # [T, H] out: updated prefix_sum
-    nw_ptr,  # [H] rmsnorm weight for the score
-    pw_ptr,  # [H] proj weight for the score
-    scores_ptr,  # [T, MAX_B] fp32; score stored at column IDX
-    IDX,
-    eps,
-    stride_om,
-    stride_dm,
-    stride_nm,
-    stride_sm,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    HAS_OLD: tl.constexpr,
-):
-    """Fused residual update + score: new = old + delta (or just delta at
-    block-write layers), written out, plus its RMSNorm+proj score for the
-    following aggregation — replaces a separate elementwise add kernel and
-    one (T,1) scores launch."""
-    pid_t = tl.program_id(0)
-    sumsq = 0.0
-    dotv = 0.0
-    for h0 in tl.static_range(0, H, BLOCK_H):
-        offs_h = h0 + tl.arange(0, BLOCK_H)
-        d = tl.load(delta_ptr + pid_t * stride_dm + offs_h).to(tl.float32)
-        if HAS_OLD:
-            o = tl.load(old_ptr + pid_t * stride_om + offs_h).to(tl.float32)
-            v = o + d
-        else:
-            v = d
-        tl.store(new_ptr + pid_t * stride_nm + offs_h, v.to(new_ptr.dtype.element_ty))
-        nw = tl.load(nw_ptr + offs_h).to(tl.float32)
-        pw = tl.load(pw_ptr + offs_h).to(tl.float32)
-        sumsq += tl.sum(v * v)
-        dotv += tl.sum(v * nw * pw)
-    rrms = 1.0 / tl.sqrt(sumsq / H + eps)
-    tl.store(scores_ptr + pid_t * stride_sm + IDX, dotv * rrms)
-
-
-@triton.jit
 def _attn_res_combine_norm_kernel(
     prefix_ptr,
     block_ptr,
@@ -304,24 +262,35 @@ def _attn_res_prefix_update(
     scores: torch.Tensor,
     idx: int,
 ) -> torch.Tensor:
-    T, H = delta.shape
-    new = torch.empty_like(delta)
-    _attn_res_prefix_kernel[(T,)](
-        old if old is not None else delta,
-        delta,
+    """Residual update + score of the updated prefix row into scores[:, idx].
+
+    The add stays a plain (parallel) elementwise op; only the score is a
+    kernel. A fully fused single-CTA-per-token version was measured SLOWER at
+    bs=1 (serial 28KB chain on one SM vs parallel add + tiny score kernel).
+    """
+    new = delta if old is None else old + delta
+    T, H = new.shape
+    # Reuse the scores kernel for a single row: NVB=0 makes row 0 take the
+    # prefix path; aim the output at column `idx` via a pointer offset.
+    scores_at_idx = scores[:, idx:]
+    _attn_res_scores_kernel[(T, 1)](
         new,
+        new,  # block_ptr unused when NVB == 0
         norm.weight,
         proj.weight.view(-1),
-        scores,
-        idx,
+        scores_at_idx,
+        norm.weight,  # dummy second set (HAS_SECOND=False)
+        proj.weight.view(-1),
+        scores_at_idx,
+        0,
         norm.variance_epsilon,
-        (old if old is not None else delta).stride(0),
-        delta.stride(0),
         new.stride(0),
+        0,
+        0,
         scores.stride(0),
         H=H,
         BLOCK_H=_ATTN_RES_BLOCK_H,
-        HAS_OLD=old is not None,
+        HAS_SECOND=False,
         num_warps=8,
     )
     return new
