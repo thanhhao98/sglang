@@ -101,11 +101,9 @@ _ATTN_RES_BLOCK_H = 1024
 def _attn_res_scores_kernel(
     prefix_ptr,  # [T, H]
     block_ptr,  # [T, NB_total, H]
-    nw_ptr,  # [H] rmsnorm weight (score set 1)
-    pw_ptr,  # [H] proj weight (score set 1)
+    cw_ptr,  # [H] fp32 precombined rmsnorm_weight * proj_weight (set 1)
     scores_ptr,  # [T, MAX_B] fp32 out (set 1)
-    nw2_ptr,  # [H] rmsnorm weight (score set 2, optional)
-    pw2_ptr,  # [H] proj weight (score set 2, optional)
+    cw2_ptr,  # [H] fp32 precombined weights (set 2, optional)
     scores2_ptr,  # [T, MAX_B] fp32 out (set 2, optional)
     NVB,
     eps,
@@ -136,14 +134,12 @@ def _attn_res_scores_kernel(
         else:
             v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
         v = v_raw.to(tl.float32)
-        nw = tl.load(nw_ptr + offs_h).to(tl.float32)
-        pw = tl.load(pw_ptr + offs_h).to(tl.float32)
+        cw = tl.load(cw_ptr + offs_h)
         sumsq += tl.sum(v * v)
-        dotv += tl.sum(v * nw * pw)
+        dotv += tl.sum(v * cw)
         if HAS_SECOND:
-            nw2 = tl.load(nw2_ptr + offs_h).to(tl.float32)
-            pw2 = tl.load(pw2_ptr + offs_h).to(tl.float32)
-            dotv2 += tl.sum(v * nw2 * pw2)
+            cw2 = tl.load(cw2_ptr + offs_h)
+            dotv2 += tl.sum(v * cw2)
     rrms = 1.0 / tl.sqrt(sumsq / H + eps)
     tl.store(scores_ptr + pid_t * stride_sm + j, dotv * rrms)
     if HAS_SECOND:
@@ -212,6 +208,17 @@ def _attn_res_combine_norm_kernel(
         )
 
 
+def _attn_res_cw(proj: ReplicatedLinear, norm: RMSNorm) -> torch.Tensor:
+    """Cached fp32 product of the (frozen) rmsnorm weight and score-proj
+    weight: dot(RMSNorm(v), pw) == dot(v, nw*pw) / rms(v). fp32 keeps the
+    in-kernel math identical to loading both factors separately."""
+    cw = getattr(proj, "_attn_res_cw", None)
+    if cw is None:
+        cw = (norm.weight.float() * proj.weight.view(-1).float()).contiguous()
+        proj._attn_res_cw = cw
+    return cw
+
+
 def _attn_res_scores(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -231,14 +238,13 @@ def _attn_res_scores(
         if has_second
         else scores  # dummy, unused when HAS_SECOND=False
     )
+    cw = _attn_res_cw(proj, norm)
     _attn_res_scores_kernel[(T, num_valid_blocks + 1)](
         prefix_sum,
         block_residual,
-        norm.weight,
-        proj.weight.view(-1),
+        cw,
         scores,
-        norm2.weight if has_second else norm.weight,
-        proj2.weight.view(-1) if has_second else proj.weight.view(-1),
+        _attn_res_cw(proj2, norm2) if has_second else cw,
         scores2,
         num_valid_blocks,
         norm.variance_epsilon,
@@ -273,14 +279,13 @@ def _attn_res_prefix_update(
     # Reuse the scores kernel for a single row: NVB=0 makes row 0 take the
     # prefix path; aim the output at column `idx` via a pointer offset.
     scores_at_idx = scores[:, idx:]
+    cw = _attn_res_cw(proj, norm)
     _attn_res_scores_kernel[(T, 1)](
         new,
         new,  # block_ptr unused when NVB == 0
-        norm.weight,
-        proj.weight.view(-1),
+        cw,
         scores_at_idx,
-        norm.weight,  # dummy second set (HAS_SECOND=False)
-        proj.weight.view(-1),
+        cw,  # dummy second set (HAS_SECOND=False)
         scores_at_idx,
         0,
         norm.variance_epsilon,
@@ -1656,6 +1661,22 @@ class KimiK3LinearForCausalLM(nn.Module):
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+
+        # Post-load: precompute the attn-res combined score weights BEFORE
+        # cuda graph capture (the lazy path inside _attn_res_cw would bake
+        # the multiply into every captured graph replay otherwise).
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if getattr(layer, "use_attn_residuals", False):
+                _attn_res_cw(
+                    layer.self_attention_res_proj, layer.self_attention_res_norm
+                )
+                _attn_res_cw(layer.mlp_res_proj, layer.mlp_res_norm)
+        if hasattr(self.model, "output_attn_res_proj"):
+            _attn_res_cw(
+                self.model.output_attn_res_proj, self.model.output_attn_res_norm
+            )
 
 
 # ---------------------------------------------------------------------------
