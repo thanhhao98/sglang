@@ -82,11 +82,15 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# Latent MoE TP reduction strategy (A/B):
+# Latent MoE TP reduction strategy:
+#   "baseline" - two separate all-reduces (routed latent, then shared)
 #   "concat"   - concat routed latent + shared partials, single all-reduce
 #   "fi_fused" - flashinfer fused allreduce+rmsnorm for the latent reduce
-#   "baseline" - two separate all-reduces
-_K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE", "concat")
+# A/B on 8xB300 bs=1 decode (2026-07-03): baseline 35.2 tok/s beats
+# concat 33.2 (21.5KB message falls off the one-shot allreduce path into
+# two-shot) and fi_fused 33.0 (lamport-buffer kernel + zero-residual
+# overhead loses to custom one-shot + tiny rmsnorm at 7KB messages).
+_K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE", "baseline")
 
 
 @triton.jit
