@@ -93,13 +93,20 @@ def _cdiv(a: int, b: int) -> int:
 _K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE", "baseline")
 
 
+_ATTN_RES_MAX_B = 16
+_ATTN_RES_BLOCK_H = 1024
+
+
 @triton.jit
 def _attn_res_scores_kernel(
     prefix_ptr,  # [T, H]
     block_ptr,  # [T, NB_total, H]
-    nw_ptr,  # [H] rmsnorm weight
-    pw_ptr,  # [H] proj weight (hidden -> 1 score)
-    scores_ptr,  # [T, MAX_B] fp32 out
+    nw_ptr,  # [H] rmsnorm weight (score set 1)
+    pw_ptr,  # [H] proj weight (score set 1)
+    scores_ptr,  # [T, MAX_B] fp32 out (set 1)
+    nw2_ptr,  # [H] rmsnorm weight (score set 2, optional)
+    pw2_ptr,  # [H] proj weight (score set 2, optional)
+    scores2_ptr,  # [T, MAX_B] fp32 out (set 2, optional)
     NVB,
     eps,
     stride_pm,
@@ -108,14 +115,20 @@ def _attn_res_scores_kernel(
     stride_sm,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    HAS_SECOND: tl.constexpr,
 ):
-    """s_j = dot(RMSNorm(v_j), pw) for one (token, row). Row NVB = prefix_sum."""
+    """Per-(token, row) score(s): s_j = dot(RMSNorm(v_j), pw). Row NVB is
+    prefix_sum. With HAS_SECOND, also computes the score under a second
+    (norm, proj) weight set in the same pass — the rows are frozen between
+    block writes, so the MLP-side aggregation of the same layer can reuse
+    them without re-reading v (halves pass-1 memory traffic per layer)."""
     pid_t = tl.program_id(0)
     j = tl.program_id(1)
     if j > NVB:
         return
     sumsq = 0.0
     dotv = 0.0
+    dotv2 = 0.0
     for h0 in tl.static_range(0, H, BLOCK_H):
         offs_h = h0 + tl.arange(0, BLOCK_H)
         if j < NVB:
@@ -127,29 +140,81 @@ def _attn_res_scores_kernel(
         pw = tl.load(pw_ptr + offs_h).to(tl.float32)
         sumsq += tl.sum(v * v)
         dotv += tl.sum(v * nw * pw)
+        if HAS_SECOND:
+            nw2 = tl.load(nw2_ptr + offs_h).to(tl.float32)
+            pw2 = tl.load(pw2_ptr + offs_h).to(tl.float32)
+            dotv2 += tl.sum(v * nw2 * pw2)
     rrms = 1.0 / tl.sqrt(sumsq / H + eps)
     tl.store(scores_ptr + pid_t * stride_sm + j, dotv * rrms)
+    if HAS_SECOND:
+        tl.store(scores2_ptr + pid_t * stride_sm + j, dotv2 * rrms)
 
 
 @triton.jit
-def _attn_res_combine_kernel(
+def _attn_res_prefix_kernel(
+    old_ptr,  # [T, H] previous prefix_sum (ignored when HAS_OLD=False)
+    delta_ptr,  # [T, H] sublayer output to accumulate
+    new_ptr,  # [T, H] out: updated prefix_sum
+    nw_ptr,  # [H] rmsnorm weight for the score
+    pw_ptr,  # [H] proj weight for the score
+    scores_ptr,  # [T, MAX_B] fp32; score stored at column IDX
+    IDX,
+    eps,
+    stride_om,
+    stride_dm,
+    stride_nm,
+    stride_sm,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HAS_OLD: tl.constexpr,
+):
+    """Fused residual update + score: new = old + delta (or just delta at
+    block-write layers), written out, plus its RMSNorm+proj score for the
+    following aggregation — replaces a separate elementwise add kernel and
+    one (T,1) scores launch."""
+    pid_t = tl.program_id(0)
+    sumsq = 0.0
+    dotv = 0.0
+    for h0 in tl.static_range(0, H, BLOCK_H):
+        offs_h = h0 + tl.arange(0, BLOCK_H)
+        d = tl.load(delta_ptr + pid_t * stride_dm + offs_h).to(tl.float32)
+        if HAS_OLD:
+            o = tl.load(old_ptr + pid_t * stride_om + offs_h).to(tl.float32)
+            v = o + d
+        else:
+            v = d
+        tl.store(new_ptr + pid_t * stride_nm + offs_h, v.to(new_ptr.dtype.element_ty))
+        nw = tl.load(nw_ptr + offs_h).to(tl.float32)
+        pw = tl.load(pw_ptr + offs_h).to(tl.float32)
+        sumsq += tl.sum(v * v)
+        dotv += tl.sum(v * nw * pw)
+    rrms = 1.0 / tl.sqrt(sumsq / H + eps)
+    tl.store(scores_ptr + pid_t * stride_sm + IDX, dotv * rrms)
+
+
+@triton.jit
+def _attn_res_combine_norm_kernel(
     prefix_ptr,
     block_ptr,
     scores_ptr,  # [T, MAX_B] fp32
-    out_ptr,  # [T, H]
+    out_nw_ptr,  # [H] output RMSNorm weight
+    out_ptr,  # [T, H] normed aggregate
     NVB,
+    out_eps,
     stride_pm,
     stride_bm,
     stride_bb,
     stride_sm,
     stride_om,
+    H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     MAX_B: tl.constexpr,
 ):
-    """out[t, chunk] = sum_j softmax(scores)_j * v_j[chunk]."""
+    """out[t] = RMSNorm(sum_j softmax(scores)_j * v_j) * out_nw. One CTA per
+    token, full-H loop (the fused norm needs the full-row sumsq), fusing the
+    input_layernorm / post_attention_layernorm that always follows the
+    aggregation."""
     pid_t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
 
     offs_b = tl.arange(0, MAX_B)
     mask_b = offs_b <= NVB
@@ -162,43 +227,61 @@ def _attn_res_combine_kernel(
     e = tl.where(mask_b, tl.exp(scores - m), 0.0)
     p = e / tl.sum(e, axis=0)
 
-    acc = tl.zeros([BLOCK_H], tl.float32)
-    for j in range(0, NVB + 1):
-        if j < NVB:
-            v_raw = tl.load(block_ptr + pid_t * stride_bm + j * stride_bb + offs_h)
-        else:
-            v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
-        p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
-        acc += p_j * v_raw.to(tl.float32)
-    tl.store(out_ptr + pid_t * stride_om + offs_h, acc.to(out_ptr.dtype.element_ty))
+    # Pass 1 over H: aggregate + accumulate sumsq for the fused norm.
+    sumsq = 0.0
+    for h0 in tl.static_range(0, H, BLOCK_H):
+        offs_h = h0 + tl.arange(0, BLOCK_H)
+        acc = tl.zeros([BLOCK_H], tl.float32)
+        for j in range(0, NVB + 1):
+            if j < NVB:
+                v_raw = tl.load(block_ptr + pid_t * stride_bm + j * stride_bb + offs_h)
+            else:
+                v_raw = tl.load(prefix_ptr + pid_t * stride_pm + offs_h)
+            p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
+            acc += p_j * v_raw.to(tl.float32)
+        sumsq += tl.sum(acc * acc)
+        # Stash the raw aggregate chunk; renormalized in pass 2.
+        tl.store(out_ptr + pid_t * stride_om + offs_h, acc.to(out_ptr.dtype.element_ty))
+    rrms = 1.0 / tl.sqrt(sumsq / H + out_eps)
+    # Pass 2: scale in place with the norm weight.
+    for h0 in tl.static_range(0, H, BLOCK_H):
+        offs_h = h0 + tl.arange(0, BLOCK_H)
+        a = tl.load(out_ptr + pid_t * stride_om + offs_h).to(tl.float32)
+        out_nw = tl.load(out_nw_ptr + offs_h).to(tl.float32)
+        tl.store(
+            out_ptr + pid_t * stride_om + offs_h,
+            (a * rrms * out_nw).to(out_ptr.dtype.element_ty),
+        )
 
 
-def _apply_attn_res(
+def _attn_res_scores(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
     proj: ReplicatedLinear,
     norm: RMSNorm,
     num_valid_blocks: int,
-) -> torch.Tensor:
-    """Fused attention-residual aggregation, two kernels:
-    (1) per-(token,row) RMSNorm+proj score; (2) softmax + weighted sum.
-    Replaces cat + RMSNorm + proj GEMV + softmax + bmm (6+ kernels), with
-    (T, rows) x (T, H-chunks) grids so bs=1 decode still fills SMs.
-    """
-    if num_valid_blocks <= 0:
-        return prefix_sum
-
+    proj2: Optional[ReplicatedLinear] = None,
+    norm2: Optional[RMSNorm] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     T, H = prefix_sum.shape
-    MAX_B = 16
-    BLOCK_H = 1024
-    scores = torch.empty((T, MAX_B), dtype=torch.float32, device=prefix_sum.device)
-    out = torch.empty_like(prefix_sum)
+    scores = torch.empty(
+        (T, _ATTN_RES_MAX_B), dtype=torch.float32, device=prefix_sum.device
+    )
+    has_second = proj2 is not None
+    scores2 = (
+        torch.empty_like(scores)
+        if has_second
+        else scores  # dummy, unused when HAS_SECOND=False
+    )
     _attn_res_scores_kernel[(T, num_valid_blocks + 1)](
         prefix_sum,
         block_residual,
         norm.weight,
         proj.weight.view(-1),
         scores,
+        norm2.weight if has_second else norm.weight,
+        proj2.weight.view(-1) if has_second else proj.weight.view(-1),
+        scores2,
         num_valid_blocks,
         norm.variance_epsilon,
         prefix_sum.stride(0),
@@ -206,25 +289,90 @@ def _apply_attn_res(
         block_residual.stride(1),
         scores.stride(0),
         H=H,
-        BLOCK_H=BLOCK_H,
+        BLOCK_H=_ATTN_RES_BLOCK_H,
+        HAS_SECOND=has_second,
         num_warps=8,
     )
-    _attn_res_combine_kernel[(T, H // BLOCK_H)](
+    return scores, (scores2 if has_second else None)
+
+
+def _attn_res_prefix_update(
+    old: Optional[torch.Tensor],
+    delta: torch.Tensor,
+    proj: ReplicatedLinear,
+    norm: RMSNorm,
+    scores: torch.Tensor,
+    idx: int,
+) -> torch.Tensor:
+    T, H = delta.shape
+    new = torch.empty_like(delta)
+    _attn_res_prefix_kernel[(T,)](
+        old if old is not None else delta,
+        delta,
+        new,
+        norm.weight,
+        proj.weight.view(-1),
+        scores,
+        idx,
+        norm.variance_epsilon,
+        (old if old is not None else delta).stride(0),
+        delta.stride(0),
+        new.stride(0),
+        scores.stride(0),
+        H=H,
+        BLOCK_H=_ATTN_RES_BLOCK_H,
+        HAS_OLD=old is not None,
+        num_warps=8,
+    )
+    return new
+
+
+def _attn_res_combine_norm(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    scores: torch.Tensor,
+    num_valid_blocks: int,
+    out_norm: RMSNorm,
+) -> torch.Tensor:
+    T, H = prefix_sum.shape
+    out = torch.empty_like(prefix_sum)
+    _attn_res_combine_norm_kernel[(T,)](
         prefix_sum,
         block_residual,
         scores,
+        out_norm.weight,
         out,
         num_valid_blocks,
+        out_norm.variance_epsilon,
         prefix_sum.stride(0),
         block_residual.stride(0),
         block_residual.stride(1),
         scores.stride(0),
         out.stride(0),
-        BLOCK_H=BLOCK_H,
-        MAX_B=MAX_B,
-        num_warps=4,
+        H=H,
+        BLOCK_H=_ATTN_RES_BLOCK_H,
+        MAX_B=_ATTN_RES_MAX_B,
+        num_warps=8,
     )
     return out
+
+
+def _apply_attn_res_fused(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: ReplicatedLinear,
+    norm: RMSNorm,
+    num_valid_blocks: int,
+    out_norm: RMSNorm,
+) -> torch.Tensor:
+    """Aggregation + fused following RMSNorm (every aggregation in K3 is
+    immediately followed by one). num_valid_blocks must be > 0."""
+    scores, _ = _attn_res_scores(
+        prefix_sum, block_residual, proj, norm, num_valid_blocks
+    )
+    return _attn_res_combine_norm(
+        prefix_sum, block_residual, scores, num_valid_blocks, out_norm
+    )
 
 
 def _apply_attn_res_torch(
@@ -1071,40 +1219,60 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prefix_sum = hidden_states
-        hidden_states = _apply_attn_res(
+        nvb = self.prev_valid_blocks
+        mlp_valid_blocks = nvb + (1 if self.is_block_write_layer else 0)
+
+        # Scores pass: attention-side scores AND (same frozen rows) the
+        # MLP-side scores in one read of the row data. scores2 row layout
+        # already matches the MLP-side aggregation:
+        #   - non-write layers: rows 0..nvb-1 frozen blocks; index nvb gets
+        #     overwritten below with the updated-prefix score.
+        #   - write layers: the new block IS prefix_sum, whose mlp-score
+        #     landed at index nvb == block_write_idx; the updated prefix's
+        #     score goes to index nvb+1.
+        scores, scores2 = _attn_res_scores(
             prefix_sum,
             block_residual,
             self.self_attention_res_proj,
             self.self_attention_res_norm,
-            self.prev_valid_blocks,
+            nvb,
+            proj2=self.mlp_res_proj,
+            norm2=self.mlp_res_norm,
         )
+        if nvb > 0:
+            hidden_states = _attn_res_combine_norm(
+                prefix_sum, block_residual, scores, nvb, self.input_layernorm
+            )
+        else:
+            # Layer 0: aggregation is a passthrough; just norm.
+            hidden_states = self.input_layernorm(prefix_sum)
 
         if self.is_block_write_layer:
             block_residual[:, self.block_write_idx, :].copy_(prefix_sum)
-            prefix_sum = None
 
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._run_self_attn(
+        attn_out = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
 
-        if prefix_sum is not None:
-            prefix_sum = prefix_sum + hidden_states
-        else:
-            prefix_sum = hidden_states
-
-        mlp_valid_blocks = self.prev_valid_blocks + (
-            1 if self.is_block_write_layer else 0
-        )
-        hidden_states = _apply_attn_res(
-            prefix_sum,
-            block_residual,
+        # Fused residual update + its MLP-side score (replaces a separate
+        # elementwise add). At write layers the prefix stream restarts from
+        # the attention output alone.
+        prefix_sum = _attn_res_prefix_update(
+            None if self.is_block_write_layer else prefix_sum,
+            attn_out,
             self.mlp_res_proj,
             self.mlp_res_norm,
+            scores2,
             mlp_valid_blocks,
         )
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = _attn_res_combine_norm(
+            prefix_sum,
+            block_residual,
+            scores2,
+            mlp_valid_blocks,
+            self.post_attention_layernorm,
+        )
         hidden_states = self.mlp(hidden_states)
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, block_residual
@@ -1224,14 +1392,15 @@ class KimiK3LinearModel(nn.Module):
 
         if hidden_states.shape[0] != 0:
             if use_attn_res:
-                hidden_states = _apply_attn_res(
+                # Final aggregation with the model norm fused into combine.
+                hidden_states = _apply_attn_res_fused(
                     hidden_states,
                     residual,
                     self.output_attn_res_proj,
                     self.output_attn_res_norm,
                     attn_res_block_num,
+                    out_norm=self.norm,
                 )
-                hidden_states = self.norm(hidden_states)
             else:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
