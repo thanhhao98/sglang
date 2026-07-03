@@ -347,7 +347,8 @@ def _attn_res_combine_kernel(
 
 # Below this token count, the norm-fused (T,)-grid combine cannot fill the
 # SMs (one CTA per token); use the chunked combine + separate norm instead.
-_ATTN_RES_FUSED_NORM_MIN_T = 64
+# Env-overridable for A/B testing.
+_ATTN_RES_FUSED_NORM_MIN_T = int(os.environ.get("SGLANG_K3_ATTN_RES_FUSED_MIN_T", "64"))
 
 
 def _attn_res_combine_norm(
