@@ -1261,24 +1261,40 @@ class KimiK3DecoderLayer(nn.Module):
         prefix_sum = hidden_states
         nvb = self.prev_valid_blocks
         mlp_valid_blocks = nvb + (1 if self.is_block_write_layer else 0)
-
-        # Scores pass: attention-side scores AND (same frozen rows) the
-        # MLP-side scores in one read of the row data. scores2 row layout
-        # already matches the MLP-side aggregation:
-        #   - non-write layers: rows 0..nvb-1 frozen blocks; index nvb gets
-        #     overwritten below with the updated-prefix score.
-        #   - write layers: the new block IS prefix_sum, whose mlp-score
-        #     landed at index nvb == block_write_idx; the updated prefix's
-        #     score goes to index nvb+1.
-        scores, scores2 = _attn_res_scores(
-            prefix_sum,
-            block_residual,
-            self.self_attention_res_proj,
-            self.self_attention_res_norm,
-            nvb,
-            proj2=self.mlp_res_proj,
-            norm2=self.mlp_res_norm,
+        # The dual-score pass (attention-side + MLP-side frozen-row scores in
+        # one read) and the norm-fused combine are BANDWIDTH optimizations:
+        # at small T (decode) all row-CTAs run in parallel anyway, so sharing
+        # saves no wall clock while the extra cw2 loads and the single-CTA
+        # prefix-score kernel sit on the critical path. Dispatch by T.
+        use_shared_scores = (
+            prefix_sum.shape[0] >= _ATTN_RES_FUSED_NORM_MIN_T and nvb > 0
         )
+
+        if use_shared_scores:
+            # scores2 row layout matches the MLP-side aggregation:
+            #   - non-write layers: rows 0..nvb-1 frozen blocks; index nvb is
+            #     overwritten below with the updated-prefix score.
+            #   - write layers: the new block IS prefix_sum, whose mlp-score
+            #     landed at index nvb == block_write_idx; the updated
+            #     prefix's score goes to index nvb+1.
+            scores, scores2 = _attn_res_scores(
+                prefix_sum,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                nvb,
+                proj2=self.mlp_res_proj,
+                norm2=self.mlp_res_norm,
+            )
+        elif nvb > 0:
+            scores, _ = _attn_res_scores(
+                prefix_sum,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                nvb,
+            )
+
         if nvb > 0:
             hidden_states = _attn_res_combine_norm(
                 prefix_sum, block_residual, scores, nvb, self.input_layernorm
@@ -1294,17 +1310,29 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, positions, forward_batch, zero_allocator
         )
 
-        # Fused residual update + its MLP-side score (replaces a separate
-        # elementwise add). At write layers the prefix stream restarts from
-        # the attention output alone.
-        prefix_sum = _attn_res_prefix_update(
-            None if self.is_block_write_layer else prefix_sum,
-            attn_out,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            scores2,
-            mlp_valid_blocks,
-        )
+        if use_shared_scores:
+            # Residual update + only the updated-prefix score (frozen-row
+            # scores were computed above).
+            prefix_sum = _attn_res_prefix_update(
+                None if self.is_block_write_layer else prefix_sum,
+                attn_out,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                scores2,
+                mlp_valid_blocks,
+            )
+        else:
+            if self.is_block_write_layer:
+                prefix_sum = attn_out
+            else:
+                prefix_sum = prefix_sum + attn_out
+            scores2, _ = _attn_res_scores(
+                prefix_sum,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                mlp_valid_blocks,
+            )
 
         hidden_states = _attn_res_combine_norm(
             prefix_sum,
