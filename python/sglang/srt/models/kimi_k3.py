@@ -6,6 +6,7 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import os
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
@@ -79,6 +80,13 @@ from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+# Latent MoE TP reduction strategy (A/B):
+#   "concat"   - concat routed latent + shared partials, single all-reduce
+#   "fi_fused" - flashinfer fused allreduce+rmsnorm for the latent reduce
+#   "baseline" - two separate all-reduces
+_K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE", "concat")
 
 
 @triton.jit
@@ -439,16 +447,50 @@ class KimiK3MoE(nn.Module):
         if self.use_latent_moe:
             # TP-partial routed outputs must be summed in latent space BEFORE
             # non-linear transforms (RMSNorm): sum(RMSNorm(x_i)) != RMSNorm(sum(x_i)).
-            if routed_needs_reduce:
-                final_hidden_states = tensor_model_parallel_all_reduce(
-                    final_hidden_states
-                )
-            if self.routed_expert_norm is not None:
+            did_fused_norm = False
+            did_shared_reduce = False
+            if (
+                routed_needs_reduce
+                and shared_output is not None
+                and _K3_MOE_REDUCE_MODE == "concat"
+            ):
+                # One NCCL call instead of two: concat routed latent (3584)
+                # and shared (7168) partial sums into a single buffer.
+                buf = torch.cat((final_hidden_states, shared_output), dim=-1)
+                buf = tensor_model_parallel_all_reduce(buf)
+                final_hidden_states = buf[..., : self.moe_hidden_size].contiguous()
+                shared_output = buf[..., self.moe_hidden_size :]
+                did_shared_reduce = True
+            elif routed_needs_reduce:
+                if (
+                    _K3_MOE_REDUCE_MODE == "fi_fused"
+                    and self.routed_expert_norm is not None
+                ):
+                    # Fuse the latent all-reduce with the RMSNorm epilogue.
+                    from sglang.srt.layers.flashinfer_comm_fusion import (
+                        flashinfer_allreduce_residual_rmsnorm,
+                    )
+
+                    zero_res = torch.zeros_like(final_hidden_states)
+                    norm_out, _ = flashinfer_allreduce_residual_rmsnorm(
+                        final_hidden_states,
+                        zero_res,
+                        self.routed_expert_norm.weight,
+                        eps=self.routed_expert_norm.variance_epsilon,
+                    )
+                    if norm_out is not None:
+                        final_hidden_states = norm_out
+                        did_fused_norm = True
+                if not did_fused_norm:
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
+            if self.routed_expert_norm is not None and not did_fused_norm:
                 final_hidden_states = self.routed_expert_norm(final_hidden_states)
             # up_proj is replicated, so the routed output is now fully reduced.
             final_hidden_states, _ = self.routed_expert_up_proj(final_hidden_states)
             if shared_output is not None:
-                if self.tp_size > 1:
+                if self.tp_size > 1 and not did_shared_reduce:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
                 final_hidden_states = final_hidden_states + shared_output
         else:
