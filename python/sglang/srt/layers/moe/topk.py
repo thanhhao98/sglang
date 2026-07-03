@@ -1469,7 +1469,22 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
     else:
         num_experts = gating_output.shape[1]
-        if _is_cuda and num_experts == 384 and num_expert_group == 1:
+        # The JIT triton router (single fused kernel: scoring + bias + topk +
+        # renorm) handles the ungrouped case with arbitrary num_experts/topk.
+        # Original user: Kimi K2 (384 experts). Also dispatch shapes the other
+        # fused kernels cannot cover, e.g. Kimi K3 (896 experts, top-16):
+        # fused_topk_deepseek needs pow2 experts + topk<=8, jit_grouped_topk
+        # needs experts<=512 + topk<=8.
+        _jit_gate_ok = (
+            _is_cuda
+            and num_expert_group == 1
+            and (topk_group is None or topk_group == 1)
+            and (
+                num_experts == 384
+                or (num_experts <= 1024 and (num_experts > 512 or topk > 8))
+            )
+        )
+        if _jit_gate_ok:
             # ===== TO BE REFACTORED ====
             _use_jit_bf16_gate = False
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -1498,7 +1513,7 @@ def biased_grouped_topk_gpu(
 
             return jit_gate(
                 gating_output.to(dtype=torch.float32),
-                correction_bias,
+                correction_bias.to(dtype=torch.float32),
                 topk=topk,
                 scoring_func="sigmoid",
                 num_fused_shared_experts=num_fused_shared_experts,
