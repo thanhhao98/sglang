@@ -1092,6 +1092,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
+        # KDA backend's track-snapshot writes (decode + extend) so donated
+        # slots hold real states for prefix-cache restores.
+        "KimiK3ForConditionalGeneration",
     }
 )
 

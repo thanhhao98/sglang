@@ -254,6 +254,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # Needed by the extra_buffer track path (_init_track_conv_indices);
+        # mirrors Mamba2/GDN backends and GLM5-Next's KDA hicache support.
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         # KDA FlashInfer speculative decode (target_verify) is linear-chain only --
