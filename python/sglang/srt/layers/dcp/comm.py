@@ -436,6 +436,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # REQUIRED barrier before the first alltoall: every rank must finish init,
     # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
+    # cp_size not stored: dcp_a2a_lse_reduce recomputes N from cp_group at call time.
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
