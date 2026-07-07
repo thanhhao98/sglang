@@ -297,6 +297,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
+        if dcp_enabled():
+            # DCP decode uses a LOCAL block table over (page_size*dcp_world) global
+            # pages — fewer, differently-strided columns than the full buffer above.
+            # Give it its OWN contiguous buffer: a column-slice of the full buffer
+            # would have row stride = full width while the flashmla index kernel is
+            # told shape[1], corrupting the table. Full width here == shape[1].
+            eff_page = self.page_size * get_attention_dcp_world_size()
+            npb = get_num_page_per_block_flashmla(eff_page)
+            dcp_blocks = (
+                triton.cdiv(triton.cdiv(self.max_context_len, eff_page), npb) * npb
+            )
+            self.dcp_decode_cuda_graph_kv_indices = torch.full(
+                (max_bs, dcp_blocks), -1, dtype=torch.int32, device=self.device
+            )
         num_tokens_per_bs = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
@@ -374,24 +388,22 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Capture with full width so future longer sequences are safe during replay.
         if dcp_enabled() and forward_mode.is_decode_or_idle():
-            # DCP decode: the local block table is over the rank's compacted
-            # strided slice, so it uses (page_size*dcp_world)-granular global pages
-            # (local page N == global page N). Fewer columns than the full-width
-            # buffer, so slice it. Capture a constant local max_seq_len (upper
-            # bound = ceil(max_context_len / dcp_world)) to avoid a host sync in
-            # forward_decode at replay.
+            # DCP decode: local block table over (page_size*dcp_world)-granular
+            # global pages (local page N == global page N). Use the dedicated
+            # contiguous DCP buffer at its full width so shape[1] == row stride
+            # (the flashmla index kernel is told shape[1]). Capture a constant
+            # local max_seq_len (upper bound = ceil(max_context_len / dcp_world))
+            # so forward_decode avoids a host sync at replay.
             dcp_world = get_attention_dcp_world_size()
-            eff_page = self.page_size * dcp_world
-            npb = get_num_page_per_block_flashmla(eff_page)
-            max_blocks_per_seq = (
-                triton.cdiv(triton.cdiv(self.max_context_len, eff_page), npb) * npb
-            )
+            block_kv_indices = self.dcp_decode_cuda_graph_kv_indices[:bs]
             metadata.dcp_local_max_seq_len = max(
                 (self.max_context_len + dcp_world - 1) // dcp_world, 1
             )
         else:
             max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
+            block_kv_indices = self.decode_cuda_graph_kv_indices[
+                :bs, :max_blocks_per_seq
+            ]
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
 
