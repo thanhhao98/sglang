@@ -34,6 +34,12 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.dcp import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+    get_dcp_lens,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -549,14 +555,48 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.seq_lens_q = forward_batch.extend_seq_lens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
 
-            max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            block_kv_indices = self._create_block_kv_indices(
-                bs,
-                max_seqlen_pad,
-                forward_batch.req_pool_indices,
-                seq_lens,
-                seq_lens.device,
-            )
+            if dcp_enabled() and forward_batch.forward_mode.is_decode_or_idle():
+                # DCP decode: build a LOCAL block table over this rank's compacted
+                # strided KV slice. The KV allocator uses (page_size*dcp_world)-
+                # aligned global pages and stores each owned token at slot//world,
+                # so the local physical page index equals slot//(page_size*world)
+                # (local page N == global page N). Reinterpreting the flashmla
+                # index kernel at PAGED_SIZE=page_size*dcp_world over the GLOBAL
+                # positions yields exactly those local page indices. seq_lens here
+                # is global; the kernel is fed LOCAL seq_lens in forward_decode.
+                dcp_world = get_attention_dcp_world_size()
+                eff_page = self.page_size * dcp_world
+                npb = get_num_page_per_block_flashmla(eff_page)
+                max_local_blocks = (
+                    triton.cdiv(triton.cdiv(int(max_seq), eff_page), npb) * npb
+                )
+                block_kv_indices = torch.full(
+                    (bs, max_local_blocks),
+                    -1,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                create_flashmla_kv_indices_triton[
+                    (bs, get_num_kv_index_blocks_flashmla(max_local_blocks, eff_page))
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    seq_lens,
+                    None,
+                    block_kv_indices,
+                    self.req_to_token.stride(0),
+                    max_local_blocks,
+                    PAGED_SIZE=eff_page,
+                )
+            else:
+                max_seqlen_pad = self._calc_padded_blocks(max_seq)
+                block_kv_indices = self._create_block_kv_indices(
+                    bs,
+                    max_seqlen_pad,
+                    forward_batch.req_pool_indices,
+                    seq_lens,
+                    seq_lens.device,
+                )
 
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
             self.forward_decode_metadata.max_seq_len_k = int(max_seq)
@@ -626,8 +666,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        return_lse: bool = False,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        causal_seqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Hook for subclasses to swap the decode/spec-verify kernel."""
+        """Hook for subclasses to swap the decode/spec-verify kernel.
+
+        The DCP params (``return_lse``/``cp_world``/``cp_rank``/``causal_seqs``)
+        are honored only by subclasses whose kernel supports decode context
+        parallelism (tokenspeed_mla). The base TRT-LLM kernel cannot emit the
+        per-rank LSE the cross-rank merge needs, so DCP is rejected here.
+        """
+        if return_lse or cp_world > 1:
+            raise NotImplementedError(
+                "trtllm_mla decode kernel does not support decode context "
+                "parallelism (needs per-rank LSE, which trtllm_batch_decode_mla "
+                "cannot emit); use --attention-backend tokenspeed_mla for DCP."
+            )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
@@ -785,6 +841,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
+
+        if forward_batch.forward_mode.is_decode() and dcp_enabled():
+            # DCP: this rank holds a compacted strided KV slice (block_kv_indices
+            # were built over global pages in init_forward_metadata, see the DCP
+            # branch there). Each rank runs full-head Q over its local shard and
+            # returns base-2 LSE; forward_mla merges across ranks via
+            # dcp_a2a_lse_reduce. seq_lens/max_seq_len are LOCAL, causal_seqs is
+            # the per-request GLOBAL bound (kernel derives the local cutoff).
+            dcp_world = get_attention_dcp_world_size()
+            dcp_rank = get_attention_dcp_rank()
+            global_seq_lens = forward_batch.seq_lens.to(torch.int32)
+            local_seq_lens = get_dcp_lens(global_seq_lens, dcp_world, dcp_rank).to(
+                torch.int32
+            )
+            out, lse = self._run_decode_kernel(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=metadata.block_kv_indices,
+                seq_lens=local_seq_lens,
+                max_seq_len=(
+                    int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
+                ),
+                layer=layer,
+                return_lse=True,
+                cp_world=dcp_world,
+                cp_rank=dcp_rank,
+                causal_seqs=global_seq_lens,
+            )
+            output = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            # LSE [B, q_len=1, H] -> [B, H] for the cross-rank merge.
+            lse = lse.reshape(output.shape[0], layer.tp_q_head_num)
+            return output, lse
 
         raw_out = self._run_decode_kernel(
             query=query,
