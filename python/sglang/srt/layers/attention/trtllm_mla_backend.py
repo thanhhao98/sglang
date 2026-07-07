@@ -850,14 +850,39 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             local_seq_lens = get_dcp_lens(global_seq_lens, dcp_world, dcp_rank).to(
                 torch.int32
             )
+            local_max = (
+                int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
+            )
+            n_tokens = query.shape[0]
+            if local_max <= 0:
+                # This rank owns no KV for any request in the batch (every
+                # seq_len < dcp_world here, e.g. the seq_len=1 decode warmup).
+                # The tokenspeed kernel rejects max_seq_len==0, so emit an empty
+                # partial directly: zero output + -inf base-2 LSE, which
+                # dcp_a2a_lse_reduce weights to exactly zero in the merge. Match
+                # the kernel's fp8-path output dtype (bfloat16) so the a2a
+                # byte-transport agrees across ranks.
+                out_dtype = (
+                    torch.bfloat16
+                    if self.data_type == torch.float8_e4m3fn
+                    else self.data_type
+                )
+                output = query.new_zeros(
+                    (n_tokens, layer.tp_q_head_num * layer.v_head_dim),
+                    dtype=out_dtype,
+                )
+                lse = query.new_full(
+                    (n_tokens, layer.tp_q_head_num),
+                    float("-inf"),
+                    dtype=torch.float32,
+                )
+                return output, lse
             out, lse = self._run_decode_kernel(
                 query=query,
                 kv_cache=kv_cache,
                 block_tables=metadata.block_kv_indices,
                 seq_lens=local_seq_lens,
-                max_seq_len=(
-                    int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
-                ),
+                max_seq_len=local_max,
                 layer=layer,
                 return_lse=True,
                 cp_world=dcp_world,
