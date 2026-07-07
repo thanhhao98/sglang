@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.dcp import get_attention_dcp_world_size
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -116,8 +117,13 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
+            # Under DCP, forward_mla gathers Q to num_q_heads * dcp_world heads
+            # (all ranks' heads) before the per-rank local-shard attention, so the
+            # decode workspace must be sized for the full gathered head count.
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device,
+                self.num_q_heads * get_attention_dcp_world_size(),
+                self.kv_lora_rank,
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -279,7 +285,20 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        causal_seqs: Optional[torch.Tensor] = None,
+    ):
+        """Run the tokenspeed CuTe DSL MLA kernel (decode or padded multi-token verify).
+
+        Under DCP (``cp_world > 1``) ``block_tables``/``seq_lens`` must already
+        describe this rank's LOCAL compacted strided KV slice, ``causal_seqs`` is
+        the per-request GLOBAL causal bound, and ``return_lse`` yields the base-2
+        LSE the cross-rank merge (``dcp_a2a_lse_reduce``) consumes. Verified via
+        the CP-contract test (LOCAL layout + base-2 LSE); see
+        sglang-dflash/docs/findings/dcp-tokenspeed-contract.md.
+        """
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -301,6 +320,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             softmax_scale=softmax_scale,
             output_scale=output_scale,
             enable_pdl=is_arch_support_pdl(),
+            return_lse=return_lse,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            causal_seqs=causal_seqs,
         )
 
     def _run_prefill_kernel(
