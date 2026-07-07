@@ -126,6 +126,12 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    # DCP decode under CUDA graph: captured (constant) local max_seq_len for the
+    # tokenspeed kernel. Set at graph capture (over-provisioned to the local
+    # length of max_context_len) so forward_decode avoids a host sync (.item())
+    # during replay. Left None on the eager path, where forward_decode computes
+    # the exact local max directly.
+    dcp_local_max_seq_len: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -367,7 +373,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
         # Capture with full width so future longer sequences are safe during replay.
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        if dcp_enabled() and forward_mode.is_decode_or_idle():
+            # DCP decode: the local block table is over the rank's compacted
+            # strided slice, so it uses (page_size*dcp_world)-granular global pages
+            # (local page N == global page N). Fewer columns than the full-width
+            # buffer, so slice it. Capture a constant local max_seq_len (upper
+            # bound = ceil(max_context_len / dcp_world)) to avoid a host sync in
+            # forward_decode at replay.
+            dcp_world = get_attention_dcp_world_size()
+            eff_page = self.page_size * dcp_world
+            npb = get_num_page_per_block_flashmla(eff_page)
+            max_blocks_per_seq = (
+                triton.cdiv(triton.cdiv(self.max_context_len, eff_page), npb) * npb
+            )
+            metadata.dcp_local_max_seq_len = max(
+                (self.max_context_len + dcp_world - 1) // dcp_world, 1
+            )
+        else:
+            max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
@@ -400,12 +423,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
 
-        # Update block indices for new sequences.
+        # Update block indices for new sequences. DCP decode builds the LOCAL
+        # block table over global pages of size page_size*dcp_world (seq_lens is
+        # global here for decode); the resulting page indices address the rank's
+        # compacted local pool (local page N == global page N).
+        paged_size = self.page_size
+        if dcp_enabled() and forward_mode.is_decode_or_idle():
+            paged_size = self.page_size * get_attention_dcp_world_size()
         create_flashmla_kv_indices_triton[
             (
                 bs,
                 get_num_kv_index_blocks_flashmla(
-                    metadata.block_kv_indices.shape[1], self.page_size
+                    metadata.block_kv_indices.shape[1], paged_size
                 ),
             )
         ](
@@ -416,7 +445,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices,
             self.req_to_token.stride(0),
             metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
+            PAGED_SIZE=paged_size,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -855,44 +884,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             local_seq_lens = get_dcp_lens(global_seq_lens, dcp_world, dcp_rank).to(
                 torch.int32
             )
-            local_max = (
-                int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
-            )
-            n_tokens = query.shape[0]
-            if local_max <= 0:
-                # This rank owns no KV for any request in the batch (every
-                # seq_len < dcp_world here, e.g. the seq_len=1 decode warmup).
-                # The tokenspeed kernel rejects max_seq_len==0, so emit an empty
-                # partial directly: zero output + -inf base-2 LSE, which
-                # dcp_a2a_lse_reduce weights to exactly zero in the merge. Match
-                # the kernel's fp8-path output dtype (bfloat16) so the a2a
-                # byte-transport agrees across ranks.
-                out_dtype = (
-                    torch.bfloat16
-                    if self.data_type == torch.float8_e4m3fn
-                    else self.data_type
+            # A request this rank owns no tokens for (local seq_len == 0, e.g. every
+            # seq_len < dcp_world in the seq_len=1 decode warmup) makes the kernel
+            # emit NaN/garbage + lse 0 for that row (it does not crash as long as
+            # max_seq_len >= 1). Clamp max_seq_len to >=1, then mask those rows to a
+            # zero partial (-inf base-2 LSE) so dcp_a2a_lse_reduce weights them out.
+            # torch.where keeps this data-independent (no host sync / branch) so it
+            # is CUDA-graph safe. At least rank 0 owns position 0, so every request
+            # still has a real contributor across ranks.
+            # Under CUDA graph, max_seq_len is a captured constant from metadata
+            # (no host sync at replay); eager computes the exact local max.
+            local_max = metadata.dcp_local_max_seq_len
+            if local_max is None:
+                local_max = (
+                    int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
                 )
-                output = query.new_zeros(
-                    (n_tokens, layer.tp_q_head_num * layer.v_head_dim),
-                    dtype=out_dtype,
-                )
-                lse = query.new_full(
-                    (n_tokens, layer.tp_q_head_num),
-                    float("-inf"),
-                    dtype=torch.float32,
-                )
-                return output, lse
             out, lse = self._run_decode_kernel(
                 query=query,
                 kv_cache=kv_cache,
                 block_tables=metadata.block_kv_indices,
                 seq_lens=local_seq_lens,
-                max_seq_len=local_max,
+                max_seq_len=max(local_max, 1),
                 layer=layer,
                 return_lse=True,
                 cp_world=dcp_world,
                 cp_rank=dcp_rank,
                 causal_seqs=global_seq_lens,
+            )
+            # out [B, q_len=1, H, kv_lora], lse [B, q_len=1, H].
+            zero_owned = local_seq_lens == 0
+            out = torch.where(zero_owned.view(-1, 1, 1, 1), out.new_zeros(()), out)
+            lse = torch.where(
+                zero_owned.view(-1, 1, 1), lse.new_full((), float("-inf")), lse
             )
             output = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             # LSE [B, q_len=1, H] -> [B, H] for the cross-rank merge.
