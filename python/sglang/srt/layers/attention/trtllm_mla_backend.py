@@ -23,8 +23,11 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.dcp import (
+    dcp_a2a_lse_reduce,
     dcp_enabled,
+    dcp_lse_combine_triton,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
     get_dcp_lens,
@@ -752,13 +755,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cp_world: int = 1,
         cp_rank: int = 0,
         causal_seqs: Optional[torch.Tensor] = None,
+        causal_mask: Optional[bool] = None,
     ) -> torch.Tensor:
         """Hook for subclasses to swap the decode/spec-verify kernel.
 
-        The DCP params (``return_lse``/``cp_world``/``cp_rank``/``causal_seqs``)
-        are honored only by subclasses whose kernel supports decode context
-        parallelism (tokenspeed_mla). The base TRT-LLM kernel cannot emit the
-        per-rank LSE the cross-rank merge needs, so DCP is rejected here.
+        The DCP params (``return_lse``/``cp_world``/``cp_rank``/``causal_seqs``/
+        ``causal_mask``) are honored only by subclasses whose kernel supports
+        decode context parallelism (tokenspeed_mla). The base TRT-LLM kernel
+        cannot emit the per-rank LSE the cross-rank merge needs, so DCP is
+        rejected here; ``causal_mask`` is ignored (TRT-LLM applies its own).
         """
         if return_lse or cp_world > 1:
             raise NotImplementedError(
@@ -988,6 +993,111 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return output
 
+    def _forward_verify_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: "TRTLLMMLADecodeMetadata",
+    ) -> torch.Tensor:
+        """DCP target-verify via the validated 2-pass cascade.
+
+        q: [bs, T, H_full, head_dim] fp8 (gathered heads, H_full =
+        num_local_heads*dcp_world). k/k_rope: the T draft tokens' latent
+        (fp8, [bs*T, 1, kv_lora_rank] + [bs*T, 1, qk_rope_head_dim]).
+
+        Pass-1 folds the NON-causal prefix over this rank's strided slice
+        (return_lse) and a2a-merges across ranks; pass-2 folds the CAUSAL
+        draft chain LOCALLY (drafts arrive non-sharded via k/k_rope); the two
+        partials are combined by base-2 online softmax. Returns the final
+        [bs*T, H_local*kv_lora_rank]. See dcp-tokenspeed-contract.md §5 (probes
+        883122 rel 0.011, 883458 rel 0.009).
+        """
+        dcp_world = get_attention_dcp_world_size()
+        dcp_rank = get_attention_dcp_rank()
+        bs, T, H_full = q.shape[0], q.shape[1], layer.tp_q_head_num
+        H_local = H_full // dcp_world
+        N = bs * T
+        vd = layer.v_head_dim
+
+        # ---- Pass-1: non-causal prefix fold over the local strided slice ----
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        global_prefix = forward_batch.seq_lens.to(torch.int32)  # prefix = seq_lens_k - T
+        local_prefix = get_dcp_lens(global_prefix, dcp_world, dcp_rank).to(torch.int32)
+        local_prefix_max = metadata.dcp_prefix_local_max
+        if local_prefix_max is None:
+            local_prefix_max = (
+                int(local_prefix.max().item()) if local_prefix.numel() else 0
+            )
+        o1, lse1 = self._run_decode_kernel(
+            query=q,
+            kv_cache=kv_cache,
+            block_tables=metadata.dcp_prefix_block_kv_indices,
+            seq_lens=local_prefix,
+            max_seq_len=max(local_prefix_max, 1),
+            layer=layer,
+            return_lse=True,
+            cp_world=dcp_world,
+            cp_rank=dcp_rank,
+            causal_seqs=global_prefix,
+            causal_mask=False,
+        )
+        # o1 [bs, T, H_full, vd], lse1 [bs, T, H_full]. Mask requests this rank
+        # owns no prefix tokens for (local prefix len == 0).
+        zero = local_prefix == 0
+        o1 = torch.where(zero.view(bs, 1, 1, 1), o1.new_zeros(()), o1)
+        lse1 = torch.where(
+            zero.view(bs, 1, 1), lse1.new_full((), float("-inf")), lse1
+        )
+        prefix_full, prefix_lse = dcp_a2a_lse_reduce(
+            o1.reshape(N, H_full, vd).contiguous(),
+            lse1.reshape(N, H_full).contiguous(),
+            get_dcp_group(),
+            is_lse_base_on_e=False,
+            comm_backend=get_global_server_args().dcp_comm_backend,
+            return_lse=True,
+        )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
+
+        # ---- Pass-2: local causal-chain draft fold (drafts NOT sharded) ----
+        q_local = q[
+            :, :, dcp_rank * H_local : (dcp_rank + 1) * H_local, :
+        ].contiguous()  # [bs, T, H_local, head_dim]
+        draft_latent = torch.cat(
+            [k.reshape(N, self.kv_lora_rank), k_rope.reshape(N, self.qk_rope_head_dim)],
+            dim=-1,
+        )  # [N, kv_cache_dim] fp8
+        draft_pool = draft_latent.new_zeros(bs, self.page_size, self.kv_cache_dim)
+        draft_pool[:, :T, :] = draft_latent.reshape(bs, T, self.kv_cache_dim)
+        draft_pool = draft_pool.unsqueeze(1)  # [bs, 1, page_size, kv_cache_dim]
+        draft_bt = torch.arange(bs, dtype=torch.int32, device=q.device).view(bs, 1)
+        draft_seq = torch.full((bs,), T, dtype=torch.int32, device=q.device)
+        o2, lse2 = self._run_decode_kernel(
+            query=q_local,
+            kv_cache=draft_pool,
+            block_tables=draft_bt,
+            seq_lens=draft_seq,
+            max_seq_len=T,
+            layer=layer,
+            return_lse=True,
+            cp_world=1,
+            cp_rank=0,
+            causal_seqs=None,
+            causal_mask=True,
+        )  # o2 [bs, T, H_local, vd], lse2 [bs, T, H_local]
+
+        # ---- Combine prefix_full ⊕ pass-2 (base-2 online softmax) ----
+        recv_out = torch.stack(
+            [prefix_full, o2.reshape(N, H_local, vd)], dim=0
+        )  # [2, N, H_local, vd]
+        recv_lse = torch.stack(
+            [prefix_lse, lse2.reshape(N, H_local)], dim=0
+        )  # [2, N, H_local]
+        final, _ = dcp_lse_combine_triton(recv_out, recv_lse, is_lse_base_on_e=False)
+        return final.reshape(-1, H_local * vd)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1093,6 +1203,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 # For target_verify, all sequences have the same number of draft tokens
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 needs_unpad = False
+                if dcp_enabled():
+                    # DCP verify: the single-fold kernel can't express the
+                    # per-draft-token causal under a strided KV slice, so run the
+                    # 2-pass cascade (non-causal DCP prefix fold + local causal
+                    # draft fold + base-2 combine). Returns the final output.
+                    return self._forward_verify_dcp(
+                        q, k, k_rope, layer, forward_batch, metadata
+                    )
             else:
                 # draft_extend: handle varying num_correct_drafts_per_req. If total_tokens % bs == 0,
                 # we can directly reshape q; otherwise, pad to max_seq_len_q.
