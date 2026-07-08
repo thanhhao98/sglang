@@ -92,6 +92,10 @@ def _cdiv(a: int, b: int) -> int:
 # overhead loses to custom one-shot + tiny rmsnorm at 7KB messages).
 _K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE", "baseline")
 
+# "fused" = new single-kernel aggregation (attn_residual.py)
+# "torch" = pytorch reference (attn_residual.py)
+# "legacy" = existing multi-kernel path (below)
+_K3_ATTN_RES_MODE = os.environ.get("SGLANG_K3_ATTN_RES_MODE", "fused")
 
 _ATTN_RES_MAX_B = 16
 _ATTN_RES_BLOCK_H = 1024
@@ -1239,7 +1243,11 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_attn_residuals:
             assert residual is not None
-            return self.forward_attn_residual(
+            if _K3_ATTN_RES_MODE == "legacy":
+                return self.forward_attn_residual(
+                    positions, hidden_states, residual, forward_batch, zero_allocator
+                )
+            return self._forward_attn_residual_clean(
                 positions, hidden_states, residual, forward_batch, zero_allocator
             )
 
@@ -1257,6 +1265,57 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    def _forward_attn_residual_clean(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.layers.attn_residual import attn_res_aggregate
+
+        prefix_sum = hidden_states
+        nvb = self.prev_valid_blocks
+
+        # ---- Aggregation 1: attention side ----
+        if nvb > 0:
+            hidden_states = attn_res_aggregate(
+                prefix_sum, block_residual, nvb,
+                self.self_attention_res_proj, self.self_attention_res_norm,
+                self.input_layernorm,
+            )
+        else:
+            hidden_states = self.input_layernorm(prefix_sum)
+
+        # ---- Write snapshot (before attention, using pre-update prefix) ----
+        if self.is_block_write_layer:
+            block_residual[:, self.block_write_idx, :].copy_(prefix_sum)
+
+        # ---- Attention ----
+        attn_out = self._run_self_attn(
+            hidden_states, positions, forward_batch, zero_allocator
+        )
+
+        # ---- Residual update ----
+        if self.is_block_write_layer:
+            prefix_sum = attn_out
+        else:
+            prefix_sum = prefix_sum + attn_out
+
+        # ---- Aggregation 2: MLP side ----
+        mlp_nvb = nvb + (1 if self.is_block_write_layer else 0)
+        hidden_states = attn_res_aggregate(
+            prefix_sum, block_residual, mlp_nvb,
+            self.mlp_res_proj, self.mlp_res_norm,
+            self.post_attention_layernorm,
+        )
+
+        # ---- MLP + accumulate ----
+        hidden_states = self.mlp(hidden_states)
+        prefix_sum = prefix_sum + hidden_states
+        return prefix_sum, block_residual
 
     def forward_attn_residual(
         self,
@@ -1468,15 +1527,26 @@ class KimiK3LinearModel(nn.Module):
 
         if hidden_states.shape[0] != 0:
             if use_attn_res:
-                # Final aggregation with the model norm fused into combine.
-                hidden_states = _apply_attn_res_fused(
-                    hidden_states,
-                    residual,
-                    self.output_attn_res_proj,
-                    self.output_attn_res_norm,
-                    attn_res_block_num,
-                    out_norm=self.norm,
-                )
+                if _K3_ATTN_RES_MODE == "legacy":
+                    hidden_states = _apply_attn_res_fused(
+                        hidden_states,
+                        residual,
+                        self.output_attn_res_proj,
+                        self.output_attn_res_norm,
+                        attn_res_block_num,
+                        out_norm=self.norm,
+                    )
+                else:
+                    from sglang.srt.layers.attn_residual import attn_res_aggregate
+
+                    hidden_states = attn_res_aggregate(
+                        hidden_states,
+                        residual,
+                        attn_res_block_num,
+                        self.output_attn_res_proj,
+                        self.output_attn_res_norm,
+                        self.norm,
+                    )
             else:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
