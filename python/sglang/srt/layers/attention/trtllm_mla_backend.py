@@ -320,6 +320,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.dcp_decode_cuda_graph_kv_indices = torch.full(
                 (max_bs, dcp_blocks), -1, dtype=torch.int32, device=self.device
             )
+            # Verify-DCP pass-1 prefix block table (its own contiguous buffer, same
+            # width; prefix <= max_context_len). Separate from the decode buffer so
+            # the decode and target-verify graphs never share index memory.
+            self.dcp_verify_prefix_cuda_graph_kv_indices = torch.full(
+                (max_bs, dcp_blocks), -1, dtype=torch.int32, device=self.device
+            )
         num_tokens_per_req = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
@@ -416,6 +422,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
 
+        if dcp_enabled() and forward_mode.is_target_verify():
+            # Verify-DCP: capture the LOCAL prefix block table (its own contiguous
+            # buffer, full width so shape[1] == row stride) + a constant local
+            # prefix max so the cascade avoids a host sync at replay.
+            dcp_world = get_attention_dcp_world_size()
+            metadata.dcp_prefix_block_kv_indices = (
+                self.dcp_verify_prefix_cuda_graph_kv_indices[:bs]
+            )
+            metadata.dcp_prefix_local_max = max(
+                (self.max_context_len + dcp_world - 1) // dcp_world, 1
+            )
+
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -468,6 +486,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices.shape[1],
             PAGED_SIZE=paged_size,
         )
+
+        if dcp_enabled() and forward_mode.is_target_verify():
+            # Verify-DCP pass-1: rebuild the LOCAL prefix block table over the
+            # rank's strided slice (page_size*dcp_world global pages). seq_lens is
+            # prefix + num_draft_tokens here (line above), so prefix = seq_lens_k - T.
+            eff_page = self.page_size * get_attention_dcp_world_size()
+            prefix_lens = (metadata.seq_lens_k[:bs] - self.num_draft_tokens).to(
+                torch.int32
+            )
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        metadata.dcp_prefix_block_kv_indices.shape[1], eff_page
+                    ),
+                )
+            ](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                prefix_lens,
+                None,
+                metadata.dcp_prefix_block_kv_indices,
+                self.req_to_token.stride(0),
+                metadata.dcp_prefix_block_kv_indices.shape[1],
+                PAGED_SIZE=eff_page,
+            )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
