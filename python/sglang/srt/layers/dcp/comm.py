@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import contextlib
 from typing import Optional
 
 import torch
@@ -43,10 +44,43 @@ from sglang.srt.layers.dcp.kernels import (
 from sglang.srt.utils import is_cuda
 
 
+# DCP shards only the TARGET's decode/verify. The speculative DRAFT model runs
+# unsharded (dcp_size=1, its own small KV pool); disable DCP for the duration of
+# any draft forward so its (MLA) attention + KV write stay full and match its
+# unsharded pool. model_runner.forward sets this via draft_forward_guard.
+_DRAFT_FORWARD_ACTIVE = False
+
+
+def set_draft_forward_active(active: bool) -> None:
+    global _DRAFT_FORWARD_ACTIVE
+    _DRAFT_FORWARD_ACTIVE = active
+
+
+def draft_forward_active() -> bool:
+    return _DRAFT_FORWARD_ACTIVE
+
+
+@contextlib.contextmanager
+def draft_forward_guard(is_draft: bool):
+    """Mark the enclosed forward as a draft forward so dcp_enabled() is False
+    for its duration (draft runs unsharded). Restores the previous state (nested
+    forwards safe)."""
+    global _DRAFT_FORWARD_ACTIVE
+    prev = _DRAFT_FORWARD_ACTIVE
+    _DRAFT_FORWARD_ACTIVE = is_draft or prev
+    try:
+        yield
+    finally:
+        _DRAFT_FORWARD_ACTIVE = prev
+
+
 def dcp_enabled() -> bool:
     """
     only checks whether dcp enabled for cuda platform
     """
+    # A draft forward runs unsharded even when the target set up a DCP group.
+    if _DRAFT_FORWARD_ACTIVE:
+        return False
     if get_dcp_group_no_assert() is None:
         return False
     if not is_cuda():

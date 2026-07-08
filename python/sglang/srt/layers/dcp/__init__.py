@@ -36,8 +36,11 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
     dcp_enabled,
+    draft_forward_active,
+    draft_forward_guard,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
+    set_draft_forward_active,
 )
 from sglang.srt.layers.dcp.kernels import (
     create_triton_kv_indices_for_dcp_triton,
