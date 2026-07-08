@@ -379,8 +379,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = self.tp_rank % self.dcp_size
+        # DCP shards only the TARGET's KV; the draft model (small, its own pool)
+        # must stay unsharded (dcp_size=1) so its KV pool is not scaled/strided.
+        # (Attention-level DCP keys off the global DCP group; the DFlash draft is
+        # non-MLA so it never enters the MLA DCP path.)
+        self.dcp_size = 1 if is_draft_worker else server_args.dcp_size
+        self.dcp_rank = 0 if is_draft_worker else (self.tp_rank % self.dcp_size)
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
