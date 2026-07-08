@@ -1346,6 +1346,8 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        from sglang.srt.layers.dcp import draft_forward_guard
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -1373,6 +1375,9 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            # Draft forwards run unsharded (dcp_size=1): disable DCP for their
+            # duration so the draft's (MLA) attention + KV write stay full.
+            draft_forward_guard(self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

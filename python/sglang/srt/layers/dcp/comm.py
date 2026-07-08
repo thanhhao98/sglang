@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import contextlib
 import warnings
 from typing import Optional
 
@@ -44,6 +45,25 @@ def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
         DeprecationWarning,
         stacklevel=2,
     )
+
+
+# DCP shards only the TARGET's decode/verify. The speculative DRAFT model runs
+# unsharded (dcp_size=1, its own small KV pool); disable DCP for the duration of
+# any draft forward so its (MLA) attention + KV write stay full and match its
+def draft_forward_guard(is_draft: bool):
+    """Run a (draft) forward with DCP disabled.
+
+    The draft model's KV pool is deliberately unsharded (dcp_size=1), so every DCP
+    branch must see dcp_enabled == False for the whole draft forward. Implemented
+    over ParallelContext.override so the authoritative get_parallel().dcp_enabled
+    (and the deprecated module accessors that delegate to it) are all covered.
+    No-op when is_draft is False.
+    """
+    if not is_draft:
+        return contextlib.nullcontext()
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().override(dcp_enabled=False)
 
 
 def dcp_enabled() -> bool:

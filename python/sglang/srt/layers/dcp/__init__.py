@@ -42,8 +42,11 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
     dcp_enabled,
+    draft_forward_active,
+    draft_forward_guard,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
+    draft_forward_guard,
     init_fi_a2a_workspace,
 )
 from sglang.srt.layers.dcp.layout import (
@@ -62,6 +65,7 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 # planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
+    "draft_forward_guard",
     "DecodeContextParallelMetadata",
     "dcp_a2a_lse_reduce",
     "init_fi_a2a_workspace",
