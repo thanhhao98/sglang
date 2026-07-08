@@ -289,6 +289,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         cp_world: int = 1,
         cp_rank: int = 0,
         causal_seqs: Optional[torch.Tensor] = None,
+        causal_mask: Optional[bool] = None,
     ):
         """Run the tokenspeed CuTe DSL MLA kernel (decode or padded multi-token verify).
 
@@ -308,6 +309,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        # causal_mask left unset preserves the wheel default (the non-DCP verify
+        # linear-chain behavior); the verify-DCP cascade sets it explicitly
+        # (False for the non-causal prefix fold, True for the draft-chain pass).
+        extra = {} if causal_mask is None else {"causal_mask": causal_mask}
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -324,6 +329,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             cp_world=cp_world,
             cp_rank=cp_rank,
             causal_seqs=causal_seqs,
+            **extra,
         )
 
     def _run_prefill_kernel(
