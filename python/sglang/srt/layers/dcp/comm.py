@@ -454,6 +454,7 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """A2A-based DCP reduce: exchange head partials, then local combine.
 
@@ -472,14 +473,16 @@ def dcp_a2a_lse_reduce(
                   send_lse, recv_lse            [N, bs, H_per_rank] fp32 staging
 
     Returns:
-        [B, H_local, D] combined attention output for this rank's local heads.
+        [B, H_local, D] combined attention output for this rank's local heads,
+        or ``(out, lse[B, H_local])`` when ``return_lse=True`` (the verify-DCP
+        cascade needs the merged-prefix LSE to combine with the draft pass).
     """
     if cp_group.world_size == 1:
-        return cp_attn_out
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
-            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e, return_lse=return_lse
         )
 
     N = cp_group.world_size
@@ -567,10 +570,10 @@ def dcp_a2a_lse_reduce(
         )
         recv_lse = recv_lse_stg
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, combined_lse = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
-    return combined
+    return (combined, combined_lse) if return_lse else combined
 
 
 def _dcp_fi_a2a_lse_reduce(
@@ -578,6 +581,7 @@ def _dcp_fi_a2a_lse_reduce(
     cp_attn_lse: torch.Tensor,
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """fi_a2a variant: delegate only the cross-rank EXCHANGE to FlashInfer's
     MNNVL all-to-all kernel, then reuse the same local Triton LSE combine.
@@ -626,7 +630,7 @@ def _dcp_fi_a2a_lse_reduce(
     recv_output = o_out.permute(2, 0, 1, 3).contiguous()  # [N, B, H_per_rank, D]
     recv_lse = stats_out[..., 0].permute(2, 0, 1).contiguous()  # [N, B, H_per_rank]
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, combined_lse = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
-    return combined
+    return (combined, combined_lse) if return_lse else combined

@@ -2867,13 +2867,25 @@ class ServerArgs:
         if is_hip():
             return
         elif is_cuda():
-            if self.speculative_algorithm is not None:
+            # Speculative + DCP is validated only for the tokenspeed_mla verify
+            # backend on the a2a/fi_a2a comm path (2-pass cascade); every other
+            # backend/comm-backend still lacks a correct verify-DCP path.
+            _ts_attn = "tokenspeed_mla" in (
+                self.attention_backend,
+                self.decode_attention_backend,
+                self.prefill_attention_backend,
+            )
+            _dcp_spec_ok = _ts_attn and self.dcp_comm_backend in ("a2a", "fi_a2a")
+            if self.speculative_algorithm is not None and not _dcp_spec_ok:
                 raise ValueError(
                     "Decode context parallel (--dcp-size / "
                     "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                    "supports speculative decoding only with "
+                    "--attention-backend tokenspeed_mla and "
+                    "--dcp-comm-backend a2a/fi_a2a, but got "
+                    f"dcp_size={self.dcp_size}, attention_backend="
+                    f"{self.attention_backend}, dcp_comm_backend="
+                    f"{self.dcp_comm_backend}."
                 )
         else:
             raise ValueError(
