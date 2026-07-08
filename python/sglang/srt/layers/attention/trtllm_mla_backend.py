@@ -132,6 +132,12 @@ class TRTLLMMLADecodeMetadata:
     # during replay. Left None on the eager path, where forward_decode computes
     # the exact local max directly.
     dcp_local_max_seq_len: Optional[int] = None
+    # DCP verify (target_verify) pass-1: LOCAL block table over the rank's strided
+    # PREFIX slice (excludes the T draft tokens, which are handled locally from the
+    # k/k_rope inputs). dcp_prefix_local_max is the captured constant local prefix
+    # max_seq_len for CUDA graph (None on the eager path).
+    dcp_prefix_block_kv_indices: Optional[torch.Tensor] = None
+    dcp_prefix_local_max: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -642,6 +648,46 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
             self.forward_decode_metadata.max_seq_len_k = int(max_seq)
             self.forward_decode_metadata.batch_size = bs
+
+            if dcp_enabled() and forward_batch.forward_mode.is_target_verify():
+                # DCP verify pass-1 attends the PREFIX (positions before the T
+                # draft tokens) over this rank's strided slice. Build a LOCAL
+                # PREFIX block table the same way decode does, but over the GLOBAL
+                # PREFIX lengths (forward_batch.seq_lens, i.e. seq_lens_k - T). The
+                # drafts are handled locally in forward_extend from the k/k_rope
+                # inputs, not from the sharded pool.
+                dcp_world = get_attention_dcp_world_size()
+                eff_page = self.page_size * dcp_world
+                npb = get_num_page_per_block_flashmla(eff_page)
+                prefix_max = max(int(max_seq) - self.num_draft_tokens, 1)
+                max_prefix_blocks = (
+                    triton.cdiv(triton.cdiv(prefix_max, eff_page), npb) * npb
+                )
+                prefix_lens = forward_batch.seq_lens.to(torch.int32)
+                dcp_prefix_bt = torch.full(
+                    (bs, max_prefix_blocks),
+                    -1,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                create_flashmla_kv_indices_triton[
+                    (
+                        bs,
+                        get_num_kv_index_blocks_flashmla(max_prefix_blocks, eff_page),
+                    )
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    prefix_lens,
+                    None,
+                    dcp_prefix_bt,
+                    self.req_to_token.stride(0),
+                    max_prefix_blocks,
+                    PAGED_SIZE=eff_page,
+                )
+                self.forward_decode_metadata.dcp_prefix_block_kv_indices = (
+                    dcp_prefix_bt
+                )
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
