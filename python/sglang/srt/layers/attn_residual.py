@@ -2,8 +2,9 @@
 # Kimi-K3 Attention Residual aggregation kernels.
 #
 # Each aggregation point: score rows → softmax → weighted sum → RMSNorm.
-# Three modes via SGLANG_K3_ATTN_RES_MODE:
+# Four modes via SGLANG_K3_ATTN_RES_MODE:
 #   "fused"  — Triton 3-kernel pipeline with full H-parallelism (default)
+#   "jit"    — CUDA JIT kernels with lower launch overhead than Triton
 #   "torch"  — PyTorch reference (readable, for debugging)
 #   "legacy" — original path in kimi_k3.py
 
@@ -168,6 +169,37 @@ def _aggregate_fused(
     return out_norm(out)
 
 
+# ---- JIT CUDA path: score → combine → RMSNorm(standard) ---------------------
+
+
+def _aggregate_jit(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+) -> torch.Tensor:
+    from sglang.jit_kernel.kimi_k3.attn_res import attn_res_combine, attn_res_score
+
+    T, H = prefix_sum.shape
+    cw = get_cw(score_proj, score_norm)
+    n_h_blocks = H // _BLOCK_H
+
+    # Step 1: score each row (2D grid, full row-parallelism)
+    scores = torch.empty(
+        (T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device
+    )
+    attn_res_score(prefix_sum, bank, cw, scores, nvb, score_norm.variance_epsilon)
+
+    # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
+    out = torch.empty_like(prefix_sum)
+    attn_res_combine(prefix_sum, bank, scores, out, nvb)
+
+    # Step 3: standard RMSNorm (sglang's optimized kernel)
+    return out_norm(out)
+
+
 # ---- PyTorch reference -------------------------------------------------------
 
 
@@ -210,6 +242,10 @@ def attn_res_aggregate(
     """
     if _MODE == "torch":
         return _aggregate_torch(
+            prefix_sum, bank, nvb, score_proj, score_norm, out_norm
+        )
+    if _MODE == "jit":
+        return _aggregate_jit(
             prefix_sum, bank, nvb, score_proj, score_norm, out_norm
         )
     return _aggregate_fused(

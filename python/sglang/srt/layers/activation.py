@@ -163,7 +163,9 @@ class SituAndMul(MultiPlatformOp):
         return (gate * up).to(x.dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        from sglang.jit_kernel.kimi_k3.activation import situ_and_mul
+
+        return situ_and_mul(x, None, self.beta, self.linear_beta)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
