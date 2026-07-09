@@ -546,12 +546,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # Act.
         if self.config.activation == "situ":
-            down_input, down_input_scale = _masked_situ_mul_quant(
+            down_input, down_input_scale = _varlen_deep_gemm_situ_mul_quant(
                 gateup_output,
                 masked_m,
                 group_size=128,
-                situ_beta=self.config.gemm1_alpha,
-                situ_linear_beta=self.config.gemm1_clamp_limit,
+                topk=self.config.top_k,
+                beta=self.config.gemm1_alpha,
+                linear_beta=self.config.gemm1_clamp_limit,
             )
         else:
             topk_ids_rs = running_state.get("topk_ids")
@@ -1096,6 +1097,53 @@ def post_permute_deep_gemm_to_deepep_normal(
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )
+
+
+def _varlen_deep_gemm_situ_mul_quant(
+    gateup_output: torch.Tensor,
+    masked_m: torch.Tensor,
+    group_size: int,
+    topk: int,
+    beta: float,
+    linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
+    from sglang.jit_kernel.kimi_k3 import situ_and_mul_masked_post_quant
+
+    E, N, D_2 = gateup_output.shape
+    D = D_2 // 2
+    G = D // group_size
+    packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+
+    down_input = torch.empty(
+        (E, N, D), device=gateup_output.device, dtype=torch.float8_e4m3fn
+    )
+    if packed_ue8m0:
+        down_input_scale = torch.empty(
+            (E, G // 4, N), device=gateup_output.device, dtype=torch.int32
+        )
+    else:
+        down_input_scale = torch.empty(
+            (E, N, G), device=gateup_output.device, dtype=torch.float32
+        )
+
+    situ_and_mul_masked_post_quant(
+        gateup_output,
+        down_input,
+        down_input_scale,
+        group_size,
+        masked_m,
+        beta=beta,
+        linear_beta=linear_beta,
+        scale_ue8m0=packed_ue8m0,
+        topk=topk,
+        transposed=packed_ue8m0,
+    )
+
+    if packed_ue8m0:
+        down_input_scale = down_input_scale.transpose(-1, -2)
+
+    return down_input, down_input_scale
 
 
 def _varlen_deep_gemm_silu_mul_quant(
