@@ -379,11 +379,22 @@ def fused_marlin_moe(
     output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
-        # sgl_kernel's dedicated top-k sum beats the generic at::native
-        # reduce_kernel that torch.sum dispatches to at decode shapes
-        # (topk weights incl. routed scaling already applied above via
-        # mul_topk_weights, so the extra scale is 1.0).
-        moe_sum_reduce(intermediate_cache3, output, 1.0)
+        # Top-k weights (incl. routed scaling) are already applied above via
+        # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
+        # vectorized pass (~1.5us at decode shapes) beats sgl_kernel's
+        # moe_sum_reduce_kernel_general (~5.7us) and the generic at::native
+        # reduce_kernel torch.sum dispatches to (~6.7us).
+        if (
+            intermediate_cache3.dtype == torch.bfloat16
+            and intermediate_cache3.is_contiguous()
+            and output.is_contiguous()
+            and intermediate_cache3.shape[-1] % 8 == 0
+        ):
+            from sglang.jit_kernel.moe_topk_sum import moe_topk_sum
+
+            moe_topk_sum(intermediate_cache3, output)
+        else:
+            moe_sum_reduce(intermediate_cache3, output, 1.0)
         return output
     else:
         if routed_scaling_factor is None:
