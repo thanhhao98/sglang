@@ -242,9 +242,18 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, global_num_experts
-    )
+    if M == 1 and topk <= 32 and expert_map is None:
+        # Single-token decode: top-k ids are distinct, so alignment is a
+        # single-warp sort instead of the align + count_and_sort kernel pair.
+        from sglang.jit_kernel.moe_align_tiny import moe_align_tiny
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_tiny(
+            topk_ids, block_size_m
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, block_size_m, global_num_experts
+        )
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (
