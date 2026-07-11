@@ -116,6 +116,9 @@ def _resolve_moe_reduce_mode() -> str:
 # Both default on; set to "0" to A/B against the unfused paths.
 _K3_FUSE_MOE_FRONT = os.environ.get("SGLANG_K3_FUSE_MOE_FRONT", "1") == "1"
 _K3_FUSE_KDA_BFA = os.environ.get("SGLANG_K3_FUSE_KDA_BFA", "1") == "1"
+# Use the dedicated CUDA tiny-GEMV kernel for the skinny KDA projections
+# (b+f_a merged, f_b) instead of cublas gemvx/dot dispatch.
+_K3_TINY_GEMV = os.environ.get("SGLANG_K3_TINY_GEMV", "1") == "1"
 
 
 def _merge_weights_as_views(mods: list) -> tuple[torch.Tensor, list[int]]:
@@ -1092,17 +1095,29 @@ class KimiK3DeltaAttention(nn.Module):
         return qkv, beta, forget_gate, g_proj_states
 
     def _bfa_weight(self) -> torch.Tensor:
-        """Lazily merge b_proj (heads/tp outputs) + f_a_proj (head_dim outputs).
+        """Lazily merge f_a_proj (head_dim outputs) + b_proj (heads/tp outputs).
 
         Both are skinny same-input GEMVs at decode: b lands in a cublas dot
-        kernel pair, f_a in a splitK GEMM. One [H, heads/tp + head_dim] GEMM
-        replaces both launches."""
+        kernel pair, f_a in a splitK GEMM. One [H, head_dim + heads/tp (+pad)]
+        GEMV replaces both. f_a leads so its output slice starts at offset 0,
+        and the width is padded to a multiple of 8 so every fused-output row
+        stays 16-byte aligned for vectorized consumers (tiny_gemv on f_b)."""
         w = getattr(self, "_bfa_w", None)
         if w is None:
-            w, self._bfa_sizes = _merge_weights_as_views(
-                [self.b_proj, self.f_a_proj]
-            )
-            self._bfa_w = w
+            mods = [self.f_a_proj, self.b_proj]
+            merged, sizes = _merge_weights_as_views(mods)
+            pad = (-sum(sizes)) % 8
+            if pad:
+                merged = torch.cat(
+                    [merged, merged.new_zeros((pad, merged.shape[1]))]
+                ).contiguous()
+                off = 0
+                for m, n in zip(mods, sizes):
+                    m.weight.data = merged[off : off + n]
+                    off += n
+            self._bfa_fa_size, self._bfa_b_size = sizes
+            self._bfa_w = merged
+            w = merged
         return w
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
@@ -1110,9 +1125,21 @@ class KimiK3DeltaAttention(nn.Module):
             fused_states, _ = self.fused_qkvg_proj(hidden_states)
             qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
             if _K3_FUSE_KDA_BFA:
-                bfa = torch.nn.functional.linear(hidden_states, self._bfa_weight())
-                beta, f_a_states = torch.split(bfa, self._bfa_sizes, dim=-1)
-                forget_gate = self.f_b_proj(f_a_states)[0]
+                w = self._bfa_weight()
+                n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
+                # tiny_gemv re-reads x once per output element: a win at
+                # decode token counts, catastrophic at prefill sizes.
+                if _K3_TINY_GEMV and hidden_states.shape[0] <= 64:
+                    from sglang.jit_kernel.kimi_k3.tiny_gemv import tiny_gemv
+
+                    bfa = tiny_gemv(hidden_states, w)
+                    forget_gate = tiny_gemv(
+                        bfa[..., :n_fa], self.f_b_proj.weight
+                    )
+                else:
+                    bfa = torch.nn.functional.linear(hidden_states, w)
+                    forget_gate = self.f_b_proj(bfa[..., :n_fa])[0]
+                beta = bfa[..., n_fa : n_fa + n_b]
             else:
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
