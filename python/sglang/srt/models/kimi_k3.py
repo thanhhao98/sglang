@@ -1127,9 +1127,11 @@ class KimiK3DeltaAttention(nn.Module):
             if _K3_FUSE_KDA_BFA:
                 w = self._bfa_weight()
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                # tiny_gemv re-reads x once per output element: a win at
-                # decode token counts, catastrophic at prefill sizes.
-                if _K3_TINY_GEMV and hidden_states.shape[0] <= 64:
+                # tiny_gemv re-reads the weight once per token (CTA-per-output),
+                # so its traffic scales linearly with T: measured 2us/launch at
+                # T=1 but 41us at T=64 (5ms/step regression). Break-even vs the
+                # cublas GEMV pair is around T~8.
+                if _K3_TINY_GEMV and hidden_states.shape[0] <= 8:
                     from sglang.jit_kernel.kimi_k3.tiny_gemv import tiny_gemv
 
                     bfa = tiny_gemv(hidden_states, w)
