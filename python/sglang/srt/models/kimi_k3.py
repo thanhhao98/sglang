@@ -1091,12 +1091,31 @@ class KimiK3DeltaAttention(nn.Module):
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         return qkv, beta, forget_gate, g_proj_states
 
+    def _bfa_weight(self) -> torch.Tensor:
+        """Lazily merge b_proj (heads/tp outputs) + f_a_proj (head_dim outputs).
+
+        Both are skinny same-input GEMVs at decode: b lands in a cublas dot
+        kernel pair, f_a in a splitK GEMM. One [H, heads/tp + head_dim] GEMM
+        replaces both launches."""
+        w = getattr(self, "_bfa_w", None)
+        if w is None:
+            w, self._bfa_sizes = _merge_weights_as_views(
+                [self.b_proj, self.f_a_proj]
+            )
+            self._bfa_w = w
+        return w
+
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
             fused_states, _ = self.fused_qkvg_proj(hidden_states)
             qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
-            beta = self.b_proj(hidden_states)[0]
-            forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+            if _K3_FUSE_KDA_BFA:
+                bfa = torch.nn.functional.linear(hidden_states, self._bfa_weight())
+                beta, f_a_states = torch.split(bfa, self._bfa_sizes, dim=-1)
+                forget_gate = self.f_b_proj(f_a_states)[0]
+            else:
+                beta = self.b_proj(hidden_states)[0]
+                forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
             qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
