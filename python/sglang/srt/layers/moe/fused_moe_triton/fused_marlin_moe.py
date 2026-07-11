@@ -379,7 +379,12 @@ def fused_marlin_moe(
     output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
-        return torch.sum(intermediate_cache3, dim=1, out=output)
+        # sgl_kernel's dedicated top-k sum beats the generic at::native
+        # reduce_kernel that torch.sum dispatches to at decode shapes
+        # (topk weights incl. routed scaling already applied above via
+        # mul_topk_weights, so the extra scale is 1.0).
+        moe_sum_reduce(intermediate_cache3, output, 1.0)
+        return output
     else:
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
