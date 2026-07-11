@@ -110,6 +110,26 @@ def _resolve_moe_reduce_mode() -> str:
         pass
     return "baseline"
 
+# Horizontal fusion of same-input GEMMs (decode is launch/BW bound):
+#   moe_front: shared gate_up + router gate + latent down_proj -> one GEMM
+#   kda_bfa:   KDA b_proj + f_a_proj -> one GEMM
+# Both default on; set to "0" to A/B against the unfused paths.
+_K3_FUSE_MOE_FRONT = os.environ.get("SGLANG_K3_FUSE_MOE_FRONT", "1") == "1"
+_K3_FUSE_KDA_BFA = os.environ.get("SGLANG_K3_FUSE_KDA_BFA", "1") == "1"
+
+
+def _merge_weights_as_views(mods: list) -> tuple[torch.Tensor, list[int]]:
+    """Cat module weights along dim 0; re-point each module's weight to a view
+    of the merged buffer so the original storage is freed (net extra memory ~0)."""
+    ws = [m.weight.data for m in mods]
+    merged = torch.cat(ws, dim=0).contiguous()
+    sizes = [w.shape[0] for w in ws]
+    off = 0
+    for m, n in zip(mods, sizes):
+        m.weight.data = merged[off : off + n]
+        off += n
+    return merged, sizes
+
 # "fused" = new single-kernel aggregation (attn_residual.py)
 # "torch" = pytorch reference (attn_residual.py)
 # "legacy" = existing multi-kernel path (below)
@@ -514,6 +534,13 @@ class KimiK3MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def forward_from_gate_up(self, gate_up: torch.Tensor) -> torch.Tensor:
+        """Same as forward() but with the gate_up GEMM already computed
+        (e.g. as a slice of a horizontally-fused projection)."""
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
 
 # ---------------------------------------------------------------------------
 # KimiK3MoE — with Latent MoE support
@@ -638,24 +665,67 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
+    def _moe_front_weight(self) -> torch.Tensor:
+        """Lazily merge shared gate_up + router gate + latent down_proj weights.
+
+        All three GEMMs consume the same hidden_states; at decode each one is a
+        skinny memory-bound GEMV with its own splitK epilogue. One merged
+        [H, gu+E+latent] GEMM reads the input once and drops 2 GEMM launches
+        plus their splitK-reduce tails per MoE layer.
+        """
+        w = getattr(self, "_front_w", None)
+        if w is None:
+            mods = [
+                self.shared_experts.gate_up_proj,
+                self.gate,
+                self.routed_expert_down_proj,
+            ]
+            w, self._front_sizes = _merge_weights_as_views(mods)
+            self._front_w = w
+        return w
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
-        # Shared experts on original hidden_states
-        shared_output = None
-        if self.shared_experts is not None and hidden_states.shape[0] > 0:
-            shared_output = self.shared_experts(hidden_states)
+        use_fused_front = (
+            _K3_FUSE_MOE_FRONT
+            and self.use_latent_moe
+            and self.shared_experts is not None
+            and hidden_states.shape[0] > 0
+            and self.gate.weight.dtype == hidden_states.dtype
+            and self.shared_experts.gate_up_proj.weight.dtype == hidden_states.dtype
+        )
 
-        # Gate + TopK (on original hidden_states for correct token count)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-
-        # Latent MoE: compress after routing, before experts
-        if self.use_latent_moe:
-            routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        if use_fused_front:
+            fused = torch.nn.functional.linear(
+                hidden_states, self._moe_front_weight()
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
+            if hidden_states.shape[0] > 1:
+                # Downstream kernels want contiguous inputs; free for T==1.
+                gate_up = gate_up.contiguous()
+                router_logits = router_logits.contiguous()
+                routed_input = routed_input.contiguous()
+            shared_output = self.shared_experts.forward_from_gate_up(gate_up)
+            topk_output = self.topk(hidden_states, router_logits)
         else:
-            routed_input = hidden_states
+            # Shared experts on original hidden_states
+            shared_output = None
+            if self.shared_experts is not None and hidden_states.shape[0] > 0:
+                shared_output = self.shared_experts(hidden_states)
+
+            # Gate + TopK (on original hidden_states for correct token count)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+
+            # Latent MoE: compress after routing, before experts
+            if self.use_latent_moe:
+                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+            else:
+                routed_input = hidden_states
 
         # Experts
         final_hidden_states = self.experts(routed_input, topk_output)
