@@ -90,7 +90,25 @@ def _cdiv(a: int, b: int) -> int:
 # concat 33.2 (21.5KB message falls off the one-shot allreduce path into
 # two-shot) and fi_fused 33.0 (lamport-buffer kernel + zero-residual
 # overhead loses to custom one-shot + tiny rmsnorm at 7KB messages).
-_K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE", "baseline")
+# On MULTI-NODE TP the trade flips: single-node custom one-shot is
+# unavailable, both reduces go through NCCL, and one 21.5KB collective
+# beats a 7KB + 14KB pair (2x4 GB300 MNNVL bs=1: 22.05 -> 21.36 ms ITL).
+# Default resolves by topology in KimiK3MoE.__init__; env overrides.
+_K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE")
+
+
+def _resolve_moe_reduce_mode() -> str:
+    if _K3_MOE_REDUCE_MODE is not None:
+        return _K3_MOE_REDUCE_MODE
+    try:
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+        if not all(in_the_same_node_as(get_tp_group().cpu_group, source_rank=0)):
+            return "concat"
+    except Exception:
+        pass
+    return "baseline"
 
 # "fused" = new single-kernel aggregation (attn_residual.py)
 # "torch" = pytorch reference (attn_residual.py)
@@ -524,6 +542,7 @@ class KimiK3MoE(nn.Module):
 
         # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
+        self.moe_reduce_mode = _resolve_moe_reduce_mode()
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -656,18 +675,30 @@ class KimiK3MoE(nn.Module):
             if (
                 routed_needs_reduce
                 and shared_output is not None
-                and _K3_MOE_REDUCE_MODE == "concat"
+                and self.moe_reduce_mode == "concat"
             ):
                 # One NCCL call instead of two: concat routed latent (3584)
                 # and shared (7168) partial sums into a single buffer.
-                buf = torch.cat((final_hidden_states, shared_output), dim=-1)
+                # Allocate the buffer in the NCCL symmetric mempool so the
+                # all-reduce takes the symmetric-kernel one-shot path instead
+                # of falling back to ring (same trick as RowParallelLinear).
+                from sglang.srt.distributed import get_tp_group
+                from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                    use_symmetric_memory,
+                )
+                from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    buf = torch.cat((final_hidden_states, shared_output), dim=-1)
                 buf = tensor_model_parallel_all_reduce(buf)
                 final_hidden_states = buf[..., : self.moe_hidden_size].contiguous()
                 shared_output = buf[..., self.moe_hidden_size :]
                 did_shared_reduce = True
             elif routed_needs_reduce:
                 if (
-                    _K3_MOE_REDUCE_MODE == "fi_fused"
+                    self.moe_reduce_mode == "fi_fused"
                     and self.routed_expert_norm is not None
                 ):
                     # Fuse the latent all-reduce with the RMSNorm epilogue.
