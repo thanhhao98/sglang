@@ -225,6 +225,51 @@ def _aggregate_torch(
     return out_norm(mixed.to(prefix_sum.dtype))
 
 
+# ---- Fused residual-add + aggregation (jit mode) -----------------------------
+
+
+def attn_res_aggregate_fadd(
+    prefix_a: torch.Tensor,
+    prefix_b: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+):
+    """Aggregation point with the upstream residual add fused into the score
+    kernel: prefix = bf16(prefix_a + prefix_b) is computed on the fly by the
+    prefix-row CTA (bit-identical to the standalone add) and materialized for
+    the combine kernel / downstream consumers. Returns (normed, prefix).
+
+    jit mode only; other modes fall back to add-then-aggregate."""
+    if _MODE == "jit":
+        from sglang.jit_kernel.kimi_k3.attn_res import (
+            attn_res_combine,
+            attn_res_score_fadd,
+        )
+
+        T, H = prefix_a.shape
+        cw = get_cw(score_proj, score_norm)
+        prefix = torch.empty_like(prefix_a)
+        scores = torch.empty(
+            (T, _MAX_ROWS), dtype=torch.float32, device=prefix_a.device
+        )
+        attn_res_score_fadd(
+            prefix_a, prefix_b, prefix, bank, cw, scores, nvb,
+            score_norm.variance_epsilon,
+        )
+        out = torch.empty_like(prefix)
+        attn_res_combine(prefix, bank, scores, out, nvb)
+        return out_norm(out), prefix
+
+    prefix = prefix_a + prefix_b
+    return (
+        attn_res_aggregate(prefix, bank, nvb, score_proj, score_norm, out_norm),
+        prefix,
+    )
+
+
 # ---- Public dispatch ---------------------------------------------------------
 
 
