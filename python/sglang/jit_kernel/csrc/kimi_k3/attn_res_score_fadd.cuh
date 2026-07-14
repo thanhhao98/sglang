@@ -38,8 +38,7 @@ struct AttnResScoreFAddParams {
 };
 
 template <int kBlockH, bool kUsePDL>
-__global__ void attn_res_score_fadd_kernel(
-    const AttnResScoreFAddParams __grid_constant__ params) {
+__global__ void attn_res_score_fadd_kernel(const AttnResScoreFAddParams __grid_constant__ params) {
   using namespace device;
 
   const uint32_t pid_t = blockIdx.x;
@@ -60,10 +59,7 @@ __global__ void attn_res_score_fadd_kernel(
 
   PDLWaitPrimary<kUsePDL>();
 
-  const bf16_t* row_ptr = is_prefix_row
-                              ? nullptr
-                              : params.bank + pid_t * params.stride_bm +
-                                    j * params.stride_bb;
+  const bf16_t* row_ptr = is_prefix_row ? nullptr : params.bank + pid_t * params.stride_bm + j * params.stride_bb;
   const bf16_t* a_ptr = params.prefix_a + pid_t * params.stride_pm;
   const bf16_t* b_ptr = params.prefix_b + pid_t * params.stride_pm;
   bf16_t* out_ptr = params.prefix_out + pid_t * params.stride_pm;
@@ -127,8 +123,8 @@ template <int kBlockH, bool kUsePDL>
 struct AttnResScoreFAddKernel {
   static constexpr auto kernel = attn_res_score_fadd_kernel<kBlockH, kUsePDL>;
 
-  static void run(
-      const tvm::ffi::TensorView prefix_a,
+  static void
+  run(const tvm::ffi::TensorView prefix_a,
       const tvm::ffi::TensorView prefix_b,
       const tvm::ffi::TensorView prefix_out,
       const tvm::ffi::TensorView bank,
@@ -178,8 +174,7 @@ struct AttnResScoreFAddKernel {
     };
 
     dim3 grid(num_tokens, NVB + 1);
-    LaunchKernel(grid, kBlockH, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid, kBlockH, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

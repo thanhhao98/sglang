@@ -1509,10 +1509,8 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            from sglang.jit_kernel.moe_fused_gate import (
-                _ROUTE_RADIX_ENABLED as _radix_on,
-            )
             from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+            from sglang.jit_kernel.moe_route_radix import ROUTE_RADIX_ENABLED
 
             # With the radix-select fast path enabled, pass bf16 logits through
             # untouched: bf16 -> fp32 is exact, the triton router loads to fp32
@@ -1520,7 +1518,7 @@ def biased_grouped_topk_gpu(
             # one elementwise kernel per MoE layer.
             _gating = (
                 gating_output
-                if (_radix_on and gating_output.dtype == torch.bfloat16)
+                if (ROUTE_RADIX_ENABLED and gating_output.dtype == torch.bfloat16)
                 else gating_output.to(dtype=torch.float32)
             )
             return jit_gate(

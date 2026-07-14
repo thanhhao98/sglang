@@ -60,8 +60,8 @@ template <int kThreads, bool kUsePDL>
 struct Add3Kernel {
   static constexpr auto kernel = add3_kernel<kThreads, kUsePDL>;
 
-  static void run(
-      const tvm::ffi::TensorView a,
+  static void
+  run(const tvm::ffi::TensorView a,
       const tvm::ffi::TensorView b,
       const tvm::ffi::TensorView c,
       const tvm::ffi::TensorView out) {
@@ -73,11 +73,7 @@ struct Add3Kernel {
     device.set_options<kDLCUDA>();
 
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(a);
-    TensorMatcher({T_, H_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .with_strides({-1, 1})
-        .verify(b);
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(b);
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(c);
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(out);
 
@@ -96,8 +92,7 @@ struct Add3Kernel {
     };
     const uint32_t n_vecs = H / 8;
     dim3 grid((n_vecs + kThreads - 1) / kThreads, T);
-    LaunchKernel(grid, kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 
