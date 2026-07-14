@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+import os
+
+_ROUTE_RADIX_ENABLED = os.environ.get("SGLANG_JIT_ROUTE_RADIX", "0") == "1"
+
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
     "sqrtsoftplus": 1,
@@ -289,6 +293,28 @@ def moe_fused_gate(
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
+
+    # Small-batch K3 fast path (SGLANG_JIT_ROUTE_RADIX=1, default off): native-CUDA
+    # radix-select replaces the 16 dependent argmax rounds (single CTA per token,
+    # ~1.8x over this triton kernel at [1,896] top-16; ids bit-identical incl. ties).
+    if _ROUTE_RADIX_ENABLED and scores.shape[0] <= 8:
+        _radix_ok = (
+            scoring_func.lower() == "sigmoid"
+            and num_fused_shared_experts == 0
+            and num_expert_group <= 1
+            and moe_softcapping == 0.0
+        )
+        from sglang.jit_kernel.moe_route_radix import covered, route_radix
+
+        if _radix_ok and covered(scores, bias, topk):
+            return route_radix(
+                scores,
+                bias,
+                topk,
+                renormalize,
+                routed_scaling_factor,
+                apply_routed_scaling_factor_on_output,
+            )
 
     M, N = scores.shape
     K = topk
