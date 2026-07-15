@@ -109,16 +109,28 @@ def resolve_prefill_backend(
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
 
+    # EXPERIMENT (SGLANG_DEDICATED_PREFILL_GRAPH_POOL): give the prefill graph its
+    # own CUDA graph memory pool instead of the pool shared with decode, so
+    # prefill's per-call FP4/TRTLLM-MoE scratch cannot alias decode's captured
+    # tensors (the #28386 decode-replay corruption).
+    import os
+
+    dedicated_pool = os.environ.get("SGLANG_DEDICATED_PREFILL_GRAPH_POOL") == "1"
+
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
             debug_eager=model_runner.server_args.debug_cuda_graph,
+            dedicated_pool=dedicated_pool,
         )
     if backend_name == Backend.FULL:
         return FullCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
+            dedicated_pool=dedicated_pool,
         )
     # Default: tc_piecewise.
-    return TcPiecewiseCudaGraphBackend(cuda_graph_runner)
+    return TcPiecewiseCudaGraphBackend(
+        cuda_graph_runner, dedicated_pool=dedicated_pool
+    )

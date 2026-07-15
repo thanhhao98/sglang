@@ -64,11 +64,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
+        dedicated_pool: bool = False,
     ) -> None:
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
+        self._dedicated_pool = dedicated_pool
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -89,7 +91,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            self._pool = (
+                self._device_module.graph_pool_handle()
+                if self._dedicated_pool
+                else get_or_create_global_graph_memory_pool(self._device_module)
+            )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None

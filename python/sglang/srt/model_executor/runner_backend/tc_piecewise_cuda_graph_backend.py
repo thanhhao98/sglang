@@ -83,9 +83,15 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     recomputed at replay outside the compiled callable's sub-graphs.
     """
 
-    def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
+    def __init__(
+        self,
+        cuda_graph_runner: BaseCudaGraphRunner,
+        *,
+        dedicated_pool: bool = False,
+    ) -> None:
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
+        self._dedicated_pool = dedicated_pool
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -166,8 +172,12 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 if self._pool is None:
-                    self._pool = get_or_create_global_graph_memory_pool(
-                        self._device_module
+                    self._pool = (
+                        self._device_module.graph_pool_handle()
+                        if self._dedicated_pool
+                        else get_or_create_global_graph_memory_pool(
+                            self._device_module
+                        )
                     )
                 set_graph_pool_id(self._pool)
 

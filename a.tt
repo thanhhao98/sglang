@@ -1,0 +1,51 @@
+Xin chào! Tôi là trợ lý AI của Hệ thống Quản lý Tài sản. Bạn cần hỗ trợ gì?
+
+công ty tôi hiện có bao nhiêu văn phòng
+Công ty bạn hiện có 4 văn phòng.
+
+SLM (Qwen 2.5 3B)
+1491 ms
+list_offices
+liệt kê cụ thể địa điểm, số lượng nhân viên từng văn phòng
+Số nhân viên theo từng văn phòng:
+
+Văn phòng	Số nhân viên
+Chi nhánh Hải Phòng	59
+Trụ sở chính Hà Nội	55
+Chi nhánh TP.HCM	43
+Chi nhánh Đà Nẵng	39
+Tổng cộng	196
+Rule Engine
+12 ms
+get_dashboard
+những yêu cầu chuyển giao nào đang cần tôi phê duyệt
+Tìm thấy 24 kết quả:
+
+4fbfb6a3-cc3e-4996-ba46-81d0f9dcdddc — pending
+06a75de7-8ae0-47b7-80de-50f803752b8a — pending
+6dbeb86e-ea59-4dcd-998b-9ef1d30eff16 — pending
+47e05a6a-9c47-44e8-bc5e-36dcfd16974e — pending
+780bb369-777d-4c14-8571-bea9a5da9d3e — pending
+73b5cf6a-6936-40f7-b4df-a639b3eb5aa7 — pending
+0b158ccf-abbd-4c5f-a795-f4e7d79219fe — pending
+96884357-b0d3-464a-97b9-434f53b9b326 — pending
+c12e7698-4006-4a59-81b7-3cb93f6a8002 — pending
+6f214375-4bf8-4c8f-af07-1cdf12830609 — pending ... và 14 mục khác.
+SLM (Qwen 2.5 3B)
+1530 ms
+list_transfers
+chi tiết các uyên cầu chuyển giao cũ nhât
+Tìm thấy 62 kết quả:
+
+1e84677e-f559-417d-ad6d-83e4068c6b32 — completed
+247debca-477d-4f58-be20-152194a3065b — completed
+35af5bcc-b9a3-4c36-a65e-bfb2cb84309e — completed
+117aec73-8ad8-4f93-9377-77cb214f7edf — completed
+093d5a57-0624-4b0d-8257-4ca4e395cf43 — completed
+8be69b7e-6f48-4ec1-a193-5cd35a73d5f4 — completed
+**2e7184c1-d2e8-4b31-a7
+SLM (Qwen 2.5 3B)
+2561 ms
+list_transfers
+chi tiết các uyên cầu chuyển giao cũ nhât đang cần duyệt 
+Xin lỗi, tôi chỉ hỗ trợ các tác vụ quản lý tài sản. Bạn vui lòng nêu yêu cầu liên quan nhé.
