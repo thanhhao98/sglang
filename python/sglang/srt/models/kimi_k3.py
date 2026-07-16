@@ -760,7 +760,19 @@ class KimiK3MoE(nn.Module):
                 shared_output = self.shared_experts(hidden_states)
 
             # Gate + TopK (on original hidden_states for correct token count)
-            router_logits, _ = self.gate(hidden_states)
+            if (
+                _K3_DECODE_GEMV
+                and hidden_states.dtype == torch.bfloat16
+                and self.gate.weight.dtype == torch.bfloat16
+            ):
+                # Router GEMM through the tiny-GEMM dispatch ([T, 7168] x
+                # [896, 7168]^T for T <= 8); falls back to F.linear past the
+                # covered regime, same math as self.gate (no bias).
+                from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm
+
+                router_logits = kimi_k3_tiny_gemm(hidden_states, self.gate.weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
 
             # Latent MoE: compress after routing, before experts
@@ -1257,15 +1269,12 @@ class KimiK3DeltaAttention(nn.Module):
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                # decode_gemv re-reads the weight once per token (CTA-per-output),
-                # so its traffic scales linearly with T: measured 2us/launch at
-                # T=1 but 41us at T=64 (5ms/step regression). Break-even vs the
-                # cublas GEMV pair is around T~8.
-                if _K3_DECODE_GEMV and hidden_states.shape[0] <= 8:
-                    from sglang.jit_kernel.kimi_k3.decode_gemv import decode_gemv
+                if _K3_DECODE_GEMV:
+                    from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm as gemm
 
-                    bfa = decode_gemv(hidden_states, w)
-                    forget_gate = decode_gemv(bfa[..., :n_fa], self.f_b_proj.weight)
+                    # TODO: can fuse these 2 GEMMs (trust me)
+                    bfa = gemm(hidden_states, w)
+                    forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 else:
                     bfa = torch.nn.functional.linear(hidden_states, w)
                     forget_gate = self.f_b_proj(bfa[..., :n_fa])[0]
