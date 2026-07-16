@@ -24,6 +24,15 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        # decide_needs_cpu_seq_lens ORs this flag across attn backends; without
+        # the delegation the getattr default (True) forces the per-step
+        # seq_lens D2H + host sync in FutureMap.resolve_seq_lens_cpu even when
+        # both sub-backends opted out (e.g. trtllm_mla prefill + cutedsl_mla
+        # decode), serializing the CPU behind every verify step.
+        self.needs_cpu_seq_lens = bool(
+            getattr(prefill_backend, "needs_cpu_seq_lens", True)
+            or getattr(decode_backend, "needs_cpu_seq_lens", True)
+        )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
