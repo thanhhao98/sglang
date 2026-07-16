@@ -694,6 +694,32 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
+    # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
+    # unfused path). See python/sglang/srt/models/kimi_k3.py.
+    # Latent-MoE TP reduce strategy: baseline | concat | fi_fused;
+    # unset = resolve by topology (multi-node -> concat).
+    SGLANG_K3_MOE_REDUCE_MODE = EnvStr(None)
+    # Horizontal fusion of same-input GEMMs: shared gate_up + router gate +
+    # latent down_proj -> one GEMM / KDA b_proj + f_a_proj -> one GEMV.
+    SGLANG_K3_FUSE_MOE_FRONT = EnvBool(True)
+    SGLANG_K3_FUSE_KDA_BFA = EnvBool(True)
+    # Dedicated CTA-per-output GEMV kernel for the skinny KDA decode
+    # projections (T <= 8) instead of cublas gemvx/dot dispatch.
+    SGLANG_K3_DECODE_GEMV = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_K3_TINY_GEMV"
+    )
+    # Cross-op decode tail fusions: residual add folded into the attn_res
+    # score kernel + MoE tail 3-way add in one kernel.
+    SGLANG_K3_TAIL_FUSE = EnvBool(True)
+    # AttnRes aggregation backend: fused (triton) | jit (CUDA) | torch | legacy.
+    SGLANG_K3_ATTN_RES_MODE = EnvStr("fused")
+    SGLANG_K3_ATTN_RES_FUSED_MIN_T = EnvInt(999999)
+    # Radix-select fast path for the K3 top-16-of-896 sigmoid router
+    # (opt-in; ids bit-identical to the triton router).
+    SGLANG_MOE_FUSED_GATE_RADIX = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_JIT_ROUTE_RADIX"
+    )
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

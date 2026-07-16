@@ -1,4 +1,4 @@
-// Fused 3-way residual add for the K3 latent-MoE tail:
+// K3 latent-MoE tail residual add:
 //   out = bf16( bf16(a + b) + c )
 // replacing the two separate elementwise adds (up_out + shared, then
 // + residual). The double rounding replicates the unfused pair exactly
@@ -17,7 +17,7 @@
 
 namespace {
 
-struct Add3Params {
+struct MoeTailAddParams {
   const bf16_t* __restrict__ a;  // [T, H] contiguous
   const bf16_t* __restrict__ b;  // [T, H] row stride may differ (buffer slice)
   const bf16_t* __restrict__ c;  // [T, H] contiguous
@@ -27,7 +27,7 @@ struct Add3Params {
 };
 
 template <int kThreads, bool kUsePDL>
-__global__ void add3_kernel(const Add3Params __grid_constant__ params) {
+__global__ void moe_tail_add_kernel(const MoeTailAddParams __grid_constant__ params) {
   using namespace device;
 
   constexpr int kVecN = 8;
@@ -57,8 +57,8 @@ __global__ void add3_kernel(const Add3Params __grid_constant__ params) {
 }
 
 template <int kThreads, bool kUsePDL>
-struct Add3Kernel {
-  static constexpr auto kernel = add3_kernel<kThreads, kUsePDL>;
+struct MoeTailAddKernel {
+  static constexpr auto kernel = moe_tail_add_kernel<kThreads, kUsePDL>;
 
   static void
   run(const tvm::ffi::TensorView a,
@@ -82,7 +82,7 @@ struct Add3Kernel {
     RuntimeCheck(H % 8 == 0, "H must be divisible by 8");
     if (T == 0) return;
 
-    const auto params = Add3Params{
+    const auto params = MoeTailAddParams{
         .a = static_cast<const bf16_t*>(a.data_ptr()),
         .b = static_cast<const bf16_t*>(b.data_ptr()),
         .c = static_cast<const bf16_t*>(c.data_ptr()),

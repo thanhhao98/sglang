@@ -20,19 +20,19 @@ _THREADS: int = 128
 
 
 @cache_once
-def _jit_tiny_gemv_module() -> Module:
+def _jit_decode_gemv_module() -> Module:
     """Compile and cache the tiny GEMV kernel."""
     args = make_cpp_args(_THREADS, is_arch_support_pdl())
     return load_jit(
-        "kimi_k3_tiny_gemv_" + str(_THREADS),
+        "kimi_k3_decode_gemv_" + str(_THREADS),
         *args,
-        cuda_files=["kimi_k3/tiny_gemv.cuh"],
-        cuda_wrappers=[("run", f"TinyGemvKernel<{args}>::run")],
+        cuda_files=["kimi_k3/decode_gemv.cuh"],
+        cuda_wrappers=[("run", f"DecodeGemvKernel<{args}>::run")],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
 
 
-def tiny_gemv(
+def decode_gemv(
     x: torch.Tensor,
     w: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -46,8 +46,6 @@ def tiny_gemv(
     aligned; the last dim must be contiguous.
     """
     if out is None:
-        out = torch.empty(
-            (x.shape[0], w.shape[0]), dtype=x.dtype, device=x.device
-        )
-    _jit_tiny_gemv_module().run(x, w, out)
+        out = torch.empty((x.shape[0], w.shape[0]), dtype=x.dtype, device=x.device)
+    _jit_decode_gemv_module().run(x, w, out)
     return out

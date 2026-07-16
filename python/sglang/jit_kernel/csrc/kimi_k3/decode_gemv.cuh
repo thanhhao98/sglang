@@ -21,7 +21,7 @@
 
 namespace {
 
-struct TinyGemvParams {
+struct DecodeGemvParams {
   const bf16_t* __restrict__ x;  // [T, K]
   const bf16_t* __restrict__ w;  // [N, K] row-major
   bf16_t* __restrict__ out;      // [T, N]
@@ -32,14 +32,14 @@ struct TinyGemvParams {
 };
 
 template <int kThreads, bool kUsePDL>
-__global__ void tiny_gemv_kernel(const TinyGemvParams __grid_constant__ params) {
+__global__ void decode_gemv_kernel(const DecodeGemvParams __grid_constant__ params) {
   using namespace device;
 
   constexpr int kVecN = 8;  // 8 bf16 = 128 bits
   using vec_bf16_t = AlignedVector<bf16_t, kVecN>;
 
-  const uint32_t n = blockIdx.x;   // output index
-  const uint32_t t = blockIdx.y;   // token index
+  const uint32_t n = blockIdx.x;  // output index
+  const uint32_t t = blockIdx.y;  // token index
   const uint32_t tid = threadIdx.x;
   const uint32_t n_vecs = params.K / kVecN;
 
@@ -79,13 +79,10 @@ __global__ void tiny_gemv_kernel(const TinyGemvParams __grid_constant__ params) 
 }
 
 template <int kThreads, bool kUsePDL>
-struct TinyGemvKernel {
-  static constexpr auto kernel = tiny_gemv_kernel<kThreads, kUsePDL>;
+struct DecodeGemvKernel {
+  static constexpr auto kernel = decode_gemv_kernel<kThreads, kUsePDL>;
 
-  static void run(
-      const tvm::ffi::TensorView x,
-      const tvm::ffi::TensorView w,
-      const tvm::ffi::TensorView out) {
+  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView out) {
     using namespace host;
 
     auto T_ = SymbolicSize{"num_tokens"};
@@ -95,20 +92,9 @@ struct TinyGemvKernel {
     device.set_options<kDLCUDA>();
 
     // x may be a row slice of a wider fused buffer: allow stride_xt != K.
-    TensorMatcher({T_, K_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .with_strides({-1, 1})
-        .verify(x);
-    TensorMatcher({N_, K_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(w);
-    TensorMatcher({T_, N_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .with_strides({-1, 1})
-        .verify(out);
+    TensorMatcher({T_, K_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(x);
+    TensorMatcher({N_, K_}).with_dtype<bf16_t>().with_device(device).verify(w);
+    TensorMatcher({T_, N_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(out);
 
     const auto num_tokens = static_cast<uint32_t>(T_.unwrap());
     const auto K = static_cast<uint32_t>(K_.unwrap());
@@ -117,7 +103,7 @@ struct TinyGemvKernel {
     RuntimeCheck(K % 8 == 0, "K must be divisible by 8 for vectorized loads");
     if (num_tokens == 0 || N == 0) return;
 
-    const auto params = TinyGemvParams{
+    const auto params = DecodeGemvParams{
         .x = static_cast<const bf16_t*>(x.data_ptr()),
         .w = static_cast<const bf16_t*>(w.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
@@ -128,8 +114,7 @@ struct TinyGemvKernel {
     };
 
     dim3 grid(N, num_tokens);
-    LaunchKernel(grid, kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

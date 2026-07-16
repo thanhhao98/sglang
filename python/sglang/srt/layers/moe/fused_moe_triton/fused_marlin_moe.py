@@ -245,9 +245,9 @@ def fused_marlin_moe(
     if M == 1 and topk <= 32 and expert_map is None:
         # Single-token decode: top-k ids are distinct, so alignment is a
         # single-warp sort instead of the align + count_and_sort kernel pair.
-        from sglang.jit_kernel.moe_align_tiny import moe_align_tiny
+        from sglang.jit_kernel.moe_align_single_token import moe_align_single_token
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_tiny(
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
             topk_ids, block_size_m
         )
     else:

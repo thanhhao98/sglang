@@ -18,18 +18,18 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_align_tiny_module() -> Module:
+def _jit_align_single_token_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        "moe_align_tiny",
+        "moe_align_single_token",
         *args,
-        cuda_files=["moe/align_tiny.cuh"],
-        cuda_wrappers=[("run", f"AlignTinyKernel<{args}>::run")],
+        cuda_files=["moe/align_single_token.cuh"],
+        cuda_wrappers=[("run", f"AlignSingleTokenKernel<{args}>::run")],
         extra_cuda_cflags=["-O3"],
     )
 
 
-def moe_align_tiny(
+def moe_align_single_token(
     topk_ids: torch.Tensor, block_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """moe_align_block_size for a single token (distinct expert ids).
@@ -43,5 +43,7 @@ def moe_align_tiny(
     sorted_ids = torch.empty((topk * block_size,), dtype=torch.int32, device=device)
     expert_ids = torch.empty((topk,), dtype=torch.int32, device=device)
     num_post = torch.empty((1,), dtype=torch.int32, device=device)
-    _jit_align_tiny_module().run(topk_ids, sorted_ids, expert_ids, num_post, block_size)
+    _jit_align_single_token_module().run(
+        topk_ids, sorted_ids, expert_ids, num_post, block_size
+    )
     return sorted_ids, expert_ids, num_post

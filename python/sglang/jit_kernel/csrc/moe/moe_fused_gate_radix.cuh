@@ -204,7 +204,7 @@ __global__ void route_radix_kernel(
 
 namespace {
 
-struct RouteRadixKernel {
+struct MoeFusedGateRadixKernel {
   static void
   run(const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView bias,
@@ -234,7 +234,7 @@ struct RouteRadixKernel {
     // shape/dtype combination to the triton router.
     RuntimeCheck(
         N_.unwrap() == kNumExperts && K_.unwrap() == kTopK && topk == kTopK,
-        "route_radix is specialized for N=896, K=16");
+        "moe_fused_gate_radix is specialized for N=896, K=16");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;

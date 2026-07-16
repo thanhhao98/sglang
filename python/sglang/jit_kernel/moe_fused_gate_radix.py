@@ -6,33 +6,33 @@ _router_triton_kernel exactly (ids bit-identical incl. adversarial ties/NaN;
 weights <= 2.4e-7 rel); 1.79x over the tuned triton router at [1, 896] top-16
 (graphed A/B on GB300), CUDA-graph capturable.
 
-Opt-in via SGLANG_JIT_ROUTE_RADIX=1; callers must also check `covered()`.
+Opt-in via SGLANG_MOE_FUSED_GATE_RADIX=1; callers must also check `covered()`.
 """
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-ROUTE_RADIX_ENABLED = os.environ.get("SGLANG_JIT_ROUTE_RADIX", "0") == "1"
+MOE_FUSED_GATE_RADIX_ENABLED = envs.SGLANG_MOE_FUSED_GATE_RADIX.get()
 
 _NUM_EXPERTS = 896
 _TOPK = 16
 
 
 @cache_once
-def _jit_route_radix_module() -> Module:
+def _jit_moe_fused_gate_radix_module() -> Module:
     return load_jit(
-        "moe_route_radix",
-        cuda_files=["moe/route_radix.cuh"],
-        cuda_wrappers=[("run", "RouteRadixKernel::run")],
+        "moe_fused_gate_radix",
+        cuda_files=["moe/moe_fused_gate_radix.cuh"],
+        cuda_wrappers=[("run", "MoeFusedGateRadixKernel::run")],
         # No fast-math: expert-id selection must stay bit-identical to the
         # triton router under ties/NaN.
         extra_cuda_cflags=["-O3"],
@@ -53,7 +53,7 @@ def covered(scores: torch.Tensor, bias: torch.Tensor, topk: int) -> bool:
     )
 
 
-def route_radix(
+def moe_fused_gate_radix(
     scores: torch.Tensor,
     bias: torch.Tensor,
     topk: int,
@@ -66,7 +66,7 @@ def route_radix(
     M = scores.shape[0]
     out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=scores.device)
-    _jit_route_radix_module().run(
+    _jit_moe_fused_gate_radix_module().run(
         scores,
         bias,
         out_w,

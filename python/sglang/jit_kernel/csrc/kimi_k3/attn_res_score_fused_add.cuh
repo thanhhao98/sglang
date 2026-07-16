@@ -21,7 +21,7 @@
 
 namespace {
 
-struct AttnResScoreFAddParams {
+struct AttnResScoreFusedAddParams {
   const bf16_t* __restrict__ prefix_a;  // [T, H]
   const bf16_t* __restrict__ prefix_b;  // [T, H]
   bf16_t* __restrict__ prefix_out;      // [T, H] (the materialized sum)
@@ -38,7 +38,7 @@ struct AttnResScoreFAddParams {
 };
 
 template <int kBlockH, bool kUsePDL>
-__global__ void attn_res_score_fadd_kernel(const AttnResScoreFAddParams __grid_constant__ params) {
+__global__ void attn_res_score_fused_add_kernel(const AttnResScoreFusedAddParams __grid_constant__ params) {
   using namespace device;
 
   const uint32_t pid_t = blockIdx.x;
@@ -120,8 +120,8 @@ __global__ void attn_res_score_fadd_kernel(const AttnResScoreFAddParams __grid_c
 }
 
 template <int kBlockH, bool kUsePDL>
-struct AttnResScoreFAddKernel {
-  static constexpr auto kernel = attn_res_score_fadd_kernel<kBlockH, kUsePDL>;
+struct AttnResScoreFusedAddKernel {
+  static constexpr auto kernel = attn_res_score_fused_add_kernel<kBlockH, kUsePDL>;
 
   static void
   run(const tvm::ffi::TensorView prefix_a,
@@ -157,7 +157,7 @@ struct AttnResScoreFAddKernel {
     RuntimeCheck(H % 8 == 0, "H must be divisible by 8");
     if (num_tokens == 0) return;
 
-    const auto params = AttnResScoreFAddParams{
+    const auto params = AttnResScoreFusedAddParams{
         .prefix_a = static_cast<const bf16_t*>(prefix_a.data_ptr()),
         .prefix_b = static_cast<const bf16_t*>(prefix_b.data_ptr()),
         .prefix_out = static_cast<bf16_t*>(prefix_out.data_ptr()),
