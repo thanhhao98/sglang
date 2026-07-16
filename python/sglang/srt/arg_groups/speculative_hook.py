@@ -133,6 +133,29 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    _validate_dcp_spec_topk(server_args)
+
+
+def _validate_dcp_spec_topk(server_args: ServerArgs) -> None:
+    """Reject tree drafting (topk > 1) under decode context parallelism.
+
+    The DCP verify path runs a 2-pass cascade: a non-causal fold over the
+    rank-local prefix KV shard plus a rank-local causal fold over the draft
+    tokens, which can only express a linear draft chain. Tree drafts would
+    need a tree-causal pass-2 (not implemented). Runs after the per-algorithm
+    handler so speculative_eagle_topk is resolved (auto-choose -> int, DFLASH
+    forced to 1); algorithms that never use topk leave it None.
+    """
+    if server_args.speculative_algorithm is None or server_args.dcp_size <= 1:
+        return
+    if (server_args.speculative_eagle_topk or 1) > 1:
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) supports only chain "
+            "speculative drafts: the DCP verify cascade folds the draft tokens "
+            "as a linear causal chain. Set --speculative-eagle-topk 1 "
+            f"(got topk={server_args.speculative_eagle_topk})."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:

@@ -17,6 +17,7 @@ import dataclasses
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.speculative_hook import _validate_dcp_spec_topk
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,6 +97,51 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args = self._make_args(dcp_size=8, dcp_comm_backend="ag_rs")
         args._handle_dcp_validation()  # no raise
         self.assertEqual(args.dcp_size, 8)
+
+
+class TestDCPSpecTopkGuard(CustomTestCase):
+    """DCP + speculative decoding permits only chain drafts (topk == 1).
+
+    The guard is ``arg_groups/speculative_hook._validate_dcp_spec_topk``,
+    invoked at the end of ``handle_speculative_decoding`` after the
+    per-algorithm handler has resolved ``speculative_eagle_topk``
+    (auto-choose -> int, DFLASH forced to 1). Tested directly, mirroring the
+    ``_handle_dcp_validation`` pattern above.
+    """
+
+    @staticmethod
+    def _make_args(dcp_size, algorithm, topk):
+        args = ServerArgs(model_path="dummy")
+        args.dcp_size = dcp_size
+        args.speculative_algorithm = algorithm
+        args.speculative_eagle_topk = topk
+        return args
+
+    def test_eagle3_topk2_with_dcp_raises(self):
+        args = self._make_args(8, "EAGLE3", 2)
+        with self.assertRaisesRegex(ValueError, "speculative-eagle-topk"):
+            _validate_dcp_spec_topk(args)
+
+    def test_eagle3_topk1_with_dcp_passes(self):
+        _validate_dcp_spec_topk(self._make_args(8, "EAGLE3", 1))  # no raise
+
+    def test_dflash_with_dcp_passes(self):
+        # _handle_dflash forces topk == 1 before the guard runs.
+        _validate_dcp_spec_topk(self._make_args(8, "DFLASH", 1))  # no raise
+
+    def test_mtp_nextn_chain_with_dcp_passes(self):
+        # NEXTN resolves to EAGLE; MTP drafts run the EAGLE path.
+        _validate_dcp_spec_topk(self._make_args(8, "EAGLE", 1))  # no raise
+
+    def test_topk_none_with_dcp_passes(self):
+        # Algorithms that never resolve topk (e.g. NGRAM) leave it None.
+        _validate_dcp_spec_topk(self._make_args(8, "NGRAM", None))  # no raise
+
+    def test_topk2_without_dcp_passes(self):
+        _validate_dcp_spec_topk(self._make_args(1, "EAGLE3", 2))  # no raise
+
+    def test_no_spec_algorithm_with_dcp_passes(self):
+        _validate_dcp_spec_topk(self._make_args(8, None, None))  # no raise
 
 
 if __name__ == "__main__":
