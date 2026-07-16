@@ -694,6 +694,10 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
+    # Collapse per-layer mamba prefix-cache track launches into one
+    # all-layers launch per decode step (see MambaAttnBackendBase).
+    SGLANG_MAMBA_TRACK_FUSED = EnvBool(True)
+
     # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
     # unfused path). See python/sglang/srt/models/kimi_k3.py.
     # Latent-MoE TP reduce strategy: baseline | concat | fi_fused;

@@ -291,12 +291,13 @@ def moe_fused_gate(
         routed_scaling_factor = 1.0
 
     # Small-batch K3 fast path (SGLANG_MOE_FUSED_GATE_RADIX=1, default off):
-    # native-CUDA radix-select replaces the 16 dependent argmax rounds (single
-    # CTA per token, ~1.8x over this triton kernel at [1,896] top-16; ids
-    # bit-identical incl. ties).
+    # native-CUDA radix-select replaces the 16 dependent argmax rounds (one
+    # CTA per token, ~1.8x over this triton kernel at [M,896] top-16; ids
+    # bit-identical incl. ties). Rows are independent CTAs, so wall time is
+    # flat in M up to decode batch sizes.
     if (
         moe_fused_gate_radix.MOE_FUSED_GATE_RADIX_ENABLED
-        and scores.shape[0] <= 8
+        and scores.shape[0] <= 128
         and scoring_func.lower() == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1

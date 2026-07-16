@@ -911,14 +911,22 @@ class KimiK3MoE(nn.Module):
             if shared_output is not None:
                 if self.tp_size > 1 and not did_shared_reduce:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                if tail_fuse:
-                    # out = bf16(bf16(up + shared) + residual): one kernel, double
-                    # rounding matches the unfused add pair bit-for-bit.
-                    from sglang.jit_kernel.kimi_k3.moe_tail_add import (
-                        kimi_k3_moe_tail_add,
-                    )
+                from sglang.jit_kernel.kimi_k3 import moe_tail_add
 
-                    final_hidden_states = kimi_k3_moe_tail_add(
+                if (
+                    _K3_TAIL_FUSE
+                    and residual is not None
+                    and moe_tail_add.covered(
+                        final_hidden_states,
+                        shared_output,
+                        residual.view(-1, hidden_size),
+                    )
+                ):
+                    # out = bf16(bf16(up + shared) + residual): one kernel, double
+                    # rounding matches the unfused add pair bit-for-bit. Applies
+                    # at any T (prefill included); shared_output may be a
+                    # row-strided slice of the concat-allreduce buffer.
+                    final_hidden_states = moe_tail_add.kimi_k3_moe_tail_add(
                         final_hidden_states,
                         shared_output,
                         residual.view(-1, hidden_size),

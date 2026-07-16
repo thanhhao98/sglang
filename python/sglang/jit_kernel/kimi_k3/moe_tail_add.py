@@ -31,6 +31,21 @@ def _jit_moe_tail_add_module() -> Module:
     )
 
 
+def covered(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> bool:
+    """a/c contiguous [T, H] bf16, b same shape with contiguous rows (its row
+    stride may differ, e.g. a slice of the concat-allreduce buffer)."""
+    return (
+        a.dtype == b.dtype == c.dtype == torch.bfloat16
+        and a.shape == b.shape == c.shape
+        and a.dim() == 2
+        and a.is_contiguous()
+        and c.is_contiguous()
+        and b.stride(1) == 1
+        and a.shape[1] % 8 == 0
+        and a.shape[0] > 0
+    )
+
+
 def kimi_k3_moe_tail_add(
     a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
 ) -> torch.Tensor:

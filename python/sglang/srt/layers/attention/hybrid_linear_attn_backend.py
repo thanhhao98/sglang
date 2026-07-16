@@ -7,9 +7,11 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
+    track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -25,6 +27,12 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+
+# Collapse the per-layer decode track launches into one all-layers launch
+# (fires at the last mamba layer; identical result, see
+# _track_mamba_state_decode).
+_MAMBA_TRACK_FUSED = envs.SGLANG_MAMBA_TRACK_FUSED.get()
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -635,26 +643,73 @@ class MambaAttnBackendBase(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
 
+    def _track_pools(self):
+        """Full [num_layers, pool_size, ...] conv/ssm pools plus the pool index
+        of the last mamba layer, for the fused all-layers track launch. None if
+        the pool shape is not the expected layout."""
+        cached = getattr(self, "_track_pools_cache", False)
+        if cached is False:
+            pools = None
+            try:
+                mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+                conv_pool = mamba_cache.conv[0]
+                ssm_pool = mamba_cache.temporal
+                last_pool_idx = max(self.req_to_token_pool.mamba_map.values())
+                if (
+                    conv_pool.dim() >= 3
+                    and ssm_pool.dim() >= 3
+                    and conv_pool.shape[0] == ssm_pool.shape[0] == last_pool_idx + 1
+                ):
+                    pools = (conv_pool, ssm_pool, last_pool_idx)
+            except (AttributeError, IndexError):
+                pools = None
+            self._track_pools_cache = pools
+            cached = pools
+        return cached
+
     def _track_mamba_state_decode(
         self,
         forward_batch: ForwardBatch,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        layer_id: Optional[int] = None,
     ):
         """Copy decode conv/SSM states to track slots for prefix caching. Track
         dests come from the metadata (under cuda-graph: the static buffer), so the
-        InputBuffer registry slot is never mutated."""
-        if forward_batch.mamba_track_mask is not None:
-            track_mamba_states_if_needed(
-                conv_states,
-                ssm_states,
-                cache_indices,
-                forward_batch.mamba_track_mask,
-                self.forward_metadata.mamba_track_indices,
-                forward_batch.batch_size,
-                check_freed_slots=self.enable_unified_memory,
-            )
+        InputBuffer registry slot is never mutated.
+
+        With SGLANG_MAMBA_TRACK_FUSED (default on) and a known layer_id, the
+        per-layer launches collapse into ONE all-layers launch fired at the
+        last mamba layer: the mask/src/dst indices are shared across layers and
+        every layer's state is final by then, so the result is identical."""
+        if forward_batch.mamba_track_mask is None:
+            return
+        if _MAMBA_TRACK_FUSED and layer_id is not None:
+            pools = self._track_pools()
+            if pools is not None:
+                conv_pool, ssm_pool, last_pool_idx = pools
+                if self.req_to_token_pool.mamba_map.get(layer_id) != last_pool_idx:
+                    return
+                track_mamba_states_all_layers(
+                    conv_pool,
+                    ssm_pool,
+                    cache_indices,
+                    forward_batch.mamba_track_mask,
+                    self.forward_metadata.mamba_track_indices,
+                    forward_batch.batch_size,
+                    check_freed_slots=self.enable_unified_memory,
+                )
+                return
+        track_mamba_states_if_needed(
+            conv_states,
+            ssm_states,
+            cache_indices,
+            forward_batch.mamba_track_mask,
+            self.forward_metadata.mamba_track_indices,
+            forward_batch.batch_size,
+            check_freed_slots=self.enable_unified_memory,
+        )
 
     def _track_mamba_state_extend(
         self,
