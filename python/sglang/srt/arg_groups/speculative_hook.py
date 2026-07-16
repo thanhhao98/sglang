@@ -144,16 +144,22 @@ def _validate_dcp_spec_topk(server_args: ServerArgs) -> None:
     tokens, which can only express a linear draft chain. Tree drafts would
     need a tree-causal pass-2 (not implemented). Runs after the per-algorithm
     handler so speculative_eagle_topk is resolved (auto-choose -> int, DFLASH
-    forced to 1); algorithms that never use topk leave it None.
+    forced to 1, NGRAM overwritten from --speculative-ngram-max-bfs-breadth).
+    getattr: unit tests drive this hook with duck-typed ServerArgs mocks.
     """
-    if server_args.speculative_algorithm is None or server_args.dcp_size <= 1:
+    if (
+        server_args.speculative_algorithm is None
+        or getattr(server_args, "dcp_size", 1) <= 1
+    ):
         return
-    if (server_args.speculative_eagle_topk or 1) > 1:
+    topk = getattr(server_args, "speculative_eagle_topk", None)
+    if (topk or 1) > 1:
         raise ValueError(
             "Decode context parallel (--dcp-size > 1) supports only chain "
             "speculative drafts: the DCP verify cascade folds the draft tokens "
-            "as a linear causal chain. Set --speculative-eagle-topk 1 "
-            f"(got topk={server_args.speculative_eagle_topk})."
+            "as a linear causal chain. Set --speculative-eagle-topk 1 (for "
+            "NGRAM, --speculative-ngram-max-bfs-breadth 1, which is what topk "
+            f"is resolved from). Got topk={topk}."
         )
 
 
