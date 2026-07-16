@@ -60,19 +60,22 @@ logger = logging.getLogger(__name__)
 
 # Workspace upper bound for tokenspeed_mla_decode:
 #   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
+# The per-call q_len is 1 for plain decode and num_draft_tokens for the
+# spec-decode verify folds, so the workspace is sized for
+# max(_TOKENSPEED_MAX_Q_LEN, speculative_num_draft_tokens). The floor of 8
+# covers the validated EAGLE3 (ndt=4) and DFlash (ndt=8) configs.
 _TOKENSPEED_MAX_Q_LEN = 8
 
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device, num_heads: int, kv_lora_rank: int, max_q_len: int
 ) -> torch.Tensor:
     needed = (
         tokenspeed_mla.get_num_sm(device)
         * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
+        * max_q_len
         * (kv_lora_rank + 1)
         * 4
     )
@@ -114,6 +117,18 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 "tokenspeed_mla backend requires page_size in {32, 64}, "
                 f"got page_size={self.page_size}."
             )
+        if (
+            get_attention_dcp_world_size() > 1
+            and self.num_draft_tokens is not None
+            and self.num_draft_tokens > self.page_size
+        ):
+            raise ValueError(
+                "tokenspeed_mla under DCP requires speculative_num_draft_tokens "
+                "<= page_size: the verify cascade packs one request's draft-token "
+                "latents into a single page (_forward_verify_dcp pass-2); got "
+                f"num_draft_tokens={self.num_draft_tokens}, "
+                f"page_size={self.page_size}."
+            )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
@@ -124,6 +139,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 self.device,
                 self.num_q_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
+                max(_TOKENSPEED_MAX_Q_LEN, self.num_draft_tokens or 1),
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
