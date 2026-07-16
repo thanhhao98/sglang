@@ -62,9 +62,9 @@ def _score_kernel(
     for h0 in tl.static_range(0, H, BLOCK_H):
         offs_h = h0 + tl.arange(0, BLOCK_H)
         if j < NVB:
-            v = tl.load(
-                bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h
-            ).to(tl.float32)
+            v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
+                tl.float32
+            )
         else:
             v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
         cw = tl.load(cw_ptr + offs_h)
@@ -116,9 +116,9 @@ def _combine_kernel(
     acc = tl.zeros([BLOCK_H], tl.float32)
     for j in range(0, NVB + 1):
         if j < NVB:
-            v = tl.load(
-                bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h
-            ).to(tl.float32)
+            v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
+                tl.float32
+            )
         else:
             v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
         p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
@@ -145,24 +145,39 @@ def _aggregate_fused(
     n_h_blocks = H // _BLOCK_H
 
     # Step 1: score each row (2D grid, full row-parallelism)
-    scores = torch.empty(
-        (T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device
-    )
+    scores = torch.empty((T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device)
     _score_kernel[(T, nvb + 1)](
-        prefix_sum, bank, cw, scores,
-        nvb, score_norm.variance_epsilon,
-        prefix_sum.stride(0), bank.stride(0), bank.stride(1), scores.stride(0),
-        H=H, BLOCK_H=_BLOCK_H, num_warps=8,
+        prefix_sum,
+        bank,
+        cw,
+        scores,
+        nvb,
+        score_norm.variance_epsilon,
+        prefix_sum.stride(0),
+        bank.stride(0),
+        bank.stride(1),
+        scores.stride(0),
+        H=H,
+        BLOCK_H=_BLOCK_H,
+        num_warps=8,
     )
 
     # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
     out = torch.empty_like(prefix_sum)
     _combine_kernel[(T, n_h_blocks)](
-        prefix_sum, bank, scores, out,
+        prefix_sum,
+        bank,
+        scores,
+        out,
         nvb,
-        prefix_sum.stride(0), bank.stride(0), bank.stride(1),
-        scores.stride(0), out.stride(0),
-        BLOCK_H=_BLOCK_H, MAX_ROWS=_MAX_ROWS, num_warps=4,
+        prefix_sum.stride(0),
+        bank.stride(0),
+        bank.stride(1),
+        scores.stride(0),
+        out.stride(0),
+        BLOCK_H=_BLOCK_H,
+        MAX_ROWS=_MAX_ROWS,
+        num_warps=4,
     )
 
     # Step 3: standard RMSNorm (sglang's optimized kernel)
@@ -187,9 +202,7 @@ def _aggregate_jit(
     n_h_blocks = H // _BLOCK_H
 
     # Step 1: score each row (2D grid, full row-parallelism)
-    scores = torch.empty(
-        (T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device
-    )
+    scores = torch.empty((T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device)
     attn_res_score(prefix_sum, bank, cw, scores, nvb, score_norm.variance_epsilon)
 
     # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
@@ -225,6 +238,57 @@ def _aggregate_torch(
     return out_norm(mixed.to(prefix_sum.dtype))
 
 
+# ---- Fused residual-add + aggregation (jit mode) -----------------------------
+
+
+def attn_res_aggregate_fadd(
+    prefix_a: torch.Tensor,
+    prefix_b: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+):
+    """Aggregation point with the upstream residual add fused into the score
+    kernel: prefix = bf16(prefix_a + prefix_b) is computed on the fly by the
+    prefix-row CTA (bit-identical to the standalone add) and materialized for
+    the combine kernel / downstream consumers. Returns (normed, prefix).
+
+    jit mode only; other modes fall back to add-then-aggregate."""
+    if _MODE == "jit":
+        from sglang.jit_kernel.kimi_k3.attn_res import (
+            attn_res_combine,
+            attn_res_score_fadd,
+        )
+
+        T, H = prefix_a.shape
+        cw = get_cw(score_proj, score_norm)
+        prefix = torch.empty_like(prefix_a)
+        scores = torch.empty(
+            (T, _MAX_ROWS), dtype=torch.float32, device=prefix_a.device
+        )
+        attn_res_score_fadd(
+            prefix_a,
+            prefix_b,
+            prefix,
+            bank,
+            cw,
+            scores,
+            nvb,
+            score_norm.variance_epsilon,
+        )
+        out = torch.empty_like(prefix)
+        attn_res_combine(prefix, bank, scores, out, nvb)
+        return out_norm(out), prefix
+
+    prefix = prefix_a + prefix_b
+    return (
+        attn_res_aggregate(prefix, bank, nvb, score_proj, score_norm, out_norm),
+        prefix,
+    )
+
+
 # ---- Public dispatch ---------------------------------------------------------
 
 
@@ -241,13 +305,7 @@ def attn_res_aggregate(
     Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
     """
     if _MODE == "torch":
-        return _aggregate_torch(
-            prefix_sum, bank, nvb, score_proj, score_norm, out_norm
-        )
+        return _aggregate_torch(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
     if _MODE == "jit":
-        return _aggregate_jit(
-            prefix_sum, bank, nvb, score_proj, score_norm, out_norm
-        )
-    return _aggregate_fused(
-        prefix_sum, bank, nvb, score_proj, score_norm, out_norm
-    )
+        return _aggregate_jit(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
+    return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)

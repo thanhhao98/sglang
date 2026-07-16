@@ -242,9 +242,18 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, global_num_experts
-    )
+    if M == 1 and topk <= 32 and expert_map is None:
+        # Single-token decode: top-k ids are distinct, so alignment is a
+        # single-warp sort instead of the align + count_and_sort kernel pair.
+        from sglang.jit_kernel.moe_align_tiny import moe_align_tiny
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_tiny(
+            topk_ids, block_size_m
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, block_size_m, global_num_experts
+        )
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (
@@ -379,7 +388,23 @@ def fused_marlin_moe(
     output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
-        return torch.sum(intermediate_cache3, dim=1, out=output)
+        # Top-k weights (incl. routed scaling) are already applied above via
+        # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
+        # vectorized pass (~1.5us at decode shapes) beats sgl_kernel's
+        # moe_sum_reduce_kernel_general (~5.7us) and the generic at::native
+        # reduce_kernel torch.sum dispatches to (~6.7us).
+        if (
+            intermediate_cache3.dtype == torch.bfloat16
+            and intermediate_cache3.is_contiguous()
+            and output.is_contiguous()
+            and intermediate_cache3.shape[-1] % 8 == 0
+        ):
+            from sglang.jit_kernel.moe_topk_sum import moe_topk_sum
+
+            moe_topk_sum(intermediate_cache3, output)
+        else:
+            moe_sum_reduce(intermediate_cache3, output, 1.0)
+        return output
     else:
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0

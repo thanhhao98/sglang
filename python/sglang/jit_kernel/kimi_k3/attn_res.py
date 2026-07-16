@@ -50,6 +50,37 @@ def _jit_combine_module() -> Module:
     )
 
 
+@cache_once
+def _jit_score_fadd_module() -> Module:
+    """Compile and cache the JIT AttnRes score+residual-add kernel."""
+    args = make_cpp_args(_BLOCK_H, is_arch_support_pdl())
+    return load_jit(
+        _make_name("score_fadd"),
+        *args,
+        cuda_files=["kimi_k3/attn_res_score_fadd.cuh"],
+        cuda_wrappers=[("run", f"AttnResScoreFAddKernel<{args}>::run")],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+    )
+
+
+def attn_res_score_fadd(
+    prefix_a: torch.Tensor,
+    prefix_b: torch.Tensor,
+    prefix_out: torch.Tensor,
+    bank: torch.Tensor,
+    cw: torch.Tensor,
+    scores: torch.Tensor,
+    nvb: int,
+    eps: float,
+) -> None:
+    """attn_res_score with the upstream residual add fused: the prefix row is
+    computed as bf16(prefix_a + prefix_b) on the fly, written to prefix_out
+    (bit-identical to the standalone add), and scored."""
+    _jit_score_fadd_module().run(
+        prefix_a, prefix_b, prefix_out, bank, cw, scores, nvb, eps
+    )
+
+
 def attn_res_score(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,

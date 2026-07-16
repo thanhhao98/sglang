@@ -86,6 +86,19 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        # Chunked-prefix / one-shot MHA metadata is a prefill concern. Without
+        # this delegation the MLA MHA path silently skips (re)planning its
+        # ragged wrappers when the full-attn backend is this prefill/decode
+        # split (e.g. --decode-attention-backend trtllm_mla), and any
+        # prefix-cache-hit extend batch then runs against a stale plan:
+        #   ValueError: q.shape[0] (...) does not match qo_indptr[-1] (...)
+        init = getattr(self.prefill_backend, "init_mha_chunk_metadata", None)
+        if init is not None:
+            init(forward_batch, disable_flashinfer_ragged)
+
     def forward(
         self,
         q: Optional[torch.Tensor] = None,  # For full attention
