@@ -8,16 +8,15 @@
 #   "torch"  — PyTorch reference (readable, for debugging)
 #   "legacy" — original path in kimi_k3.py
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 
-_MODE = os.environ.get("SGLANG_K3_ATTN_RES_MODE", "fused")
+_MODE = envs.SGLANG_K3_ATTN_RES_MODE.get()
 _BLOCK_H: int = 1024  # H=7168 = 7 × 1024
 _MAX_ROWS: int = 16  # next_pow2(8+1), K3 has ≤8 snapshots
 
@@ -241,7 +240,7 @@ def _aggregate_torch(
 # ---- Fused residual-add + aggregation (jit mode) -----------------------------
 
 
-def attn_res_aggregate_fadd(
+def attn_res_aggregate_fused_add(
     prefix_a: torch.Tensor,
     prefix_b: torch.Tensor,
     bank: torch.Tensor,
@@ -259,7 +258,7 @@ def attn_res_aggregate_fadd(
     if _MODE == "jit":
         from sglang.jit_kernel.kimi_k3.attn_res import (
             attn_res_combine,
-            attn_res_score_fadd,
+            attn_res_score_fused_add,
         )
 
         T, H = prefix_a.shape
@@ -268,7 +267,7 @@ def attn_res_aggregate_fadd(
         scores = torch.empty(
             (T, _MAX_ROWS), dtype=torch.float32, device=prefix_a.device
         )
-        attn_res_score_fadd(
+        attn_res_score_fused_add(
             prefix_a,
             prefix_b,
             prefix,

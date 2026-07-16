@@ -19,7 +19,7 @@
 
 namespace {
 
-struct AlignTinyParams {
+struct AlignSingleTokenParams {
   const int32_t* __restrict__ topk_ids;  // [1, topk]
   int32_t* __restrict__ sorted_ids;      // [topk * block_size]
   int32_t* __restrict__ expert_ids;      // [topk]
@@ -29,7 +29,7 @@ struct AlignTinyParams {
 };
 
 template <bool kUsePDL>
-__global__ void align_tiny_kernel(const AlignTinyParams __grid_constant__ params) {
+__global__ void align_single_token_kernel(const AlignSingleTokenParams __grid_constant__ params) {
   using namespace device;
   const uint32_t lane = threadIdx.x;  // one warp
   const uint32_t topk = params.topk;
@@ -69,11 +69,11 @@ __global__ void align_tiny_kernel(const AlignTinyParams __grid_constant__ params
 }
 
 template <bool kUsePDL>
-struct AlignTinyKernel {
-  static constexpr auto kernel = align_tiny_kernel<kUsePDL>;
+struct AlignSingleTokenKernel {
+  static constexpr auto kernel = align_single_token_kernel<kUsePDL>;
 
-  static void run(
-      const tvm::ffi::TensorView topk_ids,
+  static void
+  run(const tvm::ffi::TensorView topk_ids,
       const tvm::ffi::TensorView sorted_ids,
       const tvm::ffi::TensorView expert_ids,
       const tvm::ffi::TensorView num_post,
@@ -85,16 +85,13 @@ struct AlignTinyKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({One_, K_})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(topk_ids);
+    TensorMatcher({One_, K_}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
 
     const auto topk = static_cast<uint32_t>(K_.unwrap());
-    RuntimeCheck(One_.unwrap() == 1, "align_tiny requires M == 1");
-    RuntimeCheck(topk <= 32, "align_tiny requires topk <= 32");
+    RuntimeCheck(One_.unwrap() == 1, "moe_align_single_token requires M == 1");
+    RuntimeCheck(topk <= 32, "moe_align_single_token requires topk <= 32");
 
-    const auto params = AlignTinyParams{
+    const auto params = AlignSingleTokenParams{
         .topk_ids = static_cast<const int32_t*>(topk_ids.data_ptr()),
         .sorted_ids = static_cast<int32_t*>(sorted_ids.data_ptr()),
         .expert_ids = static_cast<int32_t*>(expert_ids.data_ptr()),
@@ -103,8 +100,7 @@ struct AlignTinyKernel {
         .block_size = static_cast<uint32_t>(block_size),
     };
 
-    LaunchKernel(dim3(1), 32, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(dim3(1), 32, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

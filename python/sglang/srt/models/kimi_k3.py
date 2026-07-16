@@ -6,7 +6,6 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
-import os
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
@@ -26,6 +25,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
@@ -41,6 +41,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import single_token_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -100,7 +101,7 @@ def _cdiv(a: int, b: int) -> int:
 # unavailable, both reduces go through NCCL, and one 21.5KB collective
 # beats a 7KB + 14KB pair (2x4 GB300 MNNVL bs=1: 22.05 -> 21.36 ms ITL).
 # Default resolves by topology in KimiK3MoE.__init__; env overrides.
-_K3_MOE_REDUCE_MODE = os.environ.get("SGLANG_K3_MOE_REDUCE_MODE")
+_K3_MOE_REDUCE_MODE = envs.SGLANG_K3_MOE_REDUCE_MODE.get()
 
 
 def _resolve_moe_reduce_mode() -> str:
@@ -117,23 +118,19 @@ def _resolve_moe_reduce_mode() -> str:
     return "baseline"
 
 
-def _env_flag(name: str) -> bool:
-    """Decode-path optimization switch; all default ON, set to "0" to A/B
-    against the unfused path."""
-    return os.environ.get(name, "1") == "1"
-
-
 # Horizontal fusion of same-input GEMMs (decode is launch/BW bound):
 #   moe_front: shared gate_up + router gate + latent down_proj -> one GEMM
-#   kda_bfa:   KDA b_proj + f_a_proj -> one GEMM
-_K3_FUSE_MOE_FRONT = _env_flag("SGLANG_K3_FUSE_MOE_FRONT")
-_K3_FUSE_KDA_BFA = _env_flag("SGLANG_K3_FUSE_KDA_BFA")
-# Use the dedicated CUDA tiny-GEMV kernel for the skinny KDA projections
+#   kda_bfa:   KDA b_proj + f_a_proj -> one GEMV
+_K3_FUSE_MOE_FRONT = envs.SGLANG_K3_FUSE_MOE_FRONT.get()
+_K3_FUSE_KDA_BFA = envs.SGLANG_K3_FUSE_KDA_BFA.get()
+# Use the dedicated CUDA decode-GEMV kernel for the skinny KDA projections
 # (b+f_a merged, f_b) instead of cublas gemvx/dot dispatch.
-_K3_TINY_GEMV = _env_flag("SGLANG_K3_TINY_GEMV")
+_K3_DECODE_GEMV = envs.SGLANG_K3_DECODE_GEMV.get()
 # Cross-op tail fusions (decode): residual add fused into the attn_res score
 # kernel, and the MoE tail 3-way add (up + shared + residual) in one kernel.
-_K3_TAIL_FUSE = _env_flag("SGLANG_K3_TAIL_FUSE")
+_K3_TAIL_FUSE = envs.SGLANG_K3_TAIL_FUSE.get()
+# MLA output gate x * sigmoid(g) in one kernel instead of two elementwise.
+_K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
 
 
 def _merge_weights_as_views(
@@ -161,7 +158,7 @@ def _merge_weights_as_views(
 # "fused" = new single-kernel aggregation (attn_residual.py)
 # "torch" = pytorch reference (attn_residual.py)
 # "legacy" = existing multi-kernel path (below)
-_K3_ATTN_RES_MODE = os.environ.get("SGLANG_K3_ATTN_RES_MODE", "fused")
+_K3_ATTN_RES_MODE = envs.SGLANG_K3_ATTN_RES_MODE.get()
 
 _ATTN_RES_MAX_B = 16
 _ATTN_RES_BLOCK_H = 1024
@@ -423,9 +420,7 @@ def _attn_res_combine_kernel(
 # bs=64 decode (650 vs 673 tok/s: 64 CTAs underfill 148 SMs), while prefill
 # (T>=1024) shows no measurable difference (attn-res is a tiny fraction of
 # GEMM-dominated prefill). Disabled by default; kernels kept for retuning.
-_ATTN_RES_FUSED_NORM_MIN_T = int(
-    os.environ.get("SGLANG_K3_ATTN_RES_FUSED_MIN_T", "999999")
-)
+_ATTN_RES_FUSED_NORM_MIN_T = envs.SGLANG_K3_ATTN_RES_FUSED_MIN_T.get()
 
 
 def _attn_res_combine_norm(
@@ -598,8 +593,8 @@ class KimiK3MoE(nn.Module):
         # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         self.moe_reduce_mode = _resolve_moe_reduce_mode()
-        # Merged front weight ([H, gate_up + E + latent]), built lazily at the
-        # first forward by _moe_front_weight().
+        # Merged front weight ([H, gate_up + E + latent]), built after weight
+        # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
         self.moe_hidden_size = (
@@ -697,23 +692,33 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
-    def _moe_front_weight(self) -> torch.Tensor:
-        """Lazily merge shared gate_up + router gate + latent down_proj weights.
+    def _merge_front_weights(self) -> None:
+        """Merge shared gate_up + router gate + latent down_proj weights.
 
         All three GEMMs consume the same hidden_states; at decode each one is a
         skinny memory-bound GEMV with its own splitK epilogue. One merged
         [H, gu+E+latent] GEMM reads the input once and drops 2 GEMM launches
         plus their splitK-reduce tails per MoE layer.
+
+        Called once from load_weights (after all weights are loaded, before
+        cuda graph capture); only plain bf16/fp16 dense weights are merged —
+        quantized or mixed-dtype checkpoints keep the unfused path.
         """
-        if self._front_w is None:
-            self._front_w, self._front_sizes = _merge_weights_as_views(
-                [
-                    self.shared_experts.gate_up_proj,
-                    self.gate,
-                    self.routed_expert_down_proj,
-                ]
-            )
-        return self._front_w
+        if not (
+            _K3_FUSE_MOE_FRONT
+            and self.use_latent_moe
+            and self.shared_experts is not None
+        ):
+            return
+        mods = [
+            self.shared_experts.gate_up_proj,
+            self.gate,
+            self.routed_expert_down_proj,
+        ]
+        dtypes = {m.weight.dtype for m in mods}
+        if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
+            return
+        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
 
     def _tail_fuse_applicable(
         self, num_tokens: int, residual: Optional[torch.Tensor]
@@ -721,7 +726,7 @@ class KimiK3MoE(nn.Module):
         """Tail-fusion regime (single-token decode on the concat-reduce path):
         defer the shared down GEMM so it writes its partial sum directly into
         the concat-AR buffer (no torch.cat), and fold up_out + shared +
-        residual into one add3 kernel at the end."""
+        residual into one moe_tail_add kernel at the end."""
         return (
             _K3_TAIL_FUSE
             and self.use_latent_moe
@@ -744,12 +749,9 @@ class KimiK3MoE(nn.Module):
         usual non-None marker.
         """
         use_fused_front = (
-            _K3_FUSE_MOE_FRONT
-            and self.use_latent_moe
-            and self.shared_experts is not None
+            self._front_w is not None
             and hidden_states.shape[0] > 0
-            and self.gate.weight.dtype == hidden_states.dtype
-            and self.shared_experts.gate_up_proj.weight.dtype == hidden_states.dtype
+            and self._front_w.dtype == hidden_states.dtype
         )
         if not use_fused_front:
             # Shared experts on original hidden_states
@@ -768,7 +770,7 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states
             return routed_input, topk_output, shared_output, None
 
-        fused = torch.nn.functional.linear(hidden_states, self._moe_front_weight())
+        fused = torch.nn.functional.linear(hidden_states, self._front_w)
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -792,6 +794,7 @@ class KimiK3MoE(nn.Module):
         shared_output: torch.Tensor,
         shared_act: Optional[torch.Tensor],
         hidden_size: int,
+        buf: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One NCCL call instead of two: all-reduce the routed latent (3584)
         and shared (7168) partial sums as a single [latent | shared] buffer.
@@ -803,22 +806,25 @@ class KimiK3MoE(nn.Module):
         straight into the buffer slice and the routed latent is one small
         copy — replacing down-GEMM-then-cat (one fewer 14KB round trip).
         """
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            if shared_act is not None:
-                buf = final_hidden_states.new_empty(
-                    final_hidden_states.shape[0], self.moe_hidden_size + hidden_size
-                )
-            else:
-                buf = torch.cat((final_hidden_states, shared_output), dim=-1)
+        if buf is None:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                if shared_act is not None:
+                    buf = final_hidden_states.new_empty(
+                        final_hidden_states.shape[0],
+                        self.moe_hidden_size + hidden_size,
+                    )
+                else:
+                    buf = torch.cat((final_hidden_states, shared_output), dim=-1)
         if shared_act is not None:
             torch.mm(
                 shared_act,
                 self.shared_experts.down_proj.weight.t(),
                 out=buf[..., self.moe_hidden_size :],
             )
-            buf[..., : self.moe_hidden_size].copy_(final_hidden_states)
+            if final_hidden_states.data_ptr() != buf.data_ptr():
+                buf[..., : self.moe_hidden_size].copy_(final_hidden_states)
         buf = tensor_model_parallel_all_reduce(buf)
         return (
             buf[..., : self.moe_hidden_size].contiguous(),
@@ -836,8 +842,24 @@ class KimiK3MoE(nn.Module):
             hidden_states, tail_fuse
         )
 
+        # Deferred-tail regime: preallocate the concat-AR buffer and hand its
+        # routed slice to the MoE runner as the final-sum destination, so the
+        # top-k sum writes it directly and _concat_reduce drops its memcpy
+        # (attempt-and-verify: an unconsumed handoff falls back to the copy).
+        buf = None
+        if shared_act is not None:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                buf = routed_input.new_empty(1, self.moe_hidden_size + hidden_size)
+            single_token_handoff.stash_output_destination(
+                routed_input, buf[:, : self.moe_hidden_size]
+            )
+
         # Experts
         final_hidden_states = self.experts(routed_input, topk_output)
+        if buf is not None:
+            single_token_handoff.clear_output_destination()
 
         # With an a2a backend (deepep etc.), the combine step already returns
         # the COMPLETE routed sum; all-reducing again would multiply by tp_size.
@@ -855,7 +877,7 @@ class KimiK3MoE(nn.Module):
                 and self.moe_reduce_mode == "concat"
             ):
                 final_hidden_states, shared_output = self._concat_reduce(
-                    final_hidden_states, shared_output, shared_act, hidden_size
+                    final_hidden_states, shared_output, shared_act, hidden_size, buf
                 )
                 did_shared_reduce = True
             elif routed_needs_reduce:
@@ -889,12 +911,22 @@ class KimiK3MoE(nn.Module):
             if shared_output is not None:
                 if self.tp_size > 1 and not did_shared_reduce:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                if tail_fuse:
-                    # out = bf16(bf16(up + shared) + residual): one kernel, double
-                    # rounding matches the unfused add pair bit-for-bit.
-                    from sglang.jit_kernel.kimi_k3.add3 import add3
+                from sglang.jit_kernel.kimi_k3 import moe_tail_add
 
-                    final_hidden_states = add3(
+                if (
+                    _K3_TAIL_FUSE
+                    and residual is not None
+                    and moe_tail_add.covered(
+                        final_hidden_states,
+                        shared_output,
+                        residual.view(-1, hidden_size),
+                    )
+                ):
+                    # out = bf16(bf16(up + shared) + residual): one kernel, double
+                    # rounding matches the unfused add pair bit-for-bit. Applies
+                    # at any T (prefill included); shared_output may be a
+                    # row-strided slice of the concat-allreduce buffer.
+                    final_hidden_states = moe_tail_add.kimi_k3_moe_tail_add(
                         final_hidden_states,
                         shared_output,
                         residual.view(-1, hidden_size),
@@ -1015,8 +1047,8 @@ class KimiK3DeltaAttention(nn.Module):
                 tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.f_b_proj",
             )
-            # Merged [f_a | b] weight, built lazily at the first forward by
-            # _bfa_weight().
+            # Merged [f_a | b] weight, built after weight loading by
+            # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -1200,37 +1232,40 @@ class KimiK3DeltaAttention(nn.Module):
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         return qkv, beta, forget_gate, g_proj_states
 
-    def _bfa_weight(self) -> torch.Tensor:
-        """Lazily merge f_a_proj (head_dim outputs) + b_proj (heads/tp outputs).
+    def _merge_bfa_weights(self) -> None:
+        """Merge f_a_proj (head_dim outputs) + b_proj (heads/tp outputs).
 
         Both are skinny same-input GEMVs at decode: b lands in a cublas dot
         kernel pair, f_a in a splitK GEMM. One [H, head_dim + heads/tp (+pad)]
         GEMV replaces both. f_a leads so its output slice starts at offset 0,
         and the width is padded to a multiple of 8 so every fused-output row
-        stays 16-byte aligned for vectorized consumers (tiny_gemv on f_b)."""
-        if self._bfa_w is None:
-            self._bfa_w, sizes = _merge_weights_as_views(
-                [self.f_a_proj, self.b_proj], pad_rows_to=8
-            )
-            self._bfa_fa_size, self._bfa_b_size = sizes
-        return self._bfa_w
+        stays 16-byte aligned for vectorized consumers (decode_gemv on f_b).
+
+        Called once from load_weights (after all weights are loaded, before
+        cuda graph capture)."""
+        if not (_K3_FUSE_KDA_BFA and self.use_full_rank_gate):
+            return
+        self._bfa_w, sizes = _merge_weights_as_views(
+            [self.f_a_proj, self.b_proj], pad_rows_to=8
+        )
+        self._bfa_fa_size, self._bfa_b_size = sizes
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
             fused_states, _ = self.fused_qkvg_proj(hidden_states)
             qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
-            if _K3_FUSE_KDA_BFA:
-                w = self._bfa_weight()
+            if self._bfa_w is not None:
+                w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                # tiny_gemv re-reads the weight once per token (CTA-per-output),
+                # decode_gemv re-reads the weight once per token (CTA-per-output),
                 # so its traffic scales linearly with T: measured 2us/launch at
                 # T=1 but 41us at T=64 (5ms/step regression). Break-even vs the
                 # cublas GEMV pair is around T~8.
-                if _K3_TINY_GEMV and hidden_states.shape[0] <= 8:
-                    from sglang.jit_kernel.kimi_k3.tiny_gemv import tiny_gemv
+                if _K3_DECODE_GEMV and hidden_states.shape[0] <= 8:
+                    from sglang.jit_kernel.kimi_k3.decode_gemv import decode_gemv
 
-                    bfa = tiny_gemv(hidden_states, w)
-                    forget_gate = tiny_gemv(bfa[..., :n_fa], self.f_b_proj.weight)
+                    bfa = decode_gemv(hidden_states, w)
+                    forget_gate = decode_gemv(bfa[..., :n_fa], self.f_b_proj.weight)
                 else:
                     bfa = torch.nn.functional.linear(hidden_states, w)
                     forget_gate = self.f_b_proj(bfa[..., :n_fa])[0]
@@ -1332,7 +1367,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
                     gate, _ = self.g_proj(gate_input)
-                    x = x * torch.sigmoid(gate)
+                    from sglang.jit_kernel.kimi_k3 import mla_output_gate
+
+                    if _K3_FUSE_O_GATE and mla_output_gate.covered(x, gate):
+                        # One kernel for x * sigmoid(gate); double rounding
+                        # matches the unfused pair bit-for-bit.
+                        x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
+                    else:
+                        x = x * torch.sigmoid(gate)
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -1518,7 +1560,7 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.layers.attn_residual import (
             attn_res_aggregate,
-            attn_res_aggregate_fadd,
+            attn_res_aggregate_fused_add,
         )
 
         prefix_sum = hidden_states
@@ -1562,7 +1604,7 @@ class KimiK3DecoderLayer(nn.Module):
             # Residual add fused into the score kernel (bit-identical rounding);
             # the summed prefix is materialized by the kernel for combine and
             # for the accumulate below.
-            hidden_states, prefix_sum = attn_res_aggregate_fadd(
+            hidden_states, prefix_sum = attn_res_aggregate_fused_add(
                 prefix_sum,
                 attn_out,
                 block_residual,
@@ -2052,6 +2094,25 @@ class KimiK3LinearForCausalLM(nn.Module):
             _attn_res_cw(
                 self.model.output_attn_res_proj, self.model.output_attn_res_norm
             )
+
+        # Post-load: merge the horizontally-fused decode weights. Module
+        # weights are re-pointed to views of the merged buffers (net extra
+        # memory ~0), so this must run after all weights are loaded and
+        # before cuda graph capture.
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if isinstance(layer.mlp, KimiK3MoE):
+                layer.mlp._merge_front_weights()
+                # The router consumes the correction bias in fp32; convert the
+                # bf16 checkpoint values once (exact) so the per-call
+                # .to(float32) in topk becomes a no-op instead of one upcast
+                # kernel per MoE layer per step.
+                bias = layer.mlp.gate.e_score_correction_bias
+                if bias.dtype != torch.float32:
+                    bias.data = bias.data.to(torch.float32)
+            if isinstance(layer.self_attn, KimiK3DeltaAttention):
+                layer.self_attn._merge_bfa_weights()
 
 
 # ---------------------------------------------------------------------------
