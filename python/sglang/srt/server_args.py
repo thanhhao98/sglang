@@ -870,13 +870,6 @@ class ServerArgs:
             aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
-    dcp_size: A[
-        int,
-        Arg(
-            help="The decode context parallelism size.",
-            aliases=["--decode-context-parallel-size"],
-        ),
-    ] = 1
     dcp_comm_backend: A[
         str,
         Arg(
@@ -2827,9 +2820,11 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # Decode context parallel (DCP) is validated on AMD HIP/ROCm and, on
+        # CUDA, for MLA models via the tokenspeed_mla decode/verify path (see
+        # the speculative-decoding gate below). Reject invalid or unverified
+        # configurations early instead of letting them fail deeper in model
+        # initialization.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
