@@ -452,8 +452,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
+            # One fused kernel, no per-step temp alloc: int64 seq_lens + T
+            # downcast straight into the captured int32 buffer (same-kind out=
+            # cast). The block-table kernel below reads that buffer directly —
+            # value-identical, it loads lens via .to(tl.int32).
+            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_bs
@@ -614,11 +618,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length.
+            # Get maximum sequence length. Never read it from the GPU tensor:
+            # that .max().item() blocks the host on the whole stream backlog
+            # (the previous verify step under spec-v2 overlap). When no host
+            # mirror exists (needs_cpu_seq_lens=False relay), size to the
+            # static context bound instead — max_seq only sizes the block
+            # table / kernel scheduling hint, so an over-estimate is safe.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                max_seq = forward_batch.seq_lens.max().item()
+                max_seq = self.max_context_len
 
             seq_lens = forward_batch.seq_lens
 
@@ -658,6 +667,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 npb = get_num_page_per_block_flashmla(eff_page)
                 max_local_blocks = (
                     triton.cdiv(triton.cdiv(int(max_seq), eff_page), npb) * npb
+                )
+                # Host-side local-max bound so forward_decode never falls into
+                # the per-layer local_seq_lens.max().item() device sync:
+                # get_dcp_lens <= ceil(global/world), and the kernel tolerates
+                # an over-estimated max_seq_len (bounded by device seq_lens).
+                self.forward_decode_metadata.dcp_local_max_seq_len = max(
+                    (int(max_seq) + dcp_world - 1) // dcp_world, 1
                 )
                 block_kv_indices = torch.full(
                     (bs, max_local_blocks),
@@ -727,8 +743,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     max_prefix_blocks,
                     PAGED_SIZE=eff_page,
                 )
-                self.forward_decode_metadata.dcp_prefix_block_kv_indices = (
-                    dcp_prefix_bt
+                self.forward_decode_metadata.dcp_prefix_block_kv_indices = dcp_prefix_bt
+                # Host-side prefix local-max bound: keeps _forward_verify_dcp
+                # off the per-layer local_prefix.max().item() device sync
+                # (same ceil-bound argument as the decode branch above).
+                self.forward_decode_metadata.dcp_prefix_local_max = max(
+                    (prefix_max + dcp_world - 1) // dcp_world, 1
                 )
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
@@ -1069,7 +1089,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # ---- Pass-1: non-causal prefix fold over the local strided slice ----
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
-        global_prefix = forward_batch.seq_lens.to(torch.int32)  # prefix = seq_lens_k - T
+        global_prefix = forward_batch.seq_lens.to(
+            torch.int32
+        )  # prefix = seq_lens_k - T
         local_prefix = get_dcp_lens(global_prefix, dcp_world, dcp_rank).to(torch.int32)
         local_prefix_max = metadata.dcp_prefix_local_max
         if local_prefix_max is None:
@@ -1093,9 +1115,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # owns no prefix tokens for (local prefix len == 0).
         zero = local_prefix == 0
         o1 = torch.where(zero.view(bs, 1, 1, 1), o1.new_zeros(()), o1)
-        lse1 = torch.where(
-            zero.view(bs, 1, 1), lse1.new_full((), float("-inf")), lse1
-        )
+        lse1 = torch.where(zero.view(bs, 1, 1), lse1.new_full((), float("-inf")), lse1)
         prefix_full, prefix_lse = dcp_a2a_lse_reduce(
             o1.reshape(N, H_full, vd).contiguous(),
             lse1.reshape(N, H_full).contiguous(),

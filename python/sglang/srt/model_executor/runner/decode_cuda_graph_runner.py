@@ -223,6 +223,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
+        # Lazily-built reusable event ring for the WAR fastpath (see execute()).
+        self._war_read_done_event_ring = None
+        self._war_read_done_event_slot = 0
+
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
@@ -1027,7 +1031,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.forward_mode.is_target_verify()
                 and self.model_runner.spec_algorithm.is_dflash()
             ):
-                read_done = self.device_module.Event()
+                # Ring of 2 reusable events instead of a fresh Event() per
+                # replay (DFlash fires this twice per step: draft + verify).
+                # Re-record is safe: the single scheduler thread interleaves
+                # the WAR barrier's wait_event with these records, and the ring
+                # depth matches the 1-step overlap pipeline.
+                ring = self._war_read_done_event_ring
+                if ring is None:
+                    ring = self._war_read_done_event_ring = [
+                        self.device_module.Event() for _ in range(2)
+                    ]
+                read_done = ring[self._war_read_done_event_slot]
+                self._war_read_done_event_slot = (
+                    self._war_read_done_event_slot + 1
+                ) % 2
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
