@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe import single_token_handoff
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -245,11 +246,19 @@ def fused_marlin_moe(
     if M == 1 and topk <= 32 and expert_map is None:
         # Single-token decode: top-k ids are distinct, so alignment is a
         # single-warp sort instead of the align + count_and_sort kernel pair.
-        from sglang.jit_kernel.moe_align_single_token import moe_align_single_token
+        # The radix router emits these outputs inside its own kernel; consume
+        # them when present (verified by tensor identity + block size).
+        cached = single_token_handoff.consume_alignment(topk_ids, block_size_m)
+        if cached is not None:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = cached
+        else:
+            from sglang.jit_kernel.moe_align_single_token import (
+                moe_align_single_token,
+            )
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
-        )
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_single_token(topk_ids, block_size_m)
+            )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, global_num_experts
@@ -385,7 +394,14 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
-    output = hidden_states if inplace else torch.empty_like(hidden_states)
+    output = None
+    if M == 1:
+        # The model may hand us a preallocated destination (e.g. the K3
+        # concat-allreduce buffer slice) so the final sum lands there
+        # directly instead of being copied afterwards.
+        output = single_token_handoff.consume_output_destination(hidden_states)
+    if output is None:
+        output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
         # Top-k weights (incl. routed scaling) are already applied above via

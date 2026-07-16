@@ -41,6 +41,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import single_token_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -128,6 +129,8 @@ _K3_DECODE_GEMV = envs.SGLANG_K3_DECODE_GEMV.get()
 # Cross-op tail fusions (decode): residual add fused into the attn_res score
 # kernel, and the MoE tail 3-way add (up + shared + residual) in one kernel.
 _K3_TAIL_FUSE = envs.SGLANG_K3_TAIL_FUSE.get()
+# MLA output gate x * sigmoid(g) in one kernel instead of two elementwise.
+_K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
 
 
 def _merge_weights_as_views(
@@ -791,6 +794,7 @@ class KimiK3MoE(nn.Module):
         shared_output: torch.Tensor,
         shared_act: Optional[torch.Tensor],
         hidden_size: int,
+        buf: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One NCCL call instead of two: all-reduce the routed latent (3584)
         and shared (7168) partial sums as a single [latent | shared] buffer.
@@ -802,22 +806,25 @@ class KimiK3MoE(nn.Module):
         straight into the buffer slice and the routed latent is one small
         copy — replacing down-GEMM-then-cat (one fewer 14KB round trip).
         """
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            if shared_act is not None:
-                buf = final_hidden_states.new_empty(
-                    final_hidden_states.shape[0], self.moe_hidden_size + hidden_size
-                )
-            else:
-                buf = torch.cat((final_hidden_states, shared_output), dim=-1)
+        if buf is None:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                if shared_act is not None:
+                    buf = final_hidden_states.new_empty(
+                        final_hidden_states.shape[0],
+                        self.moe_hidden_size + hidden_size,
+                    )
+                else:
+                    buf = torch.cat((final_hidden_states, shared_output), dim=-1)
         if shared_act is not None:
             torch.mm(
                 shared_act,
                 self.shared_experts.down_proj.weight.t(),
                 out=buf[..., self.moe_hidden_size :],
             )
-            buf[..., : self.moe_hidden_size].copy_(final_hidden_states)
+            if final_hidden_states.data_ptr() != buf.data_ptr():
+                buf[..., : self.moe_hidden_size].copy_(final_hidden_states)
         buf = tensor_model_parallel_all_reduce(buf)
         return (
             buf[..., : self.moe_hidden_size].contiguous(),
@@ -835,8 +842,24 @@ class KimiK3MoE(nn.Module):
             hidden_states, tail_fuse
         )
 
+        # Deferred-tail regime: preallocate the concat-AR buffer and hand its
+        # routed slice to the MoE runner as the final-sum destination, so the
+        # top-k sum writes it directly and _concat_reduce drops its memcpy
+        # (attempt-and-verify: an unconsumed handoff falls back to the copy).
+        buf = None
+        if shared_act is not None:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                buf = routed_input.new_empty(1, self.moe_hidden_size + hidden_size)
+            single_token_handoff.stash_output_destination(
+                routed_input, buf[:, : self.moe_hidden_size]
+            )
+
         # Experts
         final_hidden_states = self.experts(routed_input, topk_output)
+        if buf is not None:
+            single_token_handoff.clear_output_destination()
 
         # With an a2a backend (deepep etc.), the combine step already returns
         # the COMPLETE routed sum; all-reducing again would multiply by tp_size.
@@ -854,7 +877,7 @@ class KimiK3MoE(nn.Module):
                 and self.moe_reduce_mode == "concat"
             ):
                 final_hidden_states, shared_output = self._concat_reduce(
-                    final_hidden_states, shared_output, shared_act, hidden_size
+                    final_hidden_states, shared_output, shared_act, hidden_size, buf
                 )
                 did_shared_reduce = True
             elif routed_needs_reduce:
@@ -1336,7 +1359,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
                     gate, _ = self.g_proj(gate_input)
-                    x = x * torch.sigmoid(gate)
+                    from sglang.jit_kernel.kimi_k3 import mla_output_gate
+
+                    if _K3_FUSE_O_GATE and mla_output_gate.covered(x, gate):
+                        # One kernel for x * sigmoid(gate); double rounding
+                        # matches the unfused pair bit-for-bit.
+                        x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
+                    else:
+                        x = x * torch.sigmoid(gate)
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2066,6 +2096,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                # The router consumes the correction bias in fp32; convert the
+                # bf16 checkpoint values once (exact) so the per-call
+                # .to(float32) in topk becomes a no-op instead of one upcast
+                # kernel per MoE layer per step.
+                bias = layer.mlp.gate.e_score_correction_bias
+                if bias.dtype != torch.float32:
+                    bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
 

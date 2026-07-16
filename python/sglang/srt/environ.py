@@ -711,6 +711,8 @@ class Envs:
     # Cross-op decode tail fusions: residual add folded into the attn_res
     # score kernel + MoE tail 3-way add in one kernel.
     SGLANG_K3_TAIL_FUSE = EnvBool(True)
+    # MLA output gate x * sigmoid(g) fused into one kernel.
+    SGLANG_K3_FUSE_O_GATE = EnvBool(True)
     # AttnRes aggregation backend: fused (triton) | jit (CUDA) | torch | legacy.
     SGLANG_K3_ATTN_RES_MODE = EnvStr("fused")
     SGLANG_K3_ATTN_RES_FUSED_MIN_T = EnvInt(999999)

@@ -61,7 +61,11 @@ __global__ void route_radix_kernel(
     long long stride_im,
     float routed_scaling_factor,
     int renormalize,
-    int apply_scale) {
+    int apply_scale,
+    int32_t* __restrict__ align_sorted_ids,  // optional (nullptr): M==1 moe_align outputs
+    int32_t* __restrict__ align_expert_ids,
+    int32_t* __restrict__ align_num_post,
+    int align_block_size) {
   constexpr int IPT = (N + kThreads - 1) / kThreads;  // items per thread (id = t*IPT + i)
   using BScan = cub::BlockScan<int, kThreads>;
 
@@ -198,6 +202,25 @@ __global__ void route_radix_kernel(
     out_w[(long long)row * stride_wm + t] = w;
     out_i[(long long)row * stride_im + t] = s_sid[t];
   }
+
+  // Optional fused single-token moe_align emission (replaces the separate
+  // align_single_token launch): experts ascending, one block per expert,
+  // slot 0 of block r = flat top-k index, padding = K. Winner expert ids are
+  // distinct, so ranking by id reproduces align_single_token bit-for-bit.
+  if (align_sorted_ids != nullptr && row == 0) {
+    if (t < K) {
+      const int my_id = s_sid[t];
+      int rank = 0;
+#pragma unroll
+      for (int b = 0; b < K; ++b)
+        if (s_sid[b] < my_id) ++rank;
+      align_expert_ids[rank] = my_id;
+      align_sorted_ids[rank * align_block_size] = t;
+    }
+    for (int p = t; p < K * align_block_size; p += kThreads)
+      if (p % align_block_size != 0) align_sorted_ids[p] = K;
+    if (t == 0) align_num_post[0] = K * align_block_size;
+  }
 }
 
 }  // namespace route_radix
@@ -205,19 +228,25 @@ __global__ void route_radix_kernel(
 namespace {
 
 struct MoeFusedGateRadixKernel {
-  static void
-  run(const tvm::ffi::TensorView scores,
-      const tvm::ffi::TensorView bias,
-      const tvm::ffi::TensorView out_w,
-      const tvm::ffi::TensorView out_i,
+  static constexpr int kNumExperts = 896;
+  static constexpr int kTopK = 16;
+
+  // Shared verification + launch; the align pointers are null for the plain
+  // routing entry and non-null for the fused single-token align emission.
+  static void launch(
+      const tvm::ffi::TensorView& scores,
+      const tvm::ffi::TensorView& bias,
+      const tvm::ffi::TensorView& out_w,
+      const tvm::ffi::TensorView& out_i,
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
-      bool apply_scale) {
+      bool apply_scale,
+      int32_t* align_sorted_ids,
+      int32_t* align_expert_ids,
+      int32_t* align_num_post,
+      int align_block_size) {
     using namespace host;
-
-    constexpr int kNumExperts = 896;
-    constexpr int kTopK = 16;
 
     auto M_ = SymbolicSize{"num_tokens"};
     auto N_ = SymbolicSize{"num_experts"};
@@ -235,6 +264,7 @@ struct MoeFusedGateRadixKernel {
     RuntimeCheck(
         N_.unwrap() == kNumExperts && K_.unwrap() == kTopK && topk == kTopK,
         "moe_fused_gate_radix is specialized for N=896, K=16");
+    RuntimeCheck(align_sorted_ids == nullptr || M_.unwrap() == 1, "fused align emission requires a single token");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
@@ -251,7 +281,68 @@ struct MoeFusedGateRadixKernel {
         static_cast<long long>(out_i.stride(0)),
         static_cast<float>(routed_scaling_factor),
         renormalize ? 1 : 0,
-        apply_scale ? 1 : 0);
+        apply_scale ? 1 : 0,
+        align_sorted_ids,
+        align_expert_ids,
+        align_num_post,
+        align_block_size);
+  }
+
+  static void
+  run(const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView bias,
+      const tvm::ffi::TensorView out_w,
+      const tvm::ffi::TensorView out_i,
+      int64_t topk,
+      double routed_scaling_factor,
+      bool renormalize,
+      bool apply_scale) {
+    launch(
+        scores,
+        bias,
+        out_w,
+        out_i,
+        topk,
+        routed_scaling_factor,
+        renormalize,
+        apply_scale,
+        nullptr,
+        nullptr,
+        nullptr,
+        0);
+  }
+
+  // Same routing, plus the fused single-token moe_align emission (M == 1).
+  static void run_align(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView bias,
+      const tvm::ffi::TensorView out_w,
+      const tvm::ffi::TensorView out_i,
+      int64_t topk,
+      double routed_scaling_factor,
+      bool renormalize,
+      bool apply_scale,
+      const tvm::ffi::TensorView align_sorted_ids,
+      const tvm::ffi::TensorView align_expert_ids,
+      const tvm::ffi::TensorView align_num_post,
+      int64_t align_block_size) {
+    using namespace host;
+    RuntimeCheck(
+        align_block_size > 0 && align_sorted_ids.size(0) >= kTopK * align_block_size,
+        "align_sorted_ids must hold topk * block_size slots");
+    launch(
+        scores,
+        bias,
+        out_w,
+        out_i,
+        topk,
+        routed_scaling_factor,
+        renormalize,
+        apply_scale,
+        static_cast<int32_t*>(align_sorted_ids.data_ptr()),
+        static_cast<int32_t*>(align_expert_ids.data_ptr()),
+        static_cast<int32_t*>(align_num_post.data_ptr()),
+        static_cast<int>(align_block_size));
   }
 };
 
