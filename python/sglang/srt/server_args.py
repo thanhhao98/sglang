@@ -2860,6 +2860,9 @@ class ServerArgs:
         if not self.dcp_size > 1:
             return
         if is_hip():
+            # HIP intentionally skips the CUDA speculative-decoding gate below;
+            # spec + DCP on HIP is an unvalidated regime (the validated verify
+            # cascade is the CUDA tokenspeed_mla path).
             return
         elif is_cuda():
             # Speculative + DCP is validated only for the tokenspeed_mla verify
