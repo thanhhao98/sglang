@@ -134,8 +134,27 @@ class TestDCPSpecTopkGuard(CustomTestCase):
         _validate_dcp_spec_topk(self._make_args(8, "EAGLE", 1))  # no raise
 
     def test_topk_none_with_dcp_passes(self):
-        # Algorithms that never resolve topk (e.g. NGRAM) leave it None.
-        _validate_dcp_spec_topk(self._make_args(8, "NGRAM", None))  # no raise
+        # Direct-call case for an unresolved topk. (In production, NGRAM
+        # resolves topk from --speculative-ngram-max-bfs-breadth (default 10),
+        # so real NGRAM+DCP trips the guard unless breadth is set to 1.)
+        _validate_dcp_spec_topk(self._make_args(8, "STANDALONE", None))  # no raise
+
+    def test_ngram_breadth_topk_with_dcp_raises_with_ngram_hint(self):
+        # NGRAM's handler overwrites topk with the bfs breadth; the error must
+        # name the actionable knob for that path.
+        args = self._make_args(8, "NGRAM", 10)
+        with self.assertRaisesRegex(ValueError, "ngram-max-bfs-breadth"):
+            _validate_dcp_spec_topk(args)
+
+    def test_duck_typed_args_without_dcp_size_pass(self):
+        # handle_speculative_decoding is exercised by registry unit tests with
+        # SimpleNamespace mocks that carry no dcp_size; the guard must not
+        # assume the attribute exists.
+        from types import SimpleNamespace
+
+        _validate_dcp_spec_topk(
+            SimpleNamespace(speculative_algorithm="EAGLE")
+        )  # no raise
 
     def test_topk2_without_dcp_passes(self):
         _validate_dcp_spec_topk(self._make_args(1, "EAGLE3", 2))  # no raise

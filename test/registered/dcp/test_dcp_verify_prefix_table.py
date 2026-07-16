@@ -48,7 +48,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="extra-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -70,9 +70,7 @@ def _make_req_to_token(
     max_pages_per_req = _cdiv(max(prefix_lens), eff_page)
     total_pages = bs * max_pages_per_req + 8
     perm = torch.randperm(total_pages, generator=g).tolist()
-    req_to_token = torch.zeros(
-        (bs, max_context_len), dtype=torch.int32, device=device
-    )
+    req_to_token = torch.zeros((bs, max_context_len), dtype=torch.int32, device=device)
     page_ids: list[list[int]] = []
     it = iter(perm)
     for r, plen in enumerate(prefix_lens):
@@ -125,8 +123,22 @@ class TestDcpVerifyPrefixTable(unittest.TestCase):
     # Mixed cc16-regime prefixes, including eff_page-boundary +-1 neighbors
     # (page 64 * dcp 8 -> eff_page 512; 50176 = 98 * 512).
     PREFIX_LENS = [
-        50000, 49999, 50007, 50176, 50175, 50177, 3000, 3001,
-        511, 512, 513, 1, 65535, 65536, 2048, 50000,
+        50000,
+        49999,
+        50007,
+        50176,
+        50175,
+        50177,
+        3000,
+        3001,
+        511,
+        512,
+        513,
+        1,
+        65535,
+        65536,
+        2048,
+        50000,
     ]
 
     def _run_site(self, page_size: int, persistent: bool):
@@ -151,9 +163,7 @@ class TestDcpVerifyPrefixTable(unittest.TestCase):
             # Replay site: full-width captured buffer, -1-filled once, then
             # dirtied by a longer "previous replay" before the build under test.
             width = _cdiv(_cdiv(max_context_len, eff_page), npb) * npb
-            table = torch.full(
-                (self.BS, width), -1, dtype=torch.int32, device=device
-            )
+            table = torch.full((self.BS, width), -1, dtype=torch.int32, device=device)
             longer = torch.clamp(prefix_t + 3 * eff_page, max=max_context_len).to(
                 torch.int32
             )
@@ -168,9 +178,7 @@ class TestDcpVerifyPrefixTable(unittest.TestCase):
             # Eager site: fresh -1 table sized from the batch prefix max.
             prefix_max = max(prefix_lens)
             width = _cdiv(_cdiv(prefix_max, eff_page), npb) * npb
-            table = torch.full(
-                (self.BS, width), -1, dtype=torch.int32, device=device
-            )
+            table = torch.full((self.BS, width), -1, dtype=torch.int32, device=device)
             _build_table(req_to_token, req_pool_indices, prefix_t, table, eff_page)
 
         torch.cuda.synchronize()
@@ -178,9 +186,7 @@ class TestDcpVerifyPrefixTable(unittest.TestCase):
 
         for r, plen in enumerate(prefix_lens):
             n_valid = _cdiv(plen, eff_page)
-            self.assertLessEqual(
-                n_valid, table.shape[1], f"row {r} wider than table"
-            )
+            self.assertLessEqual(n_valid, table.shape[1], f"row {r} wider than table")
             expect = torch.tensor(page_ids[r], dtype=torch.int32)
             got = table_cpu[r, :n_valid]
             self.assertTrue(
