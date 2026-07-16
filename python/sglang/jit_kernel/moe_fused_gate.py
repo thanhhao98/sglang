@@ -291,16 +291,16 @@ def moe_fused_gate(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    # Small-batch K3 fast paths (both default off): native-CUDA radix-select
-    # replaces the 16 dependent argmax rounds (single CTA per token; ids
-    # bit-identical to this triton kernel incl. ties).
-    #   SGLANG_OPT_USE_ROUTE_RADIX_V2=1 — v2, register-resident keys, winners
-    #     in expert-id order (skips the biased-descending sort; downstream MoE
-    #     kernels are order-insensitive). ~2x over v1 at [1,896] top-16.
-    #   SGLANG_MOE_FUSED_GATE_RADIX=1 — v1, ~1.8x over the triton kernel; rows
-    #     are independent CTAs (flat in M up to decode batch sizes), and at
-    #     M == 1 it also emits the moe_align_block_size outputs for
-    #     fused_marlin_moe (single_token_handoff).
+    # K3 radix-select fast paths: native-CUDA radix-select replaces the 16
+    # dependent argmax rounds (single CTA per token; ids bit-identical to this
+    # triton kernel incl. ties).
+    #   SGLANG_OPT_USE_ROUTE_RADIX_V2 (default ON) — v2, register-resident
+    #     keys, winners in expert-id order (skips the biased-descending sort;
+    #     downstream MoE kernels are order-insensitive). All batch sizes:
+    #     3.1-3.5x over the triton kernel at [1..8192, 896] top-16 on B200.
+    #   SGLANG_MOE_FUSED_GATE_RADIX=1 (default off) — v1, M <= 128, ~1.8x over
+    #     the triton kernel; at M == 1 it also emits the moe_align_block_size
+    #     outputs for fused_marlin_moe (single_token_handoff).
     if (
         scoring_func.lower() == "sigmoid"
         and num_fused_shared_experts == 0
@@ -315,10 +315,8 @@ def moe_fused_gate(
             routed_scaling_factor,
             apply_routed_scaling_factor_on_output,
         )
-        if (
-            scores.shape[0] <= 8
-            and envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.get()
-            and moe_route_radix_v2.covered(scores, bias, topk)
+        if envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.get() and moe_route_radix_v2.covered(
+            scores, bias, topk
         ):
             return moe_route_radix_v2.route_radix_v2(*radix_args, sorted=False)
         if (

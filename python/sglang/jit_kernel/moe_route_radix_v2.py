@@ -1,4 +1,4 @@
-"""v2 of the native-CUDA radix-select router for the K3 decode regime.
+"""v2 of the native-CUDA radix-select router for K3 routing (all batch sizes).
 
 Same selection semantics as moe_fused_gate_radix (v1), different execution strategy:
 keys/activations stay in registers (224 threads, 4 experts each), the split-bin
@@ -7,10 +7,11 @@ separates on a byte boundary, and the (biased desc, id asc) output sort is
 optional — consumers that only gather by expert id can pass sorted=False and
 skip the epilogue rank-sort entirely.
 
-Opt-in via SGLANG_OPT_USE_ROUTE_RADIX_V2=1 (dispatched in moe_fused_gate,
-taking precedence over v1's SGLANG_MOE_FUSED_GATE_RADIX; the production
-dispatch uses sorted=False). Correctness/benchmark coverage vs the v1 baseline lives in
-test/registered/jit/test_moe_route_radix_v2.py and
+Default ON via SGLANG_OPT_USE_ROUTE_RADIX_V2 (dispatched in moe_fused_gate for
+every batch size, taking precedence over v1's SGLANG_MOE_FUSED_GATE_RADIX; the
+production dispatch uses sorted=False). 3.1-3.5x over the triton router at
+[1..8192, 896] top-16 on B200. Correctness/benchmark coverage vs the v1 and
+triton baselines lives in test/registered/jit/test_moe_route_radix_v2.py and
 test/registered/jit/benchmark/bench_moe_route_radix.py.
 """
 

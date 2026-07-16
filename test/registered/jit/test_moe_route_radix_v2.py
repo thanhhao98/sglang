@@ -45,7 +45,7 @@ def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     return scores, bias
 
 
-@pytest.mark.parametrize("num_tokens", [1, 3, 8])
+@pytest.mark.parametrize("num_tokens", [1, 3, 8, 512])
 @pytest.mark.parametrize(
     "case",
     [
@@ -120,6 +120,16 @@ def test_route_radix_v2_flag_dispatch():
     torch.testing.assert_close(
         ref_w.gather(1, ref_order), w, rtol=1e-6, atol=0.0
     )
+
+    # Kill-switch: with the flag off, dispatch falls back to the triton path.
+    # ids come back in the triton (biased-descending) order — proof the v2
+    # id-ascending path was not taken. Weights get a tolerance: the triton
+    # kernel fed bf16 directly rounds slightly differently from the fp32
+    # reference (production upcasts to fp32 upstream when the flag is off).
+    with envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.override(False):
+        fw, fi = moe_fused_gate(scores, bias, **common)
+    assert torch.equal(ref_i.to(fi.dtype), fi)
+    torch.testing.assert_close(ref_w, fw, rtol=1e-6, atol=0.0)
 
 
 def test_route_radix_v2_all_equal_min_id():
