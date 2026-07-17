@@ -504,6 +504,31 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
+        if (
+            self.is_draft_worker
+            and self.server_args.dcp_size > 1
+            and self.token_to_kv_pool_allocator is not None
+        ):
+            # The draft shares the target's DCP-widened allocator (virtual slot
+            # ids up to alloc.size + alloc.page_size - 1) but stores UNSHARDED
+            # KV, so its pool must cover the full id range; a physical-size
+            # pool trips the store_kvcache bound assert (DFlash bf16 pool) or
+            # an unbounded-write IMA (MLA draft pools) once allocator ids pass
+            # the physical range. The memory is budgeted by the dcp-scaled
+            # draft term in PoolConfigurator, which shrinks the target pool
+            # correspondingly. Bound: pool.size + page_size must exceed the
+            # allocator's max id (alloc.size + alloc.page_size - 1).
+            alloc = self.token_to_kv_pool_allocator
+            widened = alloc.size + getattr(alloc, "page_size", 1) - self.page_size
+            if widened > self.max_total_num_tokens:
+                logger.info(
+                    "DCP draft worker: widening draft KV pool %d -> %d tokens "
+                    "to cover the shared DCP allocator id space.",
+                    self.max_total_num_tokens,
+                    widened,
+                )
+                self.max_total_num_tokens = widened
+
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
