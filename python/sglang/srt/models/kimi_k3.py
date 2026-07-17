@@ -6,16 +6,16 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import logging
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
-
-import logging
 
 import torch
 import triton
 import triton.language as tl
 from torch import nn
 
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -30,7 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.attn_residual import AttnResidual, BaseAttnResidual
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -134,8 +134,9 @@ _K3_FUSE_KDA_BFA = envs.SGLANG_K3_FUSE_KDA_BFA.get()
 # Use the dedicated CUDA decode-GEMV kernel for the skinny KDA projections
 # (b+f_a merged, f_b) instead of cublas gemvx/dot dispatch.
 _K3_DECODE_GEMV = envs.SGLANG_K3_DECODE_GEMV.get()
-# Cross-op tail fusions (decode): residual add fused into the attn_res score
-# kernel, and the MoE tail 3-way add (up + shared + residual) in one kernel.
+# MoE-front shared-GEMM deferral on the bs=1 concat-reduce path (decode).
+# The attn_res pending-add fold no longer reads this env: jit mode always
+# folds (bit-identical to the explicit add either way).
 _K3_TAIL_FUSE = envs.SGLANG_K3_TAIL_FUSE.get()
 # MLA output gate x * sigmoid(g) in one kernel instead of two elementwise.
 _K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
@@ -564,11 +565,11 @@ class KimiK3MLP(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
-        return x if residual is None else x + residual
+        return x
 
     def forward_from_gate_up(self, gate_up: torch.Tensor) -> torch.Tensor:
         """Same as forward() but with the gate_up GEMM already computed
@@ -733,19 +734,17 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
 
-    def _tail_fuse_applicable(
-        self, num_tokens: int, residual: Optional[torch.Tensor]
-    ) -> bool:
+    def _tail_fuse_applicable(self, num_tokens: int) -> bool:
         """Tail-fusion regime (single-token decode on the concat-reduce path):
         defer the shared down GEMM so it writes its partial sum directly into
-        the concat-AR buffer (no torch.cat), and fold up_out + shared +
-        residual into one moe_tail_add kernel at the end."""
+        the concat-AR buffer (no torch.cat). The +residual add is not part of
+        the tail anymore — it is delayed into the next attn-res aggregation
+        point."""
         return (
             _K3_TAIL_FUSE
             and self.use_latent_moe
             and self.moe_reduce_mode == "concat"
             and num_tokens == 1
-            and residual is not None
             and self.tp_size > 1
             and get_moe_a2a_backend().is_none()
         )
@@ -857,13 +856,13 @@ class KimiK3MoE(nn.Module):
             buf[..., self.moe_hidden_size :],
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor = None
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """No residual add here: on the attn-res path the +residual add is
+        delayed into the next aggregation point."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
-        tail_fuse = self._tail_fuse_applicable(num_tokens, residual)
+        tail_fuse = self._tail_fuse_applicable(num_tokens)
         routed_input, topk_output, shared_output, shared_act = self._forward_front(
             hidden_states, tail_fuse
         )
@@ -937,29 +936,9 @@ class KimiK3MoE(nn.Module):
             if shared_output is not None:
                 if self.tp_size > 1 and not did_shared_reduce:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                from sglang.jit_kernel.kimi_k3 import moe_tail_add
-
-                if (
-                    _K3_TAIL_FUSE
-                    and residual is not None
-                    and moe_tail_add.covered(
-                        final_hidden_states,
-                        shared_output,
-                        residual.view(-1, hidden_size),
-                    )
-                ):
-                    # out = bf16(bf16(up + shared) + residual): one kernel, double
-                    # rounding matches the unfused add pair bit-for-bit. Applies
-                    # at any T (prefill included); shared_output may be a
-                    # row-strided slice of the concat-allreduce buffer.
-                    final_hidden_states = moe_tail_add.kimi_k3_moe_tail_add(
-                        final_hidden_states,
-                        shared_output,
-                        residual.view(-1, hidden_size),
-                    )
-                    residual = None  # consumed
-                else:
-                    final_hidden_states = final_hidden_states + shared_output
+                # bf16(up + shared); shared_output may be a row-strided slice
+                # of the concat-allreduce buffer.
+                final_hidden_states = final_hidden_states + shared_output
         else:
             if shared_output is not None:
                 final_hidden_states = final_hidden_states + shared_output
@@ -967,8 +946,6 @@ class KimiK3MoE(nn.Module):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
-        if residual is not None:
-            final_hidden_states = final_hidden_states + residual.view(-1, hidden_size)
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -1580,6 +1557,13 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
+        # dispatch to impl
+        self._forward_attn_residual = (
+            self._forward_attn_residual_legacy
+            if _K3_ATTN_RES_MODE == "legacy"
+            else self._forward_attn_residual_clean
+        )
+
     def _run_self_attn(
         self,
         hidden_states: torch.Tensor,
@@ -1617,16 +1601,17 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        attn_res: Optional[BaseAttnResidual],
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.use_attn_residuals:
-            assert residual is not None
-            if _K3_ATTN_RES_MODE == "legacy":
-                return self.forward_attn_residual(
-                    positions, hidden_states, residual, forward_batch, zero_allocator
-                )
-            return self._forward_attn_residual_clean(
-                positions, hidden_states, residual, forward_batch, zero_allocator
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if attn_res is not None:
+            return self._forward_attn_residual(
+                positions,
+                hidden_states,
+                residual,
+                attn_res,
+                forward_batch,
+                zero_allocator,
             )
 
         # Standard residual path
@@ -1648,88 +1633,57 @@ class KimiK3DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        block_residual: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        attn_res: BaseAttnResidual,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from sglang.srt.layers.attn_residual import (
-            attn_res_aggregate,
-            attn_res_aggregate_fused_add,
-        )
-
-        prefix_sum = hidden_states
-        nvb = self.prev_valid_blocks
+        # Between attn-res layers hidden_states carries the previous layer's
+        # un-added MLP delta and prefix_sum the prefix it extends (None at
+        # stream start / PP entry, where hidden_states already is the head).
 
         # ---- Aggregation 1: attention side ----
-        if nvb > 0:
-            hidden_states = attn_res_aggregate(
-                prefix_sum,
-                block_residual,
-                nvb,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.input_layernorm,
-            )
-        else:
-            hidden_states = self.input_layernorm(prefix_sum)
+        hidden_states, prefix_sum = attn_res.forward(
+            hidden_states,
+            prefix_sum,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.input_layernorm,
+        )
 
         # ---- Write snapshot (before attention, using pre-update prefix) ----
         if self.is_block_write_layer:
-            block_residual[:, self.block_write_idx, :].copy_(prefix_sum)
+            attn_res.write(prefix_sum)
+            prefix_sum = None
 
         # ---- Attention ----
-        attn_out = self._run_self_attn(
+        hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
 
-        # ---- Residual update + Aggregation 2 (MLP side) ----
-        mlp_nvb = nvb + (1 if self.is_block_write_layer else 0)
-        if self.is_block_write_layer:
-            prefix_sum = attn_out
-            hidden_states = attn_res_aggregate(
-                prefix_sum,
-                block_residual,
-                mlp_nvb,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
-        elif _K3_TAIL_FUSE:
-            # Residual add fused into the score kernel (bit-identical rounding);
-            # the summed prefix is materialized by the kernel for combine and
-            # for the accumulate below.
-            hidden_states, prefix_sum = attn_res_aggregate_fused_add(
-                prefix_sum,
-                attn_out,
-                block_residual,
-                mlp_nvb,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
-        else:
-            prefix_sum = prefix_sum + attn_out
-            hidden_states = attn_res_aggregate(
-                prefix_sum,
-                block_residual,
-                mlp_nvb,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-            )
+        # ---- Aggregation 2: MLP side ----
+        hidden_states, prefix_sum = attn_res.forward(
+            hidden_states,
+            prefix_sum,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.post_attention_layernorm,
+        )
 
-        # ---- MLP + accumulate ----
-        prefix_sum = self.mlp(hidden_states, residual=prefix_sum)
-        return prefix_sum, block_residual
+        # ---- MLP (the +prefix_sum add is delayed into the next point) ----
+        return self.mlp(hidden_states), prefix_sum
 
-    def forward_attn_residual(
+    def _forward_attn_residual_legacy(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        block_residual: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        attn_res: BaseAttnResidual,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, None]:
+        assert residual is None, "legacy attn-res path does not support extra residual"
+        block_residual = attn_res.block_residual
         prefix_sum = hidden_states
         nvb = self.prev_valid_blocks
         mlp_valid_blocks = nvb + (1 if self.is_block_write_layer else 0)
@@ -1815,7 +1769,7 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.mlp(hidden_states)
         prefix_sum = prefix_sum + hidden_states
-        return prefix_sum, block_residual
+        return prefix_sum, None
 
 
 # ---------------------------------------------------------------------------
@@ -1893,6 +1847,9 @@ class KimiK3LinearModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            # NOTE: assert to bypass the annoying typing errors
+            assert isinstance(hidden_states, torch.Tensor)
+            assert isinstance(residual, torch.Tensor | None)
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -1902,52 +1859,55 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
-        use_attn_res = self.config.attn_res_block_size is not None
-
-        if use_attn_res:
+        attn_res = None
+        if self.config.attn_res_block_size is not None:
             attn_res_block_num = _cdiv(self.end_layer, self.config.attn_res_block_size)
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0), attn_res_block_num, hidden_states.size(1)
+            attn_res = AttnResidual(
+                hidden_states,
+                attn_res_block_num,
+                self.config.attn_res_block_size,
+                block_residual=residual,
             )
-            if residual is not None:
-                block_residual[:, : residual.size(1), :].copy_(residual)
-            residual = block_residual
+            residual = None
 
         for i in range(self.start_layer, self.end_layer):
-            ctx = get_global_expert_distribution_recorder().with_current_layer(i)
-            with ctx:
-                layer = self.layers[i]
-                hidden_states, residual = layer(
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                hidden_states, residual = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     residual=residual,
+                    attn_res=attn_res,
                     zero_allocator=zero_allocator,
                 )
 
         if not self.pp_group.is_last_rank:
+            if attn_res is not None:
+                if residual is not None:
+                    # Materialize the delayed MLP add: the wire carries the
+                    # full stream head (bit-identical to the fused fold).
+                    hidden_states = residual + hidden_states
+                residual = attn_res.block_residual  # raw bank across ranks
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
         if hidden_states.shape[0] != 0:
-            if use_attn_res:
+            if attn_res is not None:
                 if _K3_ATTN_RES_MODE == "legacy":
                     hidden_states = _apply_attn_res_fused(
                         hidden_states,
-                        residual,
+                        attn_res.block_residual,
                         self.output_attn_res_proj,
                         self.output_attn_res_norm,
                         attn_res_block_num,
                         out_norm=self.norm,
                     )
                 else:
-                    from sglang.srt.layers.attn_residual import attn_res_aggregate
-
-                    hidden_states = attn_res_aggregate(
+                    # ---- Final aggregation (output side, folds delayed add) ----
+                    hidden_states, _ = attn_res.forward(
                         hidden_states,
                         residual,
-                        attn_res_block_num,
                         self.output_attn_res_proj,
                         self.output_attn_res_norm,
                         self.norm,
