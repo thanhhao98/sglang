@@ -435,8 +435,18 @@ class KimiK3VisionTower(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def forward(
-        self, pixel_values: torch.Tensor, grid_thws: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        grid_thws: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        *,
+        grid_hw: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        # run_dp_sharded_mrope_vision_model calls rope_2d towers with
+        # grid_hw=/max_seqlen= keywords (#30878); K3 grids are (t, h, w) and the
+        # encoder derives its own varlen metadata, so max_seqlen is unused.
+        if grid_thws is None:
+            grid_thws = grid_hw
         assert grid_thws.ndim == 2 and grid_thws.size(1) == 3, grid_thws.shape
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
