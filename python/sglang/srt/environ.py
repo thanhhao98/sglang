@@ -995,6 +995,13 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # v2 radix-select router for K3 routing ([M, 896] bf16 top-16, all batch
+    # sizes; 3.1-3.5x over the triton router on B200). Takes precedence over
+    # the v1 SGLANG_JIT_ROUTE_RADIX kernel. Same winner set as the triton
+    # router, but winners come out in expert-id order (the biased-descending
+    # sort is skipped — downstream MoE kernels are order-insensitive) and the
+    # renorm sum may differ by ~1 ulp. Set to false to fall back to triton.
+    SGLANG_OPT_USE_ROUTE_RADIX_V2 = EnvBool(True)
 
     # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
     # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
