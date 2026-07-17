@@ -56,6 +56,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +372,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Nothing to redo after the draft: build_tree writes the tree mask
+        # in-place into cuda_graph_custom_mask (exposed via
+        # get_verify_buffers_to_fill_after_draft), and the plan-stream verify
+        # metadata (seq_lens_k, block tables, DCP prefix tables) depends only
+        # on seq_lens, not on draft output. Same contract as the triton and
+        # trtllm_mha backends. Without this override, EAGLE-family verify
+        # under the overlap plan stream hits the base NotImplementedError.
+        pass
 
     def _init_cuda_graph_metadata(
         self,
