@@ -775,9 +775,10 @@ class KimiK3MoE(nn.Module):
             fused, self._front_sizes, dim=-1
         )
         if hidden_states.shape[0] > 1:
-            # Downstream kernels want contiguous inputs; free for T==1.
-            gate_up = gate_up.contiguous()
-            router_logits = router_logits.contiguous()
+            # Only the experts input needs a dense copy (marlin requires
+            # contiguous activations); situ_and_mul and the radix router both
+            # take row-strided slices, and the triton-router fallback upcasts
+            # through .to(float32) which densifies anyway. Free for T==1.
             routed_input = routed_input.contiguous()
         shared_act = None
         if tail_fuse and self.shared_experts.down_proj.weight.dtype == torch.bfloat16:
