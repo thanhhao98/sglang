@@ -2,6 +2,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.jit_kernel import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -321,6 +322,76 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
+
+        # Fully fused decode step: conv1d update + delta-rule recurrence +
+        # gated RMSNorm in one kernel. Engages only when the model handed off
+        # the output-norm gate for this forward (attempt-and-verify stash,
+        # see kimi_k3.py) and the shapes are covered; the model applies the
+        # norm itself whenever the stash is left unconsumed.
+        if kda_fused_decode.KDA_FUSED_DECODE_ENABLED and replayssm_d is None:
+            fused_static = getattr(layer, "_k3_fused_decode_args", None)
+            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+            if (
+                fused_static is not None
+                and onorm_gate is not None
+                and mixed_qkv.shape[0] == cache_indices.shape[0]
+                and b.ndim == 3
+                and kda_fused_decode.covered(
+                    mixed_qkv,
+                    a,
+                    b[0],
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    onorm_gate,
+                )
+            ):
+                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = (
+                    fused_static
+                )
+                core_attn_out = kda_fused_decode.kda_fused_decode(
+                    mixed_qkv,
+                    a,
+                    b[0],
+                    conv_states,
+                    w_q_t,
+                    w_k_t,
+                    w_v_t,
+                    conv_bias,
+                    a_log,
+                    layer.dt_bias,
+                    onorm_gate,
+                    onorm_w,
+                    ssm_states,
+                    cache_indices,
+                    scale=layer.head_k_dim**-0.5,
+                    onorm_eps=onorm_eps,
+                    lower_bound=getattr(layer, "lower_bound", None),
+                )
+                layer._k3_onorm_consumed = True
+                self._track_mamba_state_decode(
+                    forward_batch,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    layer.layer_id,
+                )
+                return core_attn_out
+            elif fused_static is not None and onorm_gate is not None:
+                # One-shot diagnostics: the model offered the handoff but the
+                # runtime shapes were rejected (decode stays on the unfused
+                # chain, which is correct but slower).
+                if not getattr(KDAAttnBackend, "_fused_reject_logged", False):
+                    KDAAttnBackend._fused_reject_logged = True
+                    rank0_log(
+                        "KDA fused decode rejected by covered(): "
+                        f"mixed_qkv {tuple(mixed_qkv.shape)}/{mixed_qkv.dtype} "
+                        f"stride {mixed_qkv.stride()}, "
+                        f"conv_states {tuple(conv_states.shape)} "
+                        f"stride {conv_states.stride()}, "
+                        f"ssm_states {tuple(ssm_states.shape)}/{ssm_states.dtype}, "
+                        f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
+                    )
 
         qkv = causal_conv1d_update(
             mixed_qkv,

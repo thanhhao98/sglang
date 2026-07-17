@@ -700,6 +700,12 @@ class Envs:
     # CUDA row-streaming KDA packed-decode kernel for batched decode
     # (B >= 8, K = V = 128); ULP-level differences vs the triton kernel.
     SGLANG_KDA_DECODE_CUDA = EnvBool(True)
+    # Fully fused KDA decode step: causal conv1d update + delta-rule
+    # recurrence + gated RMSNorm in one kernel (vendored NVIDIA x Moonshot
+    # many-heads kernel; H = HV = 12, K = V = 128). Engages only when the
+    # model hands off the output-norm gate (Kimi K3); tolerance-level
+    # differences vs the unfused chain.
+    SGLANG_KDA_FUSED_DECODE = EnvBool(True)
 
     # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
     # unfused path). See python/sglang/srt/models/kimi_k3.py.
