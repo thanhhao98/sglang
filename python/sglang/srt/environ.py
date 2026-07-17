@@ -697,6 +697,9 @@ class Envs:
     # Collapse per-layer mamba prefix-cache track launches into one
     # all-layers launch per decode step (see MambaAttnBackendBase).
     SGLANG_MAMBA_TRACK_FUSED = EnvBool(True)
+    # CUDA row-streaming KDA packed-decode kernel for batched decode
+    # (B >= 8, K = V = 128); ULP-level differences vs the triton kernel.
+    SGLANG_KDA_DECODE_CUDA = EnvBool(True)
 
     # Kimi K3 decode optimizations (all fusions default on; "0" to A/B the
     # unfused path). See python/sglang/srt/models/kimi_k3.py.
