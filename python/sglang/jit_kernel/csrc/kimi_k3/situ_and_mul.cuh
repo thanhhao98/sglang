@@ -29,8 +29,9 @@ struct SituAndMulParams {
   float inv_beta;
   float linear_beta;
   float inv_linear_beta;
-  uint32_t hidden_dim;   // D (output width, half of input last dim)
+  uint32_t hidden_dim;  // D (output width, half of input last dim)
   uint32_t num_tokens;
+  uint32_t stride_in_vecs;  // input row stride in vector units (2*D/vec if dense)
 };
 
 template <typename T, bool kHasLinearBeta, bool kUsePDL>
@@ -46,8 +47,9 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   if (token_id >= params.num_tokens) return;
 
   const auto offset = tid % num_vecs;
-  // Input layout: [token_id, 0..2D-1], gate = [0..D-1], up = [D..2D-1]
-  const auto input_offset = token_id * (num_vecs * 2) + offset;
+  // Input rows may be strided (e.g. a slice of a wider fused-GEMM output);
+  // within a row: gate = [0..D-1], up = [D..2D-1].
+  const auto input_offset = static_cast<uint64_t>(token_id) * params.stride_in_vecs + offset;
   const auto output_offset = tid;
 
   PDLWaitPrimary<kUsePDL>();
@@ -93,8 +95,8 @@ struct SituAndMulKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
-  static void run(
-      const tvm::ffi::TensorView input,
+  static void
+  run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView out,
       const double beta,
       const double linear_beta,
@@ -114,6 +116,7 @@ struct SituAndMulKernel {
     TensorMatcher({N, D_in})  //
         .with_dtype<T>()
         .with_device(device_)
+        .with_strides({-1, 1})
         .verify(input);
 
     const auto hidden_size = static_cast<uint32_t>(D_out.unwrap());
@@ -123,6 +126,7 @@ struct SituAndMulKernel {
     if (num_tokens == 0) return;
     RuntimeCheck(hidden_size * 2 == D_in.unwrap(), "invalid activation dimension: D_out * 2 != D_in");
     RuntimeCheck(hidden_size % kVecSize == 0, "hidden size must be divisible by vector size");
+    RuntimeCheck(input.stride(0) % kVecSize == 0, "input row stride must be divisible by vector size");
 
     const auto num_total_items = num_tokens * (hidden_size / kVecSize);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
@@ -140,14 +144,13 @@ struct SituAndMulKernel {
         .inv_linear_beta = linear_beta_f != 0.0f ? 1.0f / linear_beta_f : 0.0f,
         .hidden_dim = hidden_size,
         .num_tokens = num_tokens,
+        .stride_in_vecs = static_cast<uint32_t>(input.stride(0) / kVecSize),
     };
 
     if (has_linear_beta) {
-      LaunchKernel(num_blocks, kBlockSize, device)
-          .enable_pdl(kUsePDL)(situ_and_mul_kernel<T, true, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, true, kUsePDL>, params);
     } else {
-      LaunchKernel(num_blocks, kBlockSize, device)
-          .enable_pdl(kUsePDL)(situ_and_mul_kernel<T, false, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, false, kUsePDL>, params);
     }
   }
 };
