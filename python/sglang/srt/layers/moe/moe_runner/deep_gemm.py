@@ -270,7 +270,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     s.unsqueeze(0)
                 ).squeeze(0)
             else:
-                from sglang.srt.layers.quantization.fp8_kernel import (
+                from sglang.kernels.ops.quantization.fp8_kernel import (
                     sglang_per_token_group_quant_fp8,
                 )
 
@@ -807,8 +807,8 @@ def _pre_permute_standard_contiguous(
     bound (topk_numel + E * BLOCK_E); rows beyond the real aligned total keep
     m_indices == -1 and are skipped by the GEMM.
     """
-    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
-    from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
+    from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 
     BLOCK_E = 128  # ep_scatter's per-expert alignment
     num_local = runner_config.num_local_experts
@@ -1384,7 +1384,7 @@ def _masked_situ_mul_quant(
     path is kept there. The unfused path also wastes ~E*m_max/valid_tokens of
     elementwise work on garbage rows (88% of prefill GPU time at ep8).
     """
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_8bit,
     )
 

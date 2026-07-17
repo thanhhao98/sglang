@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
