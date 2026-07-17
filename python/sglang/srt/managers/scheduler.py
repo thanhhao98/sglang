@@ -718,9 +718,18 @@ class Scheduler(
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
-            self.model_config.think_end_id = self.tokenizer.encode(
+            think_end_ids = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            if len(think_end_ids) == 1:
+                self.model_config.think_end_id = think_end_ids[0]
+            else:
+                logger.warning(
+                    "Reasoning parser think_end_token %r encodes to %d tokens; "
+                    "grammar-gated reasoning is disabled.",
+                    reasoning_parser.detector.think_end_token,
+                    len(think_end_ids),
+                )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
