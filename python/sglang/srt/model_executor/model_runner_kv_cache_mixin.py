@@ -1174,6 +1174,29 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.register_mapping(
                     swa_allocator.full_to_swa_index_mapping
                 )
+            if self.server_args.dcp_size > 1:
+                # The draft inherits the target's DCP-widened allocator
+                # (virtual ids up to alloc.size + alloc.page_size - 1) while
+                # its unsharded pool stays physical-size, so any slot id past
+                # the pool bound trips the store_kvcache device assert
+                # (kvcache.cuh) once the allocator high-water crosses the
+                # physical range (hot allocator: free-list prepending after
+                # long sweeps). Real fix = window-compacted draft slot
+                # mapping; until then, warn loudly at boot.
+                alloc = self.token_to_kv_pool_allocator
+                alloc_max_id = alloc.size + getattr(alloc, "page_size", 1) - 1
+                pool_bound = self.token_to_kv_pool.size + self.page_size
+                if alloc_max_id >= pool_bound:
+                    logger.warning(
+                        "DCP x spec-decode: draft KV pool covers ids < %d but the "
+                        "shared DCP-widened allocator can issue ids up to %d. "
+                        "Long-running servers WILL hit the store_kvcache bound "
+                        "assert once allocation high-water passes the pool bound "
+                        "(see work-tracker sglang-dflash/docs/findings/"
+                        "dcp-draft-pool-idspace.md).",
+                        pool_bound,
+                        alloc_max_id,
+                    )
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so
