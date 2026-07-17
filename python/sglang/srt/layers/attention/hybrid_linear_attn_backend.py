@@ -875,6 +875,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             or linear_attn_backend.needs_cpu_seq_lens
         )
 
+    @property
+    def data_type(self):
+        # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the
+        # wrapper since split backends are wrapped once (#31439); the full-attn
+        # side owns the KV cache, so its dtype is authoritative.
+        return self.full_attn_backend.data_type
+
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
