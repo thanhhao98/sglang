@@ -9,6 +9,8 @@
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -69,16 +71,17 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.models.kimi_k25 import (
-    K2VLMultiModalProjector,
-    MoonViT3dPretrainedModel,
-    mm_projection_auto,
+from sglang.srt.models.kimi_k3_vl import (
+    KimiK3MultiModalProjector,
+    KimiK3VisionTower,
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2134,8 +2137,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.layers.": "language_model.model.layers.",
-            "mm_projector.proj.0": "mm_projector.linear_1",
-            "mm_projector.proj.2": "mm_projector.linear_2",
         },
         orig_to_new_substr={
             "block_sparse_moe": "mlp",
@@ -2153,31 +2154,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        # Ensure vision_config has aliases needed by MoonViT3dPretrainedModel.
-        # HF's trust_remote_code config uses vt_* prefixed names; the K25 vision
-        # code expects unprefixed aliases plus video_attn_type.
-        vc = config.vision_config
-        _vc_aliases = {
-            "hidden_size": ("vt_hidden_size", 1024),
-            "num_attention_heads": ("vt_num_attention_heads", 12),
-            "num_hidden_layers": ("vt_num_hidden_layers", 27),
-            "intermediate_size": ("vt_intermediate_size", 4096),
-            "video_attn_type": (None, "spatial_temporal"),
-        }
-        for attr, (src, default) in _vc_aliases.items():
-            if not hasattr(vc, attr):
-                setattr(vc, attr, getattr(vc, src, default) if src else default)
-
-        # K3 vision has 12 heads which may not divide TP size; force DP for encoder
+        # The dedicated K3 tower runs replicated (per-rank full weights);
+        # shard work across ranks image-wise via the DP runner.
         self.use_data_parallel = True
 
-        self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config,
-            use_data_parallel=self.use_data_parallel,
-            quant_config=None,
-            prefix="vision_tower",
-        )
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        self.vision_tower = KimiK3VisionTower(config.vision_config)
+        self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
 
         self.language_model = KimiK3LinearForCausalLM(
             config.text_config,
@@ -2220,12 +2202,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 grid_thws.tolist(),
                 rope_type="rope_2d",
             )
-            image_features = self.mm_projector(image_embeds)
-            return image_features
+            return self.mm_projector(image_embeds)
 
         image_embeds = self.vision_tower(pixel_values, grid_thws)
-        proj_out = mm_projection_auto(self.mm_projector, image_embeds)
-        return torch.cat(proj_out, dim=0)
+        return self.mm_projector(image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -2269,15 +2249,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         def stream_language_weights():
             for name, loaded_weight in weights:
                 if "vision_tower" in name or "mm_projector" in name:
-                    vname = (
-                        name.replace(r"wqkv.", r"attn.qkv_proj.")
-                        .replace(r"wo.", r"attn.proj.")
-                        .replace("mm_projector.proj.0", "mm_projector.linear_1")
-                        .replace("mm_projector.proj.2", "mm_projector.linear_2")
-                    )
-                    if vname not in vision_params:
+                    if name not in vision_params:
+                        logger.warning("Unmapped vision weight: %s", name)
                         continue
-                    param = vision_params[vname]
+                    param = vision_params[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

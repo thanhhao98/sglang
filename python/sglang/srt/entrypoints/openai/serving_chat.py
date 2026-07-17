@@ -69,6 +69,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -305,6 +306,40 @@ class OpenAIServingChat(OpenAIServingBase):
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
         )
+
+    def _flatten_kimi_k3_content(
+        self,
+        msg: Dict[str, Any],
+        image_data: list,
+        video_data: list,
+        audio_data: list,
+    ) -> Dict[str, Any]:
+        parts = []
+        for chunk in msg["content"]:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_type = chunk.get("type")
+            if chunk_type in ("text", "input_text"):
+                parts.append(chunk["text"])
+            elif chunk_type in ("image_url", "input_image"):
+                image_obj = chunk.get("image_url") or {}
+                if isinstance(image_obj, str):
+                    image_obj = {"url": image_obj, "detail": chunk.get("detail")}
+                image_data.append(
+                    ImageData(
+                        url=image_obj["url"],
+                        detail=image_obj.get("detail") or "auto",
+                        max_dynamic_patch=image_obj.get("max_dynamic_patch"),
+                    )
+                )
+                parts.append("<|media_pad|>")
+            elif chunk_type == "video_url":
+                video_data.append(chunk["video_url"]["url"])
+            elif chunk_type == "audio_url":
+                audio_data.append(chunk["audio_url"]["url"])
+        new_msg = {k: v for k, v in msg.items() if v is not None and k != "content"}
+        new_msg["content"] = "".join(parts)
+        return new_msg
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -667,7 +702,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Apply chat template and its stop strings
         tools = None
+        required_parsed_natively = False
         if request.tools and request.tool_choice != "none":
+            if self.chat_encoding_spec == "kimi_k3" and isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                raise ValueError(
+                    "Named tool choice is not supported for Kimi K3. Use "
+                    'tool_choice "auto", "required", or "none" instead.'
+                )
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
@@ -688,11 +731,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                required_parsed_natively = parser.detector.parses_required_natively()
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
-            if tool_call_constraint is None and (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if (
+                tool_call_constraint is None
+                and not required_parsed_natively
+                and (
+                    request.tool_choice == "required"
+                    or isinstance(request.tool_choice, ToolChoice)
+                )
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools,
@@ -756,6 +804,62 @@ class OpenAIServingChat(OpenAIServingBase):
         if prompt_ids is not None:
             # Custom encoding handled it - no further processing needed
             pass
+        elif self.chat_encoding_spec == "kimi_k3":
+            # K3 ships no Jinja chat template; its tokenizer renders messages
+            # through the Python XTML encoding. Tokenize eagerly so structural
+            # markers keep their special-token ids while user- and
+            # tool-supplied text stays ordinary (re-encoding a rendered string
+            # would lose that distinction).
+            messages = copy.deepcopy(messages)
+            for i, msg in enumerate(messages):
+                if isinstance(msg.get("content"), list):
+                    messages[i] = self._flatten_kimi_k3_content(
+                        msg, image_data, video_data, audio_data
+                    )
+                elif msg.get("content") is None:
+                    msg["content"] = ""
+
+            messages, assistant_prefix = self._handle_last_assistant_message(
+                messages, request
+            )
+
+            template_kwargs = dict(request.chat_template_kwargs or {})
+            template_kwargs.pop("tokenize", None)
+            template_kwargs.pop("return_dict", None)
+            # encoding_k3 accepts thinking_effort in {low, high, max} and
+            # asserts on anything else; "none" is handled at the protocol
+            # level by disabling thinking.
+            if (
+                request.reasoning_effort is not None
+                and "thinking_effort" not in template_kwargs
+            ):
+                if request.reasoning_effort in ("low", "high", "max"):
+                    template_kwargs["thinking_effort"] = request.reasoning_effort
+                elif request.reasoning_effort != "none":
+                    logger.warning(
+                        "Kimi K3 supports thinking_effort low/high/max; ignoring "
+                        "reasoning_effort=%r.",
+                        request.reasoning_effort,
+                    )
+
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=tools,
+                return_dict=False,
+                **template_kwargs,
+            )
+
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
+
+            # The multimodal processor consumes a text prompt and re-encodes
+            # around the media placeholders, so hand it the decoded prompt.
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
         elif self.chat_encoding_spec is not None:
             # dsv4/dsv32 encoding path
             messages = copy.deepcopy(messages)
@@ -1507,8 +1611,13 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int,
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
-        if self.tool_call_parser != "kimi_k2":
-            # A simple uuid is sufficient for all models except for Kimi-K2.
+        if self.tool_call_parser == "kimi_k3":
+            # Align with Kimi-K3 XTML format: {name}:{zero_based_ordinal}.
+            # The ordinal spans the whole conversation, so offset the local
+            # position by the number of history tool calls.
+            return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
+        elif self.tool_call_parser != "kimi_k2":
+            # A simple uuid is sufficient for all models except for Kimi-K2/K3.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id
         else:
@@ -1541,7 +1650,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
             )
             should_try_parser = (
-                not is_required or parser.detector.supports_structural_tag()
+                not is_required
+                or parser.detector.supports_structural_tag()
+                or parser.detector.parses_required_natively()
             )
             if should_try_parser and parser.has_tool_call(text):
                 original_finish_type = finish_reason["type"]
@@ -1694,6 +1805,9 @@ class OpenAIServingChat(OpenAIServingBase):
         removed during detokenization when ``skip_special_tokens=True``.
         """
         if self.reasoning_parser == "apertus2509":
+            request.skip_special_tokens = False
+
+        if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
             request.skip_special_tokens = False
 
         if (
@@ -1914,7 +2028,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
-                    use_native_parser = probe.detector.supports_structural_tag()
+                    use_native_parser = (
+                        probe.detector.supports_structural_tag()
+                        or probe.detector.parses_required_natively()
+                    )
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:

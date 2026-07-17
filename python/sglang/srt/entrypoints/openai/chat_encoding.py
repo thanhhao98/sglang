@@ -24,12 +24,16 @@ def resolve_chat_encoding_spec(
         return "dsv4"
     if tool_call_parser == "deepseekv32":
         return "dsv32"
+    if tool_call_parser == "kimi_k3":
+        return "kimi_k3"
 
     architectures = hf_config.architectures
     arch = architectures[0] if architectures else ""
 
     if "DeepseekV4" in arch:
         return "dsv4"
+    if "KimiK3" in arch:
+        return "kimi_k3"
 
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None
     if "DeepseekV3" in arch and not has_chat_template:
