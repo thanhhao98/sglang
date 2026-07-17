@@ -154,9 +154,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     self._cell_size
                     * (
                         1
-                        + draft_replicas
-                        * int(eagle_draft_num_layers)
-                        / int(num_layers)
+                        + draft_replicas * int(eagle_draft_num_layers) / int(num_layers)
                     )
                 )
 
