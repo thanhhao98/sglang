@@ -9,9 +9,8 @@
 import logging
 from collections.abc import Iterable
 from functools import cached_property
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
-import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -31,6 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, BaseAttnResidual
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -45,10 +45,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import single_token_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -99,18 +98,19 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# Latent MoE TP reduction strategy:
+# Latent MoE TP reduction strategy for the UNFUSED-front path only (the
+# fused front always lands both partial sums in one symmetric
+# [latent | shared] buffer and all-reduces once; see _forward_fused):
 #   "baseline" - two separate all-reduces (routed latent, then shared)
-#   "concat"   - concat routed latent + shared partials, single all-reduce
 #   "fi_fused" - flashinfer fused allreduce+rmsnorm for the latent reduce
-# A/B on 8xB300 bs=1 decode (2026-07-03): baseline 35.2 tok/s beats
-# concat 33.2 (21.5KB message falls off the one-shot allreduce path into
-# two-shot) and fi_fused 33.0 (lamport-buffer kernel + zero-residual
-# overhead loses to custom one-shot + tiny rmsnorm at 7KB messages).
-# On MULTI-NODE TP the trade flips: single-node custom one-shot is
-# unavailable, both reduces go through NCCL, and one 21.5KB collective
-# beats a 7KB + 14KB pair (2x4 GB300 MNNVL bs=1: 22.05 -> 21.36 ms ITL).
-# Default resolves by topology in KimiK3MoE.__init__; env overrides.
+#   "concat"   - accepted for compat, behaves as "baseline" here (the
+#                single-collective tail now rides the fused front)
+# A/B history, pre-zero-copy concat path, 8xB300 bs=1 decode (2026-07-03):
+# baseline 35.2 tok/s beat concat 33.2 (21.5KB message falls off the
+# one-shot allreduce path into two-shot) and fi_fused 33.0. On MULTI-NODE
+# TP the trade flipped: one 21.5KB NCCL collective beat a 7KB + 14KB pair
+# (2x4 GB300 MNNVL bs=1: 22.05 -> 21.36 ms ITL). Re-benchmark now that the
+# fused-front buffer is written with zero copies.
 _K3_MOE_REDUCE_MODE = envs.SGLANG_K3_MOE_REDUCE_MODE.get()
 
 
@@ -136,10 +136,6 @@ _K3_FUSE_KDA_BFA = envs.SGLANG_K3_FUSE_KDA_BFA.get()
 # Use the dedicated CUDA decode-GEMV kernel for the skinny KDA projections
 # (b+f_a merged, f_b) instead of cublas gemvx/dot dispatch.
 _K3_DECODE_GEMV = envs.SGLANG_K3_DECODE_GEMV.get()
-# MoE-front shared-GEMM deferral on the bs=1 concat-reduce path (decode).
-# The attn_res pending-add fold no longer reads this env: jit mode always
-# folds (bit-identical to the explicit add either way).
-_K3_TAIL_FUSE = envs.SGLANG_K3_TAIL_FUSE.get()
 # MLA output gate x * sigmoid(g) in one kernel instead of two elementwise.
 _K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
 # Fully fused KDA decode step (conv1d + delta rule + gated RMSNorm in one
@@ -573,36 +569,10 @@ class KimiK3MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-    def forward_from_gate_up(self, gate_up: torch.Tensor) -> torch.Tensor:
-        """Same as forward() but with the gate_up GEMM already computed
-        (e.g. as a slice of a horizontally-fused projection)."""
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
 
 # ---------------------------------------------------------------------------
 # KimiK3MoE — with Latent MoE support
 # ---------------------------------------------------------------------------
-
-
-class _MoeRegime(msgspec.Struct, frozen=True):
-    # Read hidden_states once through the merged [H, gate_up + E + latent]
-    # front weight instead of three separate GEMMs.
-    fused_front: bool
-    # Tail fusion: defer the shared down GEMM so it writes its partial sum
-    # directly into the concat-allreduce buffer.
-    defer_shared_down: bool
-    # Routed-latent TP reduction strategy for the latent path (ignored by the
-    # plain path): "none" | "allreduce" | "concat" | "fi_fused".
-    reduce_method: str
-
-
-class _MoeFrontResult(msgspec.Struct, frozen=True):
-    routed_input: torch.Tensor
-    topk_output: TopKOutput
-    shared_output: Optional[torch.Tensor]
-    pending_shared_act: Optional[torch.Tensor]
 
 
 class KimiK3MoE(nn.Module):
@@ -776,150 +746,20 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _eligible_for_fused_front(self) -> bool:
+        """The fused front commits to the single-collective tail (both
+        partial sums in one symmetric buffer), so beyond the merged front
+        weight it requires plain-TP routed sums (an a2a combine already
+        returns the complete sum — all-reducing it again would multiply by
+        tp_size) and a dense shared down weight for the direct out= GEMM."""
         return (
             _K3_FUSE_MOE_FRONT
             and self.use_latent_moe
             and self.shared_experts is not None
             and self._front_w is not None
+            and get_moe_a2a_backend().is_none()
+            and self.shared_experts.down_proj.weight.dtype
+            in (torch.bfloat16, torch.float16)
         )
-
-    @cached_property
-    def _eligible_for_defer_shared_down(self) -> bool:
-        return (
-            _K3_TAIL_FUSE
-            and self.moe_reduce_mode == "concat"
-            and self._routed_needs_reduce
-            and self.shared_experts is not None
-            and self.shared_experts.down_proj.weight.dtype == torch.bfloat16
-        )
-
-    def _resolve_regime(self, num_tokens: int) -> _MoeRegime:
-        """Resolve the per-forward execution plan. Every optimization gate is
-        decided here; the execution methods only branch on regime fields."""
-        fused_front = num_tokens > 0 and self._eligible_for_fused_front
-        defer_shared_down = (
-            fused_front and num_tokens == 1 and self._eligible_for_defer_shared_down
-        )
-        has_shared_output = self.shared_experts is not None and num_tokens > 0
-        if not self._routed_needs_reduce:
-            reduce_method = "none"
-        elif self.moe_reduce_mode == "concat" and has_shared_output:
-            reduce_method = "concat"
-        elif self.moe_reduce_mode == "fi_fused" and self.routed_expert_norm is not None:
-            reduce_method = "fi_fused"
-        else:
-            reduce_method = "allreduce"
-        return _MoeRegime(
-            fused_front=fused_front,
-            defer_shared_down=defer_shared_down,
-            reduce_method=reduce_method,
-        )
-
-    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (
-            _K3_DECODE_GEMV
-            and hidden_states.dtype == torch.bfloat16
-            and self.gate.weight.dtype == torch.bfloat16
-        ):
-            # Router GEMM through the tiny-GEMM dispatch ([T, 7168] x
-            # [896, 7168]^T for T <= 8); falls back to F.linear past the
-            # covered regime, same math as self.gate (no bias).
-            from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm
-
-            return kimi_k3_tiny_gemm(hidden_states, self.gate.weight)
-        router_logits, _ = self.gate(hidden_states)
-        return router_logits
-
-    def _front_unfused(self, hidden_states: torch.Tensor):
-        """Front section with three separate GEMMs, each reading
-        hidden_states: shared-expert MLP, router gate, latent down-proj."""
-        # Shared experts on original hidden_states
-        shared_output = None
-        if self.shared_experts is not None and hidden_states.shape[0] > 0:
-            shared_output = self.shared_experts(hidden_states)
-
-        # Gate + TopK (on original hidden_states for correct token count)
-        topk_output = self.topk(hidden_states, self._router_logits(hidden_states))
-
-        # Latent MoE: compress after routing, before experts
-        if self.use_latent_moe:
-            routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        else:
-            routed_input = hidden_states
-        return _MoeFrontResult(
-            routed_input=routed_input,
-            topk_output=topk_output,
-            shared_output=shared_output,
-            pending_shared_act=None,
-        )
-
-    def _front_fused(self, hidden_states: torch.Tensor, defer_shared_down: bool):
-        """Front section reading hidden_states once through the merged
-        [H, gate_up + E + latent] weight instead of three separate GEMMs."""
-        assert self._front_w is not None and self._front_sizes is not None
-        fused = torch.nn.functional.linear(hidden_states, self._front_w)
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
-        if hidden_states.shape[0] > 1:
-            # Only the experts input needs a dense copy (marlin requires
-            # contiguous activations); situ_and_mul and the radix router both
-            # take row-strided slices, and the triton-router fallback upcasts
-            # through .to(float32) which densifies anyway. Free for T==1.
-            routed_input = routed_input.contiguous()
-        shared_output = None
-        pending_shared_act = None
-        if defer_shared_down:
-            pending_shared_act = self.shared_experts.act_fn(gate_up)
-        else:
-            shared_output = self.shared_experts.forward_from_gate_up(gate_up)
-        topk_output = self.topk(hidden_states, router_logits)
-        return _MoeFrontResult(
-            routed_input=routed_input,
-            topk_output=topk_output,
-            shared_output=shared_output,
-            pending_shared_act=pending_shared_act,
-        )
-
-    def _run_experts(self, front: _MoeFrontResult, hidden_size: int):
-        buf = None
-        if front.pending_shared_act is not None:
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                buf = front.routed_input.new_empty(
-                    1, self.moe_hidden_size + hidden_size
-                )
-            single_token_handoff.stash_output_destination(
-                front.routed_input, buf[:, : self.moe_hidden_size]
-            )
-        expert_output = self.experts(front.routed_input, front.topk_output)
-        if buf is not None:
-            single_token_handoff.clear_output_destination()
-        return expert_output, buf
-
-    def _reduce_latent(
-        self,
-        latent: torch.Tensor,
-        front: _MoeFrontResult,
-        reduce_method: str,
-        hidden_size: int,
-        buf: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
-        if reduce_method == "concat":
-            latent, shared_output = self._reduce_latent_concat(
-                latent=latent,
-                shared_output=front.shared_output,
-                pending_shared_act=front.pending_shared_act,
-                hidden_size=hidden_size,
-                buf=buf,
-            )
-            return self._latent_norm(latent), shared_output, True
-        if reduce_method == "fi_fused":
-            return self._fi_fused_reduce_norm(latent), front.shared_output, False
-        if reduce_method == "allreduce":
-            latent = tensor_model_parallel_all_reduce(latent)
-        return self._latent_norm(latent), front.shared_output, False
 
     def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
         if self.routed_expert_norm is None:
@@ -946,91 +786,116 @@ class KimiK3MoE(nn.Module):
             return norm_out
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _reduce_latent_concat(
-        self,
-        latent: torch.Tensor,
-        shared_output: Optional[torch.Tensor],
-        pending_shared_act: Optional[torch.Tensor],
-        hidden_size: int,
-        buf: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One NCCL call instead of two: all-reduce the routed latent (3584)
-        and shared (7168) partial sums as a single [latent | shared] buffer.
+    def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Unfused-front latent tail: TP-partial routed sums must be reduced
+        in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
+        if not self._routed_needs_reduce:
+            return self._latent_norm(latent)
+        if self.moe_reduce_mode == "fi_fused" and self.routed_expert_norm is not None:
+            return self._fi_fused_reduce_norm(latent)
+        return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-        The buffer is allocated in the NCCL symmetric mempool so the
-        all-reduce takes the symmetric-kernel one-shot path instead of
-        falling back to ring (same trick as RowParallelLinear). When the
-        shared down GEMM was deferred (pending_shared_act), it writes its
-        partial sum straight into the buffer slice and the routed latent is
-        one small copy — replacing down-GEMM-then-cat (one fewer 14KB round
-        trip).
-        """
-        if buf is None:
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                if pending_shared_act is not None:
-                    buf = latent.new_empty(
-                        latent.shape[0],
-                        self.moe_hidden_size + hidden_size,
-                    )
-                else:
-                    assert shared_output is not None  # concat regime has shared
-                    buf = torch.cat((latent, shared_output), dim=-1)
-        if pending_shared_act is not None:
-            torch.mm(
-                pending_shared_act,
-                self.shared_experts.down_proj.weight.t(),
-                out=buf[..., self.moe_hidden_size :],
+    def _forward_unfused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Front section with three separate GEMMs, each reading
+        hidden_states: shared-expert MLP, router gate, latent down-proj."""
+        # Shared experts on original hidden_states
+        shared_output = None
+        if self.shared_experts is not None and hidden_states.shape[0] > 0:
+            shared_output = self.shared_experts(hidden_states)
+
+        # Gate + TopK (on original hidden_states for correct token count)
+        topk_output = self.topk(hidden_states, self.gate(hidden_states)[0])
+
+        if not self.use_latent_moe:
+            expert_output = self.experts(hidden_states, topk_output)
+            if shared_output is not None:
+                expert_output = expert_output + shared_output
+            if self.tp_size > 1:
+                expert_output = tensor_model_parallel_all_reduce(expert_output)
+            return expert_output
+
+        # Latent MoE: compress after routing, before experts
+        if TYPE_CHECKING:
+            assert (
+                self.routed_expert_down_proj is not None
+                and self.routed_expert_up_proj is not None
             )
-            if latent.data_ptr() != buf.data_ptr():
-                buf[..., : self.moe_hidden_size].copy_(latent)
-        buf = tensor_model_parallel_all_reduce(buf)
-        return (
-            buf[..., : self.moe_hidden_size].contiguous(),
-            buf[..., self.moe_hidden_size :],
+
+        routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        latent = self._reduce_latent(self.experts(routed_input, topk_output))
+        # up_proj is replicated, so the routed output is now fully reduced.
+        out, _ = self.routed_expert_up_proj(latent)
+        if shared_output is not None:
+            if self.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            out = out + shared_output
+        return out
+
+    def _forward_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Fused-front pipeline: read hidden_states once through the merged
+        [H, gate_up + E + latent] weight, then land both TP-partial sums in
+        one flat symmetric [latent | shared] buffer with zero copies — the
+        shared down GEMM writes its slice via out=, the MoE runner writes
+        its top-k sum via the zero-copy context — and all-reduce the pair
+        in a single collective (the symmetric mempool keeps the one-shot
+        allreduce path; same trick as RowParallelLinear)."""
+        if TYPE_CHECKING:  # NOTE: precondition for this case
+            assert (
+                self._front_w is not None
+                and self._front_sizes is not None
+                and self.moe_hidden_size is not None
+                and self.shared_experts is not None
+                and isinstance(self.shared_experts.down_proj.weight, torch.Tensor)
+                and self.routed_expert_up_proj is not None
+            )
+
+        num_tokens, hidden_size = hidden_states.shape
+        fused = torch.nn.functional.linear(hidden_states, self._front_w)
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        topk_output = self.topk(hidden_states, router_logits)
+        latent_numel = num_tokens * self.moe_hidden_size
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        torch.mm(
+            self.shared_experts.act_fn(gate_up),
+            self.shared_experts.down_proj.weight.t(),
+            out=shared_output,
         )
 
-    def _combine_plain(
-        self, expert_output: torch.Tensor, shared_output: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        """Non-latent tail: add shared partials before the single all-reduce
-        so routed and shared are reduced together."""
-        if shared_output is not None:
-            expert_output = expert_output + shared_output
-        if self.tp_size > 1:
-            expert_output = tensor_model_parallel_all_reduce(expert_output)
-        return expert_output
+        # NOTE: Marlin need contiguous input; bs = 1 is already contiguous
+        if num_tokens > 1:
+            routed_input = routed_input.contiguous()
+        with zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(routed_input, topk_output)
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+
+        # Re-derive both views from the returned tensor: all_reduce is NOT
+        # guaranteed in-place (custom-AR / pymscclpp paths return a new
+        # tensor; only the symmetric-mempool pynccl path reduces in place).
+        buf = tensor_model_parallel_all_reduce(buf)
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        # up_proj is replicated, so the routed output is now fully reduced.
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        return out + shared_output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """No residual add here: on the attn-res path the +residual add is
         delayed into the next aggregation point."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        regime = self._resolve_regime(num_tokens)
-
-        if regime.fused_front:
-            front = self._front_fused(hidden_states, regime.defer_shared_down)
+        if num_tokens > 0 and self._eligible_for_fused_front:
+            out = self._forward_fused(hidden_states)
         else:
-            front = self._front_unfused(hidden_states)
-
-        expert_output, buf = self._run_experts(front, hidden_size=hidden_size)
-
-        if not self.use_latent_moe:
-            out = self._combine_plain(expert_output, front.shared_output)
-            return out.view(num_tokens, hidden_size)
-
-        latent, shared_output, shared_reduced = self._reduce_latent(
-            expert_output, front, regime.reduce_method, hidden_size, buf
-        )
-        # up_proj is replicated, so the routed output is now fully reduced.
-        out, _ = self.routed_expert_up_proj(latent)
-        if shared_output is not None:
-            if self.tp_size > 1 and not shared_reduced:
-                shared_output = tensor_model_parallel_all_reduce(shared_output)
-            # bf16(up + shared); shared_output may be a row-strided slice
-            # of the concat-allreduce buffer.
-            out = out + shared_output
+            out = self._forward_unfused(hidden_states)
         return out.view(num_tokens, hidden_size)
 
 

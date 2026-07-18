@@ -729,9 +729,6 @@ class Envs:
     SGLANG_K3_DECODE_GEMV = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_K3_TINY_GEMV"
     )
-    # Cross-op decode tail fusions: residual add folded into the attn_res
-    # score kernel + MoE tail 3-way add in one kernel.
-    SGLANG_K3_TAIL_FUSE = EnvBool(True)
     # MLA output gate x * sigmoid(g) fused into one kernel.
     SGLANG_K3_FUSE_O_GATE = EnvBool(True)
     # AttnRes aggregation backend: fused (triton) | jit (CUDA) | torch | legacy.
@@ -1155,6 +1152,7 @@ def _convert_SGL_to_SGLANG():
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
+    _print_deprecated_env("SGLANG_K3_TAIL_FUSE")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(

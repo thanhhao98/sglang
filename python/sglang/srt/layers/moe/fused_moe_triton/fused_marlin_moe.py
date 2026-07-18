@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe import single_token_handoff
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -394,12 +395,7 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
-    output = None
-    if M == 1:
-        # The model may hand us a preallocated destination (e.g. the K3
-        # concat-allreduce buffer slice) so the final sum lands there
-        # directly instead of being copied afterwards.
-        output = single_token_handoff.consume_output_destination(hidden_states)
+    output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
