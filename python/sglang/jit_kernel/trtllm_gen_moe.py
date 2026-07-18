@@ -56,7 +56,9 @@ if TYPE_CHECKING:
 # (kept as plain ints here so this module has no fork import).
 ACTIVATION_SITU = 9
 ROUTING_DEEPSEEK_V3 = 2
+_ROUTING_TOPK = 5
 _ROUTING_INPUT_FROM_LOGITS = 0
+_ROUTING_INPUT_PACKED = 2
 
 # Batched-gemm ABI headers shipped flat in the cubin pool; the launcher
 # includes them as flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/<h>.
@@ -365,6 +367,90 @@ def trtllm_fp4_block_scale_moe(
         output,
         list(tactic),
         norm_topk_prob,
+        None,  # routing_replay_out
+    )
+    return output
+
+
+def trtllm_fp4_block_scale_routed_moe(
+    packed_topk_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_scalar: Optional[torch.Tensor],
+    output1_scale_gate_scalar: Optional[torch.Tensor],
+    output2_scale_scalar: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    activation_type: int = ACTIVATION_SITU,
+    tactic: Sequence[int] = (-1, -1),
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP4 block-scale MoE with PRECOMPUTED routing (PackedPrecomputed).
+
+    ``packed_topk_ids``: int32 ``[T, top_k]`` with ``(expert_id << 16) |
+    bf16-weight-bits`` (PackTopkIds layout) — selection and weights come
+    from the caller's router, the in-op routing kernels are skipped. This
+    is the fast path at small T, where the in-op single-CTA routing kernel
+    (~22 µs at 896 experts) costs more than an external radix router.
+    """
+    module = _jit_trtllm_gen_moe_module()
+    hidden_states = hidden_states.contiguous()
+    num_tokens = packed_topk_ids.shape[0]
+    hidden_size = hidden_states.shape[-1]
+    if hidden_states.dtype == torch.uint8:
+        hidden_size *= 2
+    device = hidden_states.device
+    # Mode 2 unpacks the weights in-kernel; this is its output buffer.
+    topk_weights = torch.empty(
+        num_tokens, top_k, dtype=torch.bfloat16, device=device
+    )
+    if output is None:
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
+    module.trtllm_fp4_block_scale_moe_private(
+        _ROUTING_INPUT_PACKED,
+        None,  # routing_logits
+        packed_topk_ids.contiguous(),
+        topk_weights,
+        None,  # routing_bias (already applied by the external router)
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        None,  # gemm1_bias
+        gemm1_alpha,
+        gemm1_beta,
+        None,  # gemm1_clamp_limit
+        gemm2_weights,
+        gemm2_weights_scale,
+        None,  # gemm2_bias
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        None,  # per_token_scale
+        num_experts,
+        top_k,
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,  # local_num_experts
+        1.0,  # routed_scaling_factor (already applied by the router)
+        _ROUTING_TOPK,  # routing_method_type (unused for precomputed)
+        True,  # do_finalize
+        True,  # enable_pdl
+        activation_type,
+        output,
+        list(tactic),
+        True,  # norm_topk_prob (unused for precomputed)
         None,  # routing_replay_out
     )
     return output

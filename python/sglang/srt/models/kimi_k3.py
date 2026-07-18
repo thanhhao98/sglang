@@ -49,7 +49,7 @@ from sglang.srt.layers.moe import single_token_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer
@@ -682,7 +682,20 @@ class KimiK3MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            # flashinfer_mxfp4 + situ consumes precomputed routing
+            # (PackedPrecomputed): keep the radix router in the TopK layer
+            # and hand its ids/weights to the MoE op. Other quantized paths
+            # keep the runner-resolved format (marlin -> standard anyway,
+            # bypassed only for the public logits-routing path).
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if quant_config is None
+                or (
+                    config.hidden_act == "situ"
+                    and get_moe_runner_backend().is_flashinfer_mxfp4()
+                )
+                else None
+            ),
         )
 
         # Shared experts (operate in original hidden_size space)

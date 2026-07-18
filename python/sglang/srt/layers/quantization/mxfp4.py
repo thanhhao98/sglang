@@ -1296,10 +1296,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 raise NotImplementedError()
 
             assert x_quant.shape[-1] == self.hidden_size
-            assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-            top_k = topk_output.topk_config.top_k
-            router_logits = topk_output.router_logits
+            is_standard = TopKOutputChecker.format_is_standard(topk_output)
+            # The situ path accepts precomputed (standard) routing; the
+            # public path below is logits-only.
+            assert is_standard or TopKOutputChecker.format_is_bypassed(
+                topk_output
+            ), f"unsupported topk format: {topk_output.format}"
+            if is_standard:
+                assert (
+                    self.moe_runner_config.activation == "situ"
+                ), "standard topk output only wired for the situ path"
+                top_k = topk_output.topk_ids.shape[1]
+                router_logits = None
+            else:
+                top_k = topk_output.topk_config.top_k
+                router_logits = topk_output.router_logits
 
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1326,6 +1337,40 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "sglang/jit_kernel/trtllm_gen_moe.py)."
                     )
                 assert layer.num_local_experts == layer.num_experts, "situ trtllm-gen path is TP-only (no EP)"
+                if TopKOutputChecker.format_is_standard(topk_output):
+                    # Precomputed routing (radix router upstream): skip the
+                    # in-op routing kernels entirely. At small T the in-op
+                    # single-CTA routing costs ~22 us/layer vs ~6 us for the
+                    # external radix router.
+                    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+
+                    packed_topk = PackTopkIds.execute(
+                        topk_output.topk_ids, topk_output.topk_weights
+                    )
+                    situ_moe.trtllm_fp4_block_scale_routed_moe(
+                        packed_topk_ids=packed_topk,
+                        hidden_states=x_quant,
+                        hidden_states_scale=x_scale,
+                        gemm1_weights=layer.w13_weight,
+                        gemm1_weights_scale=layer.w13_weight_scale,
+                        gemm1_alpha=layer.gemm1_alpha,
+                        # SiTuGlu: gatedActBeta is the linear-half tanh
+                        # clip; K3 stores it in gemm1_clamp_limit.
+                        gemm1_beta=layer.gemm1_clamp_limit,
+                        gemm2_weights=layer.w2_weight,
+                        gemm2_weights_scale=layer.w2_weight_scale,
+                        output1_scale_scalar=None,
+                        output1_scale_gate_scalar=None,
+                        output2_scale_scalar=None,
+                        num_experts=layer.num_experts,
+                        top_k=packed_topk.shape[1],
+                        intermediate_size=self.intermediate_size_per_partition,
+                        activation_type=situ_moe.ACTIVATION_SITU,
+                        output=symm_output,
+                    )
+                    return StandardCombineInput(hidden_states=symm_output)
+
+                # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
                 bias_bf16 = getattr(layer, "_situ_routing_bias_bf16", None)
                 if bias_bf16 is None and correction_bias is not None:
