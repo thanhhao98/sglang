@@ -79,7 +79,12 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import make_layers
-from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+from sglang.srt.utils.common import (
+    BumpAllocator,
+    add_prefix,
+    rank0_log,
+    set_weight_attrs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +139,11 @@ _K3_DECODE_GEMV = envs.SGLANG_K3_DECODE_GEMV.get()
 _K3_TAIL_FUSE = envs.SGLANG_K3_TAIL_FUSE.get()
 # MLA output gate x * sigmoid(g) in one kernel instead of two elementwise.
 _K3_FUSE_O_GATE = envs.SGLANG_K3_FUSE_O_GATE.get()
+# Fully fused KDA decode step (conv1d + delta rule + gated RMSNorm in one
+# kernel, jit_kernel/kda_fused_decode). The model hands the output-norm gate
+# to the KDA backend via an attempt-and-verify stash on the attention layer;
+# unconsumed stashes fall back to the unfused chain + o_norm here.
+_K3_KDA_FUSED_DECODE = envs.SGLANG_KDA_FUSED_DECODE.get()
 
 
 def _merge_weights_as_views(
@@ -1237,6 +1247,8 @@ class KimiK3DeltaAttention(nn.Module):
         )
         # KDA safe gate: checkpoint trained with gate_lower_bound=-5.0
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        # Set by _prepare_fused_decode() once weights are loaded.
+        self._kda_fused_decode_ready = False
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1265,6 +1277,58 @@ class KimiK3DeltaAttention(nn.Module):
             [self.f_a_proj, self.b_proj], pad_rows_to=8
         )
         self._bfa_fa_size, self._bfa_b_size = sizes
+
+    def _prepare_fused_decode(self) -> None:
+        """Static inputs for the fused KDA decode kernel
+        (jit_kernel/kda_fused_decode): per-segment transposed fp32 conv
+        weights [4, seg], dense fp32 conv bias, fp32 output-norm weight. Stashed on the
+        attention layer for the KDA backend; when the shapes do not match
+        the compiled kernel the stash stays unset and decode keeps the
+        unfused chain. Called once from load_weights (after all weights are
+        loaded, before cuda graph capture)."""
+        if not _K3_KDA_FUSED_DECODE:
+            return
+        layer = self.attn
+        w = layer.conv_weights
+        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        if (
+            w is None
+            or w.ndim != 2
+            or w.shape != (3 * seg, 4)
+            or w.dtype != torch.float32
+            or layer.A_log is None
+            or layer.A_log.numel() != 12
+            or layer.A_log.dtype != torch.float32
+            or layer.dt_bias is None
+            or tuple(layer.dt_bias.shape) != (seg,)
+            or layer.dt_bias.dtype != torch.float32
+        ):
+            rank0_log(
+                "K3 fused KDA decode disabled: unexpected conv/A_log/dt_bias "
+                f"layout (conv {None if w is None else tuple(w.shape)}, "
+                f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
+                f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
+            )
+            return
+        # Conv weights/bias stay fp32 (checkpoint dtype; the kernel loads
+        # them as fp32, matching the triton chain's precision exactly).
+        wt = w.t().contiguous()  # [4, 3*seg]
+        bias = layer.bias
+        conv_bias = (
+            bias.float().contiguous()
+            if bias is not None
+            else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
+        )
+        layer._k3_fused_decode_args = (
+            wt[:, :seg].contiguous(),
+            wt[:, seg : 2 * seg].contiguous(),
+            wt[:, 2 * seg :].contiguous(),
+            conv_bias,
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            self.o_norm.weight.data.float().contiguous(),
+            float(self.o_norm.eps),
+        )
+        self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
@@ -1316,6 +1380,19 @@ class KimiK3DeltaAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
+        # Fused-decode handoff (attempt-and-verify): offer the output-norm
+        # gate to the KDA backend so decode can run conv1d + delta rule +
+        # gated RMSNorm as one kernel. If the backend leaves the stash
+        # unconsumed (env off, shape not covered, non-decode), apply o_norm
+        # here as before.
+        fused_onorm = (
+            self._kda_fused_decode_ready
+            and forward_batch.forward_mode.is_decode()
+        )
+        if fused_onorm:
+            self.attn._k3_onorm_gate = g_proj_states
+            self.attn._k3_onorm_consumed = False
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -1323,8 +1400,12 @@ class KimiK3DeltaAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        if fused_onorm:
+            self.attn._k3_onorm_gate = None
+            fused_onorm = self.attn._k3_onorm_consumed
+        if not fused_onorm:
+            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         return self.o_proj(core_attn_out)[0]
@@ -2126,6 +2207,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
+                layer.self_attn._prepare_fused_decode()
 
 
 # ---------------------------------------------------------------------------
