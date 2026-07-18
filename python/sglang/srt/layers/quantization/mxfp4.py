@@ -1312,6 +1312,59 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
+
+            if self.moe_runner_config.activation == "situ":
+                # SiTU is only in the private trtllm-gen cubin pool (the
+                # public artifact bakes swiglu into the fused-act cubins and
+                # silently computes the wrong activation). Routing must also
+                # be noaux_tc (sigmoid + correction bias, DeepSeekV3 method),
+                # not the renormalize-softmax default below.
+                from sglang.jit_kernel import trtllm_gen_moe as situ_moe
+
+                if not situ_moe.available():
+                    raise RuntimeError(
+                        "activation='situ' with the flashinfer_mxfp4 runner "
+                        "needs the private SiTU cubin pool: set "
+                        "SGLANG_TRTLLM_GEN_MOE_SDK (see "
+                        "sglang/jit_kernel/trtllm_gen_moe.py)."
+                    )
+                assert layer.num_local_experts == layer.num_experts, "situ trtllm-gen path is TP-only (no EP)"
+                correction_bias = topk_output.topk_config.correction_bias
+                bias_bf16 = getattr(layer, "_situ_routing_bias_bf16", None)
+                if bias_bf16 is None and correction_bias is not None:
+                    bias_bf16 = correction_bias.to(torch.bfloat16)
+                    layer._situ_routing_bias_bf16 = bias_bf16
+                situ_moe.trtllm_fp4_block_scale_moe(
+                    routing_logits=router_logits.to(torch.bfloat16),
+                    routing_bias=bias_bf16,
+                    hidden_states=x_quant,
+                    hidden_states_scale=x_scale,
+                    gemm1_weights=layer.w13_weight,
+                    gemm1_weights_scale=layer.w13_weight_scale,
+                    gemm1_alpha=layer.gemm1_alpha,
+                    # SiTuGlu: gatedActBeta is the linear-half tanh clip;
+                    # K3 stores it in gemm1_clamp_limit (situ_linear_beta).
+                    gemm1_beta=layer.gemm1_clamp_limit,
+                    gemm2_weights=layer.w2_weight,
+                    gemm2_weights_scale=layer.w2_weight_scale,
+                    output1_scale_scalar=None,
+                    output1_scale_gate_scalar=None,
+                    output2_scale_scalar=None,
+                    num_experts=layer.num_experts,
+                    top_k=top_k,
+                    n_group=topk_output.topk_config.num_expert_group,
+                    topk_group=topk_output.topk_config.topk_group,
+                    intermediate_size=self.intermediate_size_per_partition,
+                    routed_scaling_factor=(
+                        topk_output.topk_config.routed_scaling_factor or 1.0
+                    ),
+                    routing_method_type=situ_moe.ROUTING_DEEPSEEK_V3,
+                    activation_type=situ_moe.ACTIVATION_SITU,
+                    norm_topk_prob=topk_output.topk_config.renormalize,
+                    output=symm_output,
+                )
+                return StandardCombineInput(hidden_states=symm_output)
+
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
