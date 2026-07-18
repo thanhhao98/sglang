@@ -668,24 +668,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = swap_every_two_rows(w13_weight, -2)
                 w13_bias = swap_every_two_rows(w13_bias, -1)
             else:
-                # Non-interleaved layout (e.g. K3 Latent MoE): first half=gate, second half=up
-                # Swap halves to match trtllm-gen's expected [up, gate] order
+                # Non-interleaved layout (e.g. K3 Latent MoE): first half = gate
+                # (w1), second half = up (w3). The trtllm-gen fused gated-act
+                # epilogue wants rows interleaved as (up_i, gate_i) PAIRS -
+                # the layout get_reorder_rows_for_gated_act_gemm_row_indices
+                # produces from [linear; gate] halves, and what the
+                # interleaved branch above arrives at via swap_every_two_rows.
+                # A plain halves swap keeps rows blocked and pairs up_i with
+                # up_{i+1}, which scrambles the gated activation.
                 half = w13_weight.shape[-2] // 2
-                w13_weight = torch.cat(
-                    [w13_weight[..., half:, :], w13_weight[..., :half, :]], dim=-2
-                )
-                half_s = w13_weight_scale.shape[-2] // 2
-                w13_weight_scale = torch.cat(
-                    [
-                        w13_weight_scale[..., half_s:, :],
-                        w13_weight_scale[..., :half_s, :],
-                    ],
-                    dim=-2,
-                )
-                half_b = w13_bias.shape[-1] // 2
-                w13_bias = torch.cat(
-                    [w13_bias[..., half_b:], w13_bias[..., :half_b]], dim=-1
-                )
+                pair_idx = torch.empty(2 * half, dtype=torch.long)
+                pair_idx[0::2] = torch.arange(half) + half  # up (w3)
+                pair_idx[1::2] = torch.arange(half)  # gate (w1)
+                w13_weight = w13_weight[..., pair_idx, :].contiguous()
+                w13_weight_scale = w13_weight_scale[..., pair_idx, :].contiguous()
+                w13_bias = w13_bias[..., pair_idx].contiguous()
 
             # Shuffle weights and scaling factors for transposed mma output
             gemm1_weights_mxfp4_shuffled = []
