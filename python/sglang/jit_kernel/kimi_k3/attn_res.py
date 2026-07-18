@@ -11,6 +11,7 @@ from sglang.jit_kernel.utils import (
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
+    override_jit_cuda_arch,
 )
 
 if TYPE_CHECKING:
@@ -77,6 +78,28 @@ def _jit_chain_module() -> Module:
         cuda_wrappers=[("run", f"AttnResChain<{args}>::run")],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
+
+
+@cache_once
+def _jit_fused_tma_module() -> Module:
+    """Compile and cache the NV warp-specialized TMA aggregation kernel.
+
+    tcgen05 TMEM / cp.async.bulk require the sm_*a target, hence the arch
+    override. The mbarrier/tcgen05 primitives are inlined PTX (no cutlass)."""
+    major, minor = torch.cuda.get_device_capability()
+    if major < 10:
+        raise RuntimeError(
+            "attn_res_fused_tma requires SM100+ (tcgen05, cp.async.bulk)"
+        )
+    args = make_cpp_args(_DIM, _MAX_BANK_ROWS, is_arch_support_pdl())
+    with override_jit_cuda_arch(major, minor, suffix="a"):
+        return load_jit(
+            _make_name("fused_tma"),
+            *args,
+            cuda_files=["kimi_k3/attn_res/fused_tma.cuh"],
+            cuda_wrappers=[("run", f"AttnResFusedTmaKernel<{args}>::run")],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
 
 
 @cache_once
@@ -155,6 +178,35 @@ def attn_res_chain(
     eps        : RMSNorm epsilon (shared by score and output norms)
     """
     _jit_chain_module().run(prefix_sum, bank, cw, ow, out, nvb, eps)
+
+
+def attn_res_fused_tma(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    cw: torch.Tensor,
+    ow: torch.Tensor,
+    out: torch.Tensor,
+    nvb: int,
+    eps: float,
+) -> None:
+    """NV warp-specialized TMA aggregation (ported): per-row score -> online
+    softmax -> weighted combine -> output RMSNorm, one persistent CTA per SM.
+    1 producer warp streams rows into smem via cp.async.bulk, 8 consumer
+    warps reduce and accumulate; cw and ow are staged in TMEM.
+
+    Restrictions: H == 7168, nvb in [1, 8], SM100a+.
+
+    Parameters
+    ----------
+    prefix_sum : [T, H] bf16
+    bank       : [T, NB, H] bf16 (rows 0..nvb-1 are aggregated)
+    cw         : [H] bf16 — precomputed score_norm_weight * proj_weight
+    ow         : [H] bf16 — output RMSNorm weight
+    out        : [T, H] bf16 output buffer
+    nvb        : number of valid bank rows (1..8)
+    eps        : RMSNorm epsilon (shared by score and output norms)
+    """
+    _jit_fused_tma_module().run(prefix_sum, bank, cw, ow, out, nvb, eps)
 
 
 def attn_res_score_fused_add(

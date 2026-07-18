@@ -9,6 +9,9 @@ Impls at K3 shapes (H=7168, bf16):
              call (max-width vectors + unroll for score/norm, table-dispatched
              rows and partial sum-of-squares in merge so norm needs no
              reduction); workspace allocated C++-side.
+- tma:       attn_res_fused_tma — NV warp-specialized cp.async.bulk/TMEM port
+             (persistent CTA per SM, online softmax) with the output RMSNorm
+             fused; SM100a+ only.
 - jit_chain: baseline attn_res_score + attn_res_combine + rmsnorm.
 
 Bandwidth is reported over the algorithmic footprint (prefix + bank rows
@@ -25,6 +28,7 @@ from sglang.jit_kernel.kimi_k3.attn_res import (
     attn_res_chain,
     attn_res_combine,
     attn_res_fused,
+    attn_res_fused_tma,
     attn_res_score,
 )
 from sglang.jit_kernel.norm import rmsnorm
@@ -50,6 +54,10 @@ def _run_chain(prefix, bank, cw, ow, out, nvb):
     attn_res_chain(prefix, bank, cw, ow, out, nvb, _EPS)
 
 
+def _run_tma(prefix, bank, cw, ow, out, nvb):
+    attn_res_fused_tma(prefix, bank, cw, ow, out, nvb, _EPS)
+
+
 def _run_jit_chain(prefix, bank, cw32, ow, scores, mixed, out, nvb):
     attn_res_score(prefix, bank, cw32, scores, nvb, _EPS)
     attn_res_combine(prefix, bank, scores, mixed, nvb)
@@ -58,10 +66,10 @@ def _run_jit_chain(prefix, bank, cw32, ow, scores, mixed, out, nvb):
 
 @marker.parametrize("nvb", list(range(1, 9)), [8])
 @marker.parametrize("num_tokens", [2**x for x in range(14)], [1, 64])
-@marker.benchmark("impl", ["fused", "chain", "jit_chain"])
+@marker.benchmark("impl", ["fused", "chain", "tma", "jit_chain"])
 def benchmark(num_tokens: int, nvb: int, impl: str):
-    if impl == "fused" and torch.cuda.get_device_capability()[0] < 10:
-        marker.skip("attn_res_fused requires SM100+ (fma.rn.f32.bf16)")
+    if impl in ("fused", "tma") and torch.cuda.get_device_capability()[0] < 10:
+        marker.skip(f"attn_res {impl} impl requires SM100+")
 
     prefix = create_random(num_tokens, _H)
     bank = create_random(num_tokens, _NB, _H)
@@ -75,6 +83,9 @@ def benchmark(num_tokens: int, nvb: int, impl: str):
     elif impl == "chain":
         args = (prefix, bank, cw, ow, out, nvb)
         fn = _run_chain
+    elif impl == "tma":
+        args = (prefix, bank, cw, ow, out, nvb)
+        fn = _run_tma
     else:
         scores = torch.empty(
             num_tokens, _MAX_ROWS, dtype=torch.float32, device=prefix.device

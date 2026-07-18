@@ -6,10 +6,10 @@
 # [T, NB, H] and the valid-row counter, and dispatches each aggregation point
 # (score rows → softmax → weighted sum → RMSNorm) to the implementation
 # selected by SGLANG_K3_ATTN_RES_MODE:
-#   "fast"   — optimized CUDA kernels (default): one fully fused kernel for
-#              nvb <= 6 rows, the score/merge/norm chain above (B200/B300
-#              benchmark crossover). Requires SM100+ and H=7168; fails loudly
-#              when unsupported — pick another mode there.
+#   "fast"   — NV warp-specialized TMA kernel (default): cp.async.bulk
+#              producer + online-softmax consumers, out norm fused, one
+#              persistent CTA per SM. Requires SM100a+ and H=7168; fails
+#              loudly when unsupported — pick another mode there.
 #   "fused"  — Triton 2-kernel pipeline with full H-parallelism
 #   "jit"    — CUDA JIT kernels with lower launch overhead than Triton
 #   "torch"  — PyTorch reference (readable, for debugging)
@@ -29,7 +29,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 _MODE = envs.SGLANG_K3_ATTN_RES_MODE.get()
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
-_OPT_FUSED_MAX_NVB: int = 6  # fused wins up to 6 rows on B200, chain above
 
 
 # ---- Precomputed weight cache ------------------------------------------------
@@ -63,18 +62,20 @@ def _aggregate_fast(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
 ) -> torch.Tensor:
-    """Route to the fully fused single kernel while all rows fit its register
-    budget with good occupancy (nvb <= 6), and to the 3-kernel
-    score/merge/norm chain above that (B300 benchmark crossover)."""
-    from sglang.jit_kernel.kimi_k3.attn_res import attn_res_chain, attn_res_fused
+    """NV warp-specialized TMA kernel: online softmax over row chunks with
+    the output RMSNorm fused, one persistent CTA per SM (GB300 benchmark
+    winner across nvb; attn_res_fused / attn_res_chain remain available as
+    benchmark alternates)."""
+    from sglang.jit_kernel.kimi_k3.attn_res import attn_res_fused_tma
 
-    # The kernels apply one eps to both the score norm and the output norm.
+    # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
 
     cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
     out = torch.empty_like(prefix_sum)
-    kernel = attn_res_fused if nvb <= _OPT_FUSED_MAX_NVB else attn_res_chain
-    kernel(prefix_sum, bank, cw, out_norm.weight, out, nvb, score_norm.variance_epsilon)
+    attn_res_fused_tma(
+        prefix_sum, bank, cw, out_norm.weight, out, nvb, score_norm.variance_epsilon
+    )
     return out
 
 
