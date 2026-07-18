@@ -58,7 +58,9 @@ ACTIVATION_SITU = 9
 ROUTING_DEEPSEEK_V3 = 2
 _ROUTING_TOPK = 5
 _ROUTING_INPUT_FROM_LOGITS = 0
-_ROUTING_INPUT_PACKED = 2
+# NOTE: the enum VALUES start at 0; the "Mode 1/2/3" wording in upstream
+# comments is documentation numbering, not the enum value.
+_ROUTING_INPUT_PACKED = 1
 
 # Batched-gemm ABI headers shipped flat in the cubin pool; the launcher
 # includes them as flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/<h>.
