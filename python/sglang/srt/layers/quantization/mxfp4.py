@@ -1332,7 +1332,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     bias_bf16 = correction_bias.to(torch.bfloat16)
                     layer._situ_routing_bias_bf16 = bias_bf16
                 situ_moe.trtllm_fp4_block_scale_moe(
-                    routing_logits=router_logits.to(torch.bfloat16),
+                    # router_logits is a row-strided slice of the K3 fused
+                    # front GEMM output; the FFI reads it as dense.
+                    routing_logits=router_logits.to(torch.bfloat16).contiguous(),
                     routing_bias=bias_bf16,
                     hidden_states=x_quant,
                     hidden_states_scale=x_scale,

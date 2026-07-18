@@ -312,6 +312,10 @@ def trtllm_fp4_block_scale_moe(
     (gemm1, gemm2) config index pair; ``(-1, -1)`` = runner heuristic.
     """
     module = _jit_trtllm_gen_moe_module()
+    # The FFI launcher reads these as dense row-major; a strided slice
+    # (e.g. a fused-GEMM split) would silently mis-route.
+    routing_logits = routing_logits.contiguous()
+    hidden_states = hidden_states.contiguous()
     num_tokens = routing_logits.shape[0]
     hidden_size = hidden_states.shape[-1]
     if hidden_states.dtype == torch.uint8:
