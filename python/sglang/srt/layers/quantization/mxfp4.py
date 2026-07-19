@@ -1336,7 +1336,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "SGLANG_TRTLLM_GEN_MOE_SDK (see "
                         "sglang/jit_kernel/trtllm_gen_moe.py)."
                     )
-                assert layer.num_local_experts == layer.num_experts, "situ trtllm-gen path is TP-only (no EP)"
+                assert (
+                    layer.num_local_experts == layer.num_experts
+                ), "situ trtllm-gen path is TP-only (no EP)"
                 if TopKOutputChecker.format_is_standard(topk_output):
                     # Precomputed routing (radix router upstream): skip the
                     # in-op routing kernels entirely. At small T the in-op

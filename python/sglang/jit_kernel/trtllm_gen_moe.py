@@ -410,9 +410,7 @@ def trtllm_fp4_block_scale_routed_moe(
         hidden_size *= 2
     device = hidden_states.device
     # Mode 2 unpacks the weights in-kernel; this is its output buffer.
-    topk_weights = torch.empty(
-        num_tokens, top_k, dtype=torch.bfloat16, device=device
-    )
+    topk_weights = torch.empty(num_tokens, top_k, dtype=torch.bfloat16, device=device)
     if output is None:
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device

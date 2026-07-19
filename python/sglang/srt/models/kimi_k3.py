@@ -1448,8 +1448,7 @@ class KimiK3DeltaAttention(nn.Module):
         # unconsumed (env off, shape not covered, non-decode), apply o_norm
         # here as before.
         fused_onorm = (
-            self._kda_fused_decode_ready
-            and forward_batch.forward_mode.is_decode()
+            self._kda_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
