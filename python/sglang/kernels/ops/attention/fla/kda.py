@@ -1164,6 +1164,7 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
+    # Returns o [B, T, H, V] when output_intermediate_states=False, or (o, h [B, NT, H, V, K]) when output_intermediate_states=True.
     return chunk_kda_fwd(
         q=q,
         k=k,
