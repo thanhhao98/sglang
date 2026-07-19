@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -158,6 +160,48 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
         self.assertEqual(processor.mm_feature_transport, "cpu")
         self.assertFalse(processor.use_cuda_ipc)
         memory_pool.assert_not_called()
+
+
+class TestPrecomputeHashBeforeCpuTransfer(unittest.TestCase):
+    @staticmethod
+    def _processor(enabled):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+            processor = BaseMultimodalProcessor()
+        processor.precompute_hash_before_cpu_transfer = enabled
+        processor.keep_mm_feature_on_device = False
+        processor.use_cuda_ipc = False
+        return processor
+
+    def test_enabled_path_sets_hash_and_pad_value(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)
+        )
+
+        self._processor(True)._precompute_hashes_before_cpu_transfer([item])
+
+        self.assertIsNotNone(item.hash)
+        self.assertIsNotNone(item.pad_value)
+        self.assertTrue(item.feature.is_cpu)
+
+    def test_disabled_path_leaves_item_unmodified(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)
+        )
+
+        self._processor(False)._precompute_hashes_before_cpu_transfer([item])
+
+        self.assertIsNone(item.hash)
+        self.assertIsNone(item.pad_value)
 
 
 class TestProcessMmDataKwargs(unittest.TestCase):

@@ -181,6 +181,7 @@ class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
+    precompute_hash_before_cpu_transfer = False
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -427,6 +428,8 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
+        defer_feature_cpu_transfer = kwargs.pop("_defer_feature_cpu_transfer", False)
+
         if images:
             kwargs["images"] = images
             if self.image_config:
@@ -498,7 +501,10 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.keep_mm_feature_on_device:
+        if (
+            not self.keep_mm_feature_on_device
+            and not defer_feature_cpu_transfer
+        ):
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if self.use_cuda_ipc:
@@ -1223,7 +1229,12 @@ class BaseMultimodalProcessor(ABC):
             Tuple of (created mm_items, input_ids)
         """
         ret = self.process_mm_data(
-            input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
+            input_text=input_text,
+            images=images,
+            audios=audios,
+            videos=videos,
+            _defer_feature_cpu_transfer=self.precompute_hash_before_cpu_transfer,
+            **kwargs,
         )
 
         input_ids = ret["input_ids"].flatten()
@@ -1265,6 +1276,32 @@ class BaseMultimodalProcessor(ABC):
         if self.keep_mm_feature_on_device:
             return tensor
         return tensor.cpu()
+
+    @staticmethod
+    def _move_feature_to_cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.cpu()
+        if isinstance(value, list):
+            return [BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(
+                BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value
+            )
+        return value
+
+    def _precompute_hashes_before_cpu_transfer(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> None:
+        if not self.precompute_hash_before_cpu_transfer:
+            return
+
+        for item in mm_items:
+            item.set_pad_value()
+            if not self.keep_mm_feature_on_device and not self.use_cuda_ipc:
+                item.feature = self._move_feature_to_cpu(item.feature)
+                item.precomputed_embeddings = self._move_feature_to_cpu(
+                    item.precomputed_embeddings
+                )
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
@@ -1477,6 +1514,8 @@ class BaseMultimodalProcessor(ABC):
                 MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
             ):
                 item.set_pad_value()
+
+        self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
         """
         solution for cuda-ipc memory-leak:
