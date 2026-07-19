@@ -43,6 +43,7 @@ class KimiLinearConfig(PretrainedConfig):
         use_grouped_topk: bool = True,
         num_expert_group: int = 1,
         topk_group: int = 1,
+        topk_method: str = "noaux_tc",
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = None,
         qk_nope_head_dim: int | None = None,
@@ -90,6 +91,7 @@ class KimiLinearConfig(PretrainedConfig):
         self.mla_use_nope = mla_use_nope
         # moe config
         self.n_routed_experts = self.num_experts = num_experts
+        self.topk_method = topk_method
         self.num_experts_per_token = num_experts_per_token
         self.moe_renormalize = moe_renormalize
         self.num_shared_experts = num_shared_experts
