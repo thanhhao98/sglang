@@ -132,6 +132,41 @@ def _resolve_moe_reduce_mode() -> str:
 #   moe_front: shared gate_up + router gate + latent down_proj -> one GEMM
 #   kda_bfa:   KDA b_proj + f_a_proj -> one GEMV
 _K3_FUSE_MOE_FRONT = envs.SGLANG_K3_FUSE_MOE_FRONT.get()
+
+
+def _k3_bf16_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
+    through UnquantizedLinearMethod. The fused MoE front and the deferred
+    shared down GEMM call torch directly on raw merged weights, so the
+    --bf16-gemm-backend cutedsl selection would silently skip them.
+
+    TGV has no out= form; the copy into `out` (a contiguous view of the
+    concat-allreduce buffer) is [T, H] at decode sizes and only taken when
+    the heuristic already judged the TGV win larger."""
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        if get_bf16_gemm_backend().is_cutedsl():
+            from sglang.jit_kernel.cutedsl_bf16_gemm import (
+                cutedsl_bf16_gemm,
+                use_cutedsl_bf16_gemm,
+            )
+
+            if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
+                y = cutedsl_bf16_gemm(x, weight)
+                if out is None:
+                    return y
+                out.copy_(y)
+                return out
+    if out is None:
+        return torch.nn.functional.linear(x, weight)
+    return torch.mm(x, weight.t(), out=out)
+
+
 _K3_FUSE_KDA_BFA = envs.SGLANG_K3_FUSE_KDA_BFA.get()
 # Use the dedicated CUDA decode-GEMV kernel for the skinny KDA projections
 # (b+f_a merged, f_b) instead of cublas gemvx/dot dispatch.
@@ -850,7 +885,7 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = torch.nn.functional.linear(hidden_states, self._front_w)
+        fused = _k3_bf16_gemm(hidden_states, self._front_w)
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -863,9 +898,9 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        torch.mm(
+        _k3_bf16_gemm(
             self.shared_experts.act_fn(gate_up),
-            self.shared_experts.down_proj.weight.t(),
+            self.shared_experts.down_proj.weight,
             out=shared_output,
         )
 
