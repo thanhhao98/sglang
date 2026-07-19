@@ -700,6 +700,14 @@ class Envs:
     # CUDA row-streaming KDA packed-decode kernel for batched decode
     # (B >= 8, K = V = 128); ULP-level differences vs the triton kernel.
     SGLANG_KDA_DECODE_CUDA = EnvBool(True)
+    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to the private
+    # FlashInfer snapshot checkout (internal collaboration artifact with
+    # csrc/, include/, 3rdparty/, local_cubins/). Unset = feature off.
+    SGLANG_TRTLLM_GEN_MOE_SDK = EnvStr(None)
+    # Optional explicit SiTU cubin pool dir (default: newest under
+    # <SDK>/local_cubins/).
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+
     # Fully fused KDA decode step: causal conv1d update + delta-rule
     # recurrence + gated RMSNorm in one kernel (vendored NVIDIA x Moonshot
     # many-heads kernel; H = HV = 12, K = V = 128). Engages only when the

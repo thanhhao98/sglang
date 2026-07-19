@@ -668,24 +668,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = swap_every_two_rows(w13_weight, -2)
                 w13_bias = swap_every_two_rows(w13_bias, -1)
             else:
-                # Non-interleaved layout (e.g. K3 Latent MoE): first half=gate, second half=up
-                # Swap halves to match trtllm-gen's expected [up, gate] order
+                # Non-interleaved layout (e.g. K3 Latent MoE): first half = gate
+                # (w1), second half = up (w3). The trtllm-gen fused gated-act
+                # epilogue wants rows interleaved as (up_i, gate_i) PAIRS -
+                # the layout get_reorder_rows_for_gated_act_gemm_row_indices
+                # produces from [linear; gate] halves, and what the
+                # interleaved branch above arrives at via swap_every_two_rows.
+                # A plain halves swap keeps rows blocked and pairs up_i with
+                # up_{i+1}, which scrambles the gated activation.
                 half = w13_weight.shape[-2] // 2
-                w13_weight = torch.cat(
-                    [w13_weight[..., half:, :], w13_weight[..., :half, :]], dim=-2
-                )
-                half_s = w13_weight_scale.shape[-2] // 2
-                w13_weight_scale = torch.cat(
-                    [
-                        w13_weight_scale[..., half_s:, :],
-                        w13_weight_scale[..., :half_s, :],
-                    ],
-                    dim=-2,
-                )
-                half_b = w13_bias.shape[-1] // 2
-                w13_bias = torch.cat(
-                    [w13_bias[..., half_b:], w13_bias[..., :half_b]], dim=-1
-                )
+                pair_idx = torch.empty(2 * half, dtype=torch.long)
+                pair_idx[0::2] = torch.arange(half) + half  # up (w3)
+                pair_idx[1::2] = torch.arange(half)  # gate (w1)
+                w13_weight = w13_weight[..., pair_idx, :].contiguous()
+                w13_weight_scale = w13_weight_scale[..., pair_idx, :].contiguous()
+                w13_bias = w13_bias[..., pair_idx].contiguous()
 
             # Shuffle weights and scaling factors for transposed mma output
             gemm1_weights_mxfp4_shuffled = []
@@ -1299,10 +1296,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 raise NotImplementedError()
 
             assert x_quant.shape[-1] == self.hidden_size
-            assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-            top_k = topk_output.topk_config.top_k
-            router_logits = topk_output.router_logits
+            is_standard = TopKOutputChecker.format_is_standard(topk_output)
+            # The situ path accepts precomputed (standard) routing; the
+            # public path below is logits-only.
+            assert is_standard or TopKOutputChecker.format_is_bypassed(
+                topk_output
+            ), f"unsupported topk format: {topk_output.format}"
+            if is_standard:
+                assert (
+                    self.moe_runner_config.activation == "situ"
+                ), "standard topk output only wired for the situ path"
+                top_k = topk_output.topk_ids.shape[1]
+                router_logits = None
+            else:
+                top_k = topk_output.topk_config.top_k
+                router_logits = topk_output.router_logits
 
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1312,6 +1320,97 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
+
+            if self.moe_runner_config.activation == "situ":
+                # SiTU is only in the private trtllm-gen cubin pool (the
+                # public artifact bakes swiglu into the fused-act cubins and
+                # silently computes the wrong activation). Routing must also
+                # be noaux_tc (sigmoid + correction bias, DeepSeekV3 method),
+                # not the renormalize-softmax default below.
+                from sglang.jit_kernel import trtllm_gen_moe as situ_moe
+
+                if not situ_moe.available():
+                    raise RuntimeError(
+                        "activation='situ' with the flashinfer_mxfp4 runner "
+                        "needs the private SiTU cubin pool: set "
+                        "SGLANG_TRTLLM_GEN_MOE_SDK (see "
+                        "sglang/jit_kernel/trtllm_gen_moe.py)."
+                    )
+                assert (
+                    layer.num_local_experts == layer.num_experts
+                ), "situ trtllm-gen path is TP-only (no EP)"
+                if TopKOutputChecker.format_is_standard(topk_output):
+                    # Precomputed routing (radix router upstream): skip the
+                    # in-op routing kernels entirely. At small T the in-op
+                    # single-CTA routing costs ~22 us/layer vs ~6 us for the
+                    # external radix router.
+                    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+
+                    packed_topk = PackTopkIds.execute(
+                        topk_output.topk_ids, topk_output.topk_weights
+                    )
+                    situ_moe.trtllm_fp4_block_scale_routed_moe(
+                        packed_topk_ids=packed_topk,
+                        hidden_states=x_quant,
+                        hidden_states_scale=x_scale,
+                        gemm1_weights=layer.w13_weight,
+                        gemm1_weights_scale=layer.w13_weight_scale,
+                        gemm1_alpha=layer.gemm1_alpha,
+                        # SiTuGlu: gatedActBeta is the linear-half tanh
+                        # clip; K3 stores it in gemm1_clamp_limit.
+                        gemm1_beta=layer.gemm1_clamp_limit,
+                        gemm2_weights=layer.w2_weight,
+                        gemm2_weights_scale=layer.w2_weight_scale,
+                        output1_scale_scalar=None,
+                        output1_scale_gate_scalar=None,
+                        output2_scale_scalar=None,
+                        num_experts=layer.num_experts,
+                        top_k=packed_topk.shape[1],
+                        intermediate_size=self.intermediate_size_per_partition,
+                        activation_type=situ_moe.ACTIVATION_SITU,
+                        output=symm_output,
+                    )
+                    return StandardCombineInput(hidden_states=symm_output)
+
+                # Bypassed topk: route from logits inside the op.
+                correction_bias = topk_output.topk_config.correction_bias
+                bias_bf16 = getattr(layer, "_situ_routing_bias_bf16", None)
+                if bias_bf16 is None and correction_bias is not None:
+                    bias_bf16 = correction_bias.to(torch.bfloat16)
+                    layer._situ_routing_bias_bf16 = bias_bf16
+                situ_moe.trtllm_fp4_block_scale_moe(
+                    # router_logits is a row-strided slice of the K3 fused
+                    # front GEMM output; the FFI reads it as dense.
+                    routing_logits=router_logits.to(torch.bfloat16).contiguous(),
+                    routing_bias=bias_bf16,
+                    hidden_states=x_quant,
+                    hidden_states_scale=x_scale,
+                    gemm1_weights=layer.w13_weight,
+                    gemm1_weights_scale=layer.w13_weight_scale,
+                    gemm1_alpha=layer.gemm1_alpha,
+                    # SiTuGlu: gatedActBeta is the linear-half tanh clip;
+                    # K3 stores it in gemm1_clamp_limit (situ_linear_beta).
+                    gemm1_beta=layer.gemm1_clamp_limit,
+                    gemm2_weights=layer.w2_weight,
+                    gemm2_weights_scale=layer.w2_weight_scale,
+                    output1_scale_scalar=None,
+                    output1_scale_gate_scalar=None,
+                    output2_scale_scalar=None,
+                    num_experts=layer.num_experts,
+                    top_k=top_k,
+                    n_group=topk_output.topk_config.num_expert_group,
+                    topk_group=topk_output.topk_config.topk_group,
+                    intermediate_size=self.intermediate_size_per_partition,
+                    routed_scaling_factor=(
+                        topk_output.topk_config.routed_scaling_factor or 1.0
+                    ),
+                    routing_method_type=situ_moe.ROUTING_DEEPSEEK_V3,
+                    activation_type=situ_moe.ACTIVATION_SITU,
+                    norm_topk_prob=topk_output.topk_config.renormalize,
+                    output=symm_output,
+                )
+                return StandardCombineInput(hidden_states=symm_output)
+
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
