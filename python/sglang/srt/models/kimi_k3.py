@@ -9,7 +9,7 @@
 import logging
 from collections.abc import Iterable
 from functools import cached_property
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import triton

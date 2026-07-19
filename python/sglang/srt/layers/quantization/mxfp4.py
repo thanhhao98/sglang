@@ -33,6 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -1312,14 +1313,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 top_k = topk_output.topk_config.top_k
                 router_logits = topk_output.router_logits
 
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                num_tokens = x_quant.shape[0]
-                hidden_size = origin_hidden_states_dim
-                symm_output = torch.empty(
-                    num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
-                )
+            num_tokens = x_quant.shape[0]
+            hidden_size = origin_hidden_states_dim
+            # The K3 fused-front path publishes its [latent | shared] buffer
+            # slice as the output destination (zero_copy_context); writing
+            # the finalize output there directly skips this allocation and
+            # the copy_ back in _forward_fused. The slice lives in the same
+            # symmetric buffer the caller all-reduces.
+            symm_output = zero_copy_context.get_moe_output_spec(
+                torch.Size((num_tokens, hidden_size)),
+                torch.bfloat16,
+                x_quant.device,
+            )
+            if symm_output is None:
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    symm_output = torch.empty(
+                        num_tokens,
+                        hidden_size,
+                        dtype=torch.bfloat16,
+                        device=x_quant.device,
+                    )
 
             if self.moe_runner_config.activation == "situ":
                 # SiTU is only in the private trtllm-gen cubin pool (the
