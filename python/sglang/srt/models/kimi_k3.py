@@ -610,6 +610,24 @@ class KimiK3MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _moe_tail_add(
+    out: torch.Tensor,
+    shared_output: torch.Tensor,
+    tail_add: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """MoE tail: bf16(out + shared_output) [+ tail_add]. A pending tail_add
+    (the attn-res delayed +prefix_sum) collapses the two elementwise adds
+    into the 3-way JIT kernel — one launch and one memory pass; its double
+    rounding matches the unfused pair bit-for-bit."""
+    if tail_add is None:
+        return out + shared_output
+    from sglang.jit_kernel.kimi_k3 import moe_tail_add
+
+    if moe_tail_add.covered(out, shared_output, tail_add):
+        return moe_tail_add.kimi_k3_moe_tail_add(out, shared_output, tail_add)
+    return out + shared_output + tail_add
+
+
 class KimiK3MoE(nn.Module):
     def __init__(
         self,
@@ -830,7 +848,9 @@ class KimiK3MoE(nn.Module):
             return self._fi_fused_reduce_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _forward_unfused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_unfused(
+        self, hidden_states: torch.Tensor, *, tail_add: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
         # Shared experts on original hidden_states
@@ -847,6 +867,8 @@ class KimiK3MoE(nn.Module):
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
                 expert_output = tensor_model_parallel_all_reduce(expert_output)
+            if tail_add is not None:
+                expert_output = expert_output + tail_add
             return expert_output
 
         # Latent MoE: compress after routing, before experts
@@ -863,10 +885,12 @@ class KimiK3MoE(nn.Module):
         if shared_output is not None:
             if self.tp_size > 1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
-            out = out + shared_output
-        return out
+            return _moe_tail_add(out, shared_output, tail_add)
+        return out if tail_add is None else out + tail_add
 
-    def _forward_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_fused(
+        self, hidden_states: torch.Tensor, *, tail_add: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight, then land both TP-partial sums in
         one flat symmetric [latent | shared] buffer with zero copies — the
@@ -920,17 +944,22 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
-        return out + shared_output
+        return _moe_tail_add(out, shared_output, tail_add)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """No residual add here: on the attn-res path the +residual add is
-        delayed into the next aggregation point."""
+    def forward(
+        self, hidden_states: torch.Tensor, *, tail_add: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """No residual add here on the standard path: on the attn-res path the
+        +residual add is delayed into the next aggregation point — unless the
+        caller hands it in as `tail_add`, which is always consumed here (folded
+        into the 3-way JIT tail add when covered, plain adds otherwise;
+        bit-identical either way)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if num_tokens > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states)
+            out = self._forward_fused(hidden_states, tail_add=tail_add)
         else:
-            out = self._forward_unfused(hidden_states)
+            out = self._forward_unfused(hidden_states, tail_add=tail_add)
         return out.view(num_tokens, hidden_size)
 
 
@@ -1509,6 +1538,9 @@ class KimiK3DecoderLayer(nn.Module):
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
             )
+        # Only the MoE tail can absorb the attn-res delayed +prefix_sum
+        # (3-way tail add); dense KimiK3MLP layers keep the delayed-add path.
+        self.mlp_absorbs_tail_add = isinstance(self.mlp, KimiK3MoE)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1621,7 +1653,7 @@ class KimiK3DecoderLayer(nn.Module):
         attn_res: BaseAttnResidual,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Between attn-res layers hidden_states carries the previous layer's
         # un-added MLP delta and prefix_sum the prefix it extends (None at
         # stream start / PP entry, where hidden_states already is the head).
@@ -1654,7 +1686,10 @@ class KimiK3DecoderLayer(nn.Module):
             self.post_attention_layernorm,
         )
 
-        # ---- MLP (the +prefix_sum add is delayed into the next point) ----
+        # ---- MLP: fold +prefix_sum into the MoE 3-way tail add; dense
+        # layers keep delaying it into the next aggregation point ----
+        if prefix_sum is not None and self.mlp_absorbs_tail_add:
+            return self.mlp(hidden_states, tail_add=prefix_sum), None
         return self.mlp(hidden_states), prefix_sum
 
     def _forward_attn_residual_legacy(
@@ -1751,6 +1786,8 @@ class KimiK3DecoderLayer(nn.Module):
             mlp_valid_blocks,
             self.post_attention_layernorm,
         )
+        if self.mlp_absorbs_tail_add:
+            return self.mlp(hidden_states, tail_add=prefix_sum), None
         hidden_states = self.mlp(hidden_states)
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, None
