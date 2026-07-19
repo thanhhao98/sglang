@@ -209,6 +209,9 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+# Emit per-forward nvtx step spans (step[<MODE> bs=N], draft:step[...]) for
+# nsys phase attribution (draft vs verify vs extend). Off-profile default: no-op.
+_NVTX_STEP_SPANS = get_bool_env_var("SGLANG_NVTX_STEP_SPANS")
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -1358,7 +1361,12 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_name = build_step_span_name(forward_batch)
+        if self.is_draft_worker:
+            # Disambiguate draft-runner forwards (DFlash drafts also run in
+            # TARGET_VERIFY mode) for nsys phase attribution.
+            step_span_name = "draft:" + step_span_name
+        step_span_ctx = profile_range(step_span_name, nvtx_enabled=_NVTX_STEP_SPANS)
 
         canary_ctx = (
             context_tuple(
