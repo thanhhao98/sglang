@@ -1,17 +1,16 @@
-"""K3 attn-residual aggregation: fused single kernel and optimized chain vs
-the baseline 3-kernel JIT chain.
+"""K3 attn-residual aggregation: the production TMA kernel and the optimized
+chain vs the baseline 3-kernel JIT chain.
 
 Impls at K3 shapes (H=7168, bf16):
-- fused:     attn_res_fused — score -> softmax -> combine -> out-RMSNorm in
-             one CTA-per-token kernel; nvb dispatched via a constexpr kernel
-             table; SM100+ only.
+- tma:    attn_res_fused_tma — warp-specialized cp.async.bulk producer
+             + online-softmax consumers over a double-buffered chunk ring,
+             out RMSNorm fused, per-nvb tuned launch config (chunk rows /
+             occupancy / setmaxnreg register split); SM100a+ only. The
+             "fast"-mode production kernel.
 - chain:     attn_res_chain — optimized score/merge/norm kernels in one host
              call (max-width vectors + unroll for score/norm, table-dispatched
              rows and partial sum-of-squares in merge so norm needs no
              reduction); workspace allocated C++-side.
-- tma:       attn_res_fused_tma — NV warp-specialized cp.async.bulk/TMEM port
-             (persistent CTA per SM, online softmax) with the output RMSNorm
-             fused; SM100a+ only.
 - jit_chain: baseline attn_res_score + attn_res_combine + rmsnorm.
 
 Bandwidth is reported over the algorithmic footprint (prefix + bank rows
@@ -27,7 +26,6 @@ from sglang.jit_kernel.benchmark.utils import create_empty, create_random
 from sglang.jit_kernel.kimi_k3.attn_res import (
     attn_res_chain,
     attn_res_combine,
-    attn_res_fused,
     attn_res_fused_tma,
     attn_res_score,
 )
@@ -46,10 +44,6 @@ _MAX_ROWS = 16
 _EPS = 1e-6
 
 
-def _run_fused(prefix, bank, cw, ow, out, nvb):
-    attn_res_fused(prefix, bank, cw, ow, out, nvb, _EPS)
-
-
 def _run_chain(prefix, bank, cw, ow, out, nvb):
     attn_res_chain(prefix, bank, cw, ow, out, nvb, _EPS)
 
@@ -66,10 +60,10 @@ def _run_jit_chain(prefix, bank, cw32, ow, scores, mixed, out, nvb):
 
 @marker.parametrize("nvb", list(range(1, 9)), [8])
 @marker.parametrize("num_tokens", [2**x for x in range(14)], [1, 64])
-@marker.benchmark("impl", ["fused", "chain", "tma", "jit_chain"])
+@marker.benchmark("impl", ["tma", "chain", "jit_chain"])
 def benchmark(num_tokens: int, nvb: int, impl: str):
-    if impl in ("fused", "tma") and torch.cuda.get_device_capability()[0] < 10:
-        marker.skip(f"attn_res {impl} impl requires SM100+")
+    if impl == "tma" and torch.cuda.get_device_capability()[0] < 10:
+        marker.skip("attn_res tma impl requires SM100a+")
 
     prefix = create_random(num_tokens, _H)
     bank = create_random(num_tokens, _NB, _H)
@@ -77,15 +71,12 @@ def benchmark(num_tokens: int, nvb: int, impl: str):
     ow = create_random(_H)
     out = create_empty(num_tokens, _H)
 
-    if impl == "fused":
+    if impl == "tma":
         args = (prefix, bank, cw, ow, out, nvb)
-        fn = _run_fused
+        fn = _run_tma
     elif impl == "chain":
         args = (prefix, bank, cw, ow, out, nvb)
         fn = _run_chain
-    elif impl == "tma":
-        args = (prefix, bank, cw, ow, out, nvb)
-        fn = _run_tma
     else:
         scores = torch.empty(
             num_tokens, _MAX_ROWS, dtype=torch.float32, device=prefix.device
