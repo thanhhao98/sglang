@@ -43,10 +43,14 @@ def get_cw(
 
     Cached per dtype: "fast" mode consumes bf16 while the triton/jit paths
     consume fp32, and a shared slot would hand one path the other's dtype."""
-    cache = getattr(proj, "_attn_res_cw", None)
+    # Distinct attribute from kimi_k3._attn_res_cw, which prewarms a raw
+    # fp32 tensor under `_attn_res_cw` for the legacy in-model kernels; a
+    # shared name would hand this dict lookup that tensor (post-load prewarm
+    # runs for every mode).
+    cache = getattr(proj, "_attn_res_cw_cache", None)
     if cache is None:
         cache = {}
-        proj._attn_res_cw = cache
+        proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
     if cw is None:
         cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
