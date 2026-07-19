@@ -615,16 +615,23 @@ class KimiK3MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _add3(a: torch.Tensor, b: torch.Tensor, c: Optional[torch.Tensor]) -> torch.Tensor:
+def _add3(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: Optional[torch.Tensor],
+    *,
+    prefetch_bc: bool = False,
+) -> torch.Tensor:
     """bf16(a + b) [+ c]. A pending c (the attn-res delayed +prefix_sum)
     collapses the two elementwise adds into the 3-way JIT kernel — one
     launch and one memory pass; its double rounding matches the unfused
-    pair bit-for-bit."""
+    pair bit-for-bit. prefetch_bc loads b/c before the PDL wait: only pass
+    True when their producers are at least two kernels back."""
     if c is None:
         return a + b
     from sglang.jit_kernel import add3
 
-    return add3.add3(a, b, c)
+    return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
 
 class KimiK3MoE(nn.Module):
@@ -943,7 +950,11 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
-        return _add3(out, shared_output, prefix_sum)
+        # prefetch_bc: b (shared_output) was produced by the all-reduce and
+        # c (prefix_sum) even earlier; the AR is a plain launch (full
+        # barrier), so both are complete once the norm / up_proj GEMM chain
+        # starts — only `a`'s producer can still be in flight at PDL entry.
+        return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
     def forward(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor] = None
