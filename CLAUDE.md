@@ -5,6 +5,20 @@
 - `k3-track`（tracking branch）：直接 commit & push，不开 PR。
 - `kimi-k3`（主 dev 分支）：默认走 PR —— 改动在单独 worktree 的 feature branch 上做，开 PR 合入，不直接 push 到 `kimi-k3`。
 
+## Secrets — 严禁入库
+
+任何 key / token / 密钥等敏感信息（HF token `hf_*`、GitHub token `ghp_*` / `github_pat_*`、cloud key、SSH private key、kubeconfig 凭据、API key、密码）**严禁**写入：
+
+- 本 repo 任何分支（代码分支、`k3-track` 的 README / journals / repro.md）、commit message、PR
+- 共享存储（`/cluster-storage`、共享 devbox 落盘的脚本 / 配置）及任何会被上传、同步的文件
+
+要求：
+
+- 秘密只走瞬态通道：交互 login（如 `hf auth login`）、运行时 env var（不落文件）、本地未跟踪配置
+- 文档 / journal 需要提及 token 时一律用占位符（`hf_xxxxxxxx...`）并注明获取方式
+- `git add` 前 grep 改动中的 token pattern（`hf_[A-Za-z0-9]{20,}`、`ghp_`、`github_pat_`、`AKIA`、`BEGIN.*PRIVATE KEY`、`sk-`），命中即停
+- 一旦 secret 已进 commit / push：按**已泄露**处理 —— 立即告知并 rotate；仅删文件或改历史不算修复
+
 ## K3 Track — plans & progress tracking
 
 Kimi K3 的计划、进度、实验记录不在代码分支里，而在本 repo 的独立 orphan branch `k3-track`：
