@@ -662,6 +662,29 @@ _K3_RECOMPUTE_W_U_CONFIGS = {
 }
 
 
+@torch.inference_mode()
+def precompile_k3_recompute_w_u_kernel(
+    *, num_heads: int, dtype: torch.dtype, device: torch.device
+) -> bool:
+    device = torch.device(device)
+    if (
+        not is_nvidia
+        or device.type != "cuda"
+        or torch.cuda.get_device_capability(device) not in _K3_RECOMPUTE_W_U_CONFIGS
+    ):
+        return False
+
+    shape = (1, 1, num_heads, 128)
+    k = torch.zeros(shape, dtype=dtype, device=device)
+    v = torch.zeros_like(k)
+    beta = torch.zeros((1, 1, num_heads), dtype=dtype, device=device)
+    A = torch.zeros((1, 1, num_heads, 64), dtype=dtype, device=device)
+    gk = torch.zeros(shape, dtype=torch.float32, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    recompute_w_u_fwd(k, v, beta, A, gk=gk, cu_seqlens=cu_seqlens)
+    return True
+
+
 def _get_k3_recompute_w_u_config(
     k: torch.Tensor,
     q: torch.Tensor | None,

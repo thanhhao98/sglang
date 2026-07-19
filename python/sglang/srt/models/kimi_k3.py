@@ -2186,6 +2186,23 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
 
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer) or not isinstance(
+                layer.self_attn, KimiK3DeltaAttention
+            ):
+                continue
+            from sglang.kernels.ops.attention.fla.kda import (
+                precompile_k3_recompute_w_u_kernel,
+            )
+
+            if precompile_k3_recompute_w_u_kernel(
+                num_heads=layer.self_attn.local_num_heads,
+                dtype=layer.self_attn.o_proj.weight.dtype,
+                device=layer.self_attn.dt_bias.device,
+            ):
+                rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
+            break
+
 
 # ---------------------------------------------------------------------------
 # KimiK3ForConditionalGeneration — multimodal wrapper
