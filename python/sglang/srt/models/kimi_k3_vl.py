@@ -143,6 +143,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_width: int = 14,
         pos_emb_time: int = 4,
         pos_emb_type: str = "divided_fixed",
+        pos_emb_interpolation_mode: str = "bicubic",
         patch_embed_proj_bias: bool = True,
     ):
         super().__init__()
@@ -165,6 +166,7 @@ class MoonVision3dPatchEmbed(nn.Module):
             width=pos_emb_width,
             num_frames=pos_emb_time,
             dim=out_dim,
+            interpolation_mode=pos_emb_interpolation_mode,
         )
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
@@ -398,6 +400,7 @@ class KimiK3VisionTower(nn.Module):
             pos_emb_width=config.init_pos_emb_width,
             pos_emb_time=config.init_pos_emb_time,
             pos_emb_type=config.pos_emb_type,
+            pos_emb_interpolation_mode=config.pos_emb_interpolation_mode,
             patch_embed_proj_bias=getattr(config, "patch_embed_proj_bias", True),
         )
 
