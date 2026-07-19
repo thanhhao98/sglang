@@ -73,7 +73,7 @@ def interpolate_pos_emb(
 ) -> torch.Tensor:
     return (
         F.interpolate(
-            weight.permute((2, 0, 1)).unsqueeze(0),
+            weight.permute((2, 0, 1)).contiguous().unsqueeze(0),
             size=shape,
             mode=interpolation_mode,
         )

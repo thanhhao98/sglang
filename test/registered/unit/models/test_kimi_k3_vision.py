@@ -1,8 +1,14 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
+import torch.nn.functional as F
 
-from sglang.srt.models.kimi_k3_vl import KimiK3VisionTower
+from sglang.srt.models import kimi_k3_vl
+from sglang.srt.models.kimi_k3_vl import (
+    KimiK3VisionTower,
+    interpolate_pos_emb,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -23,6 +29,7 @@ def test_kimi_k3_vision_tower_uses_configured_position_interpolation(mode):
         vt_hidden_size=8,
         vt_num_attention_heads=1,
         vt_num_hidden_layers=0,
+        num_hidden_layers=0,
         vt_intermediate_size=16,
         qkv_hidden_size=8,
         norm_type="rmsnorm",
@@ -34,6 +41,37 @@ def test_kimi_k3_vision_tower_uses_configured_position_interpolation(mode):
     tower = KimiK3VisionTower(config)
 
     assert tower.patch_embed.pos_emb.interpolation_mode == mode
+
+
+def test_kimi_k3_position_interpolation_uses_contiguous_chw(monkeypatch):
+    weight = torch.randn(4, 5, 8)
+    output_size = (3, 7)
+    expected = (
+        F.interpolate(
+            weight.permute(2, 0, 1).unsqueeze(0),
+            size=output_size,
+            mode="bilinear",
+        )
+        .squeeze(0)
+        .permute(1, 2, 0)
+        .flatten(end_dim=1)
+    )
+    original_interpolate = F.interpolate
+    captured = {}
+
+    def capture_layout(input_tensor, *args, **kwargs):
+        captured["is_contiguous"] = input_tensor.is_contiguous()
+        captured["stride"] = input_tensor.stride()
+        return original_interpolate(input_tensor, *args, **kwargs)
+
+    monkeypatch.setattr(kimi_k3_vl.F, "interpolate", capture_layout)
+    actual = interpolate_pos_emb(weight, "bilinear", output_size)
+
+    assert captured == {
+        "is_contiguous": True,
+        "stride": (160, 20, 5, 1),
+    }
+    assert torch.equal(actual, expected)
 
 
 if __name__ == "__main__":
