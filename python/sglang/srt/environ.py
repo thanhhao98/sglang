@@ -731,8 +731,10 @@ class Envs:
     )
     # MLA output gate x * sigmoid(g) fused into one kernel.
     SGLANG_K3_FUSE_O_GATE = EnvBool(True)
-    # AttnRes aggregation backend: fused (triton) | jit (CUDA) | torch | legacy.
-    SGLANG_K3_ATTN_RES_MODE = EnvStr("fused")
+    # AttnRes aggregation backend:
+    # fast (optimized CUDA, SM100+/H=7168 only) | fused (triton) | jit (CUDA)
+    # | torch | legacy
+    SGLANG_K3_ATTN_RES_MODE = EnvStr("fast")
     SGLANG_K3_ATTN_RES_FUSED_MIN_T = EnvInt(999999)
     # Radix-select fast path for the K3 top-16-of-896 sigmoid router
     # (opt-in; ids bit-identical to the triton router).
