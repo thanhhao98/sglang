@@ -955,10 +955,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     qp = getattr(m, "q_b_proj", None) or getattr(m, "q_proj", None)
                     if w_kc is None or qp is None or not hasattr(qp, "weight"):
                         continue
-                    if (
-                        w_kc.dtype not in (torch.bfloat16, torch.float16)
-                        or qp.weight.dtype not in (torch.bfloat16, torch.float16)
-                    ):
+                    if w_kc.dtype not in (
+                        torch.bfloat16,
+                        torch.float16,
+                    ) or qp.weight.dtype not in (torch.bfloat16, torch.float16):
                         logger.warning(
                             "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
                             "(bf16/fp16 only); this layer keeps the Q all-gather."
@@ -3099,9 +3099,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Disambiguate draft-runner forwards (DFlash drafts also run in
             # TARGET_VERIFY mode) for nsys phase attribution.
             step_span_name = "draft:" + step_span_name
-        step_span_ctx = profile_range(
-            step_span_name, nvtx_enabled=_NVTX_STEP_SPANS
-        )
+        step_span_ctx = profile_range(step_span_name, nvtx_enabled=_NVTX_STEP_SPANS)
 
         canary_ctx = (
             context_tuple(
