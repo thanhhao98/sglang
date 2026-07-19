@@ -144,6 +144,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
+            if eagle_draft_num_layers is None and mr.server_args.dcp_size > 1:
+                # Under DCP the draft pool is widened dcp_size x regardless of
+                # whether the runner exposes the draft depth; skipping the
+                # budget here lets the widened pool eat the transient headroom
+                # and OOM at the first big prefill. Assume the 1-layer
+                # MTP/nextn-style draft as a floor.
+                eagle_draft_num_layers = 1
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
