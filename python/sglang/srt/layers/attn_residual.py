@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# Kimi-K3 Attention Residual aggregation kernels.
+# Kimi-K3 Attention Residual: snapshot bank + aggregation.
 #
-# Each aggregation point: score rows → softmax → weighted sum → RMSNorm.
-# Four modes via SGLANG_K3_ATTN_RES_MODE:
-#   "fused"  — Triton 3-kernel pipeline with full H-parallelism (default)
+# The public API is the AttnResidual class (constructed once per forward
+# pass; type against BaseAttentionResidual). It owns the frozen snapshot bank
+# [T, NB, H] and the valid-row counter, and dispatches each aggregation point
+# (score rows → softmax → weighted sum → RMSNorm) to one of three kernel
+# implementations selected by SGLANG_K3_ATTN_RES_MODE:
+#   "fused"  — Triton 2-kernel pipeline with full H-parallelism (default)
 #   "jit"    — CUDA JIT kernels with lower launch overhead than Triton
 #   "torch"  — PyTorch reference (readable, for debugging)
-#   "legacy" — original path in kimi_k3.py
+#   "legacy" — original multi-kernel path in kimi_k3.py (bank held here, but
+#              scoring/combining bypasses this module)
+
+from typing import Optional, Protocol
 
 import torch
 import triton
@@ -240,7 +246,7 @@ def _aggregate_torch(
 # ---- Fused residual-add + aggregation (jit mode) -----------------------------
 
 
-def attn_res_aggregate_fused_add(
+def _aggregate_fused_add(
     prefix_a: torch.Tensor,
     prefix_b: torch.Tensor,
     bank: torch.Tensor,
@@ -283,15 +289,15 @@ def attn_res_aggregate_fused_add(
 
     prefix = prefix_a + prefix_b
     return (
-        attn_res_aggregate(prefix, bank, nvb, score_proj, score_norm, out_norm),
+        _aggregate(prefix, bank, nvb, score_proj, score_norm, out_norm),
         prefix,
     )
 
 
-# ---- Public dispatch ---------------------------------------------------------
+# ---- Mode dispatch ------------------------------------------------------------
 
 
-def attn_res_aggregate(
+def _aggregate(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
     nvb: int,
@@ -308,3 +314,94 @@ def attn_res_aggregate(
     if _MODE == "jit":
         return _aggregate_jit(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
+
+
+# ---- Public API ---------------------------------------------------------------
+
+
+class BaseAttnResidual(Protocol):
+    """Snapshot bank + aggregation of one K3 attention-residual stream.
+
+    One instance lives for one model forward pass. Type annotations should
+    use this protocol; construct AttnResidual.
+    """
+
+    # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
+    # legacy kernel path.
+    block_residual: torch.Tensor
+
+    def write(self, prefix_sum: torch.Tensor) -> None: ...
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class AttnResidual:
+    """Default implementation backed by the mode-dispatched kernels above."""
+
+    def __init__(
+        self,
+        hidden_states: torch.Tensor,
+        block_num: int,
+        attn_res_block_size: int,
+        block_residual: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.block_size = attn_res_block_size
+        num_tokens, hidden_size = hidden_states.shape
+        self.block_residual = hidden_states.new_empty(
+            (num_tokens, block_num, hidden_size)
+        )
+        self.num_valid_blocks = 0
+        if block_residual is not None:  # inherited from the previous PP rank
+            self.num_valid_blocks = block_residual.size(1)
+            self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
+
+    def write(self, prefix_sum: torch.Tensor) -> None:
+        """Snapshot the pre-attention prefix into the next bank row."""
+        self.block_residual[:, self.num_valid_blocks, :].copy_(prefix_sum)
+        self.num_valid_blocks += 1
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nvb = self.num_valid_blocks
+        # Layer 0 attention side: nothing banked yet
+        if nvb == 0:
+            assert prefix_sum is None
+            return out_norm(hidden_states), hidden_states
+
+        if prefix_sum is None:
+            # hidden_states already is the whole head (PP entry or a
+            # block-boundary restart).
+            normed = _aggregate(
+                hidden_states,
+                self.block_residual,
+                nvb,
+                score_proj,
+                score_norm,
+                out_norm,
+            )
+            return normed, hidden_states
+
+        # Pending add: folded into the score kernel in jit mode, explicit
+        # add + aggregate otherwise (bit-identical, handled inside).
+        return _aggregate_fused_add(
+            prefix_sum,
+            hidden_states,
+            self.block_residual,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+        )
