@@ -861,6 +861,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            # Sibling of the verify-prepare wait above: this plan work reads
+            # batch.seq_lens and predict from the fwd stream.
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
                 draft_extend_input,
@@ -1472,6 +1478,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
+        if self.plan_stream:
+            # The plan-stream kernels below read fwd-stream products: draft_token
+            # (torch.cat written during draft()), this-iteration seq_lens (relay
+            # gather on the schedule stream, which fwd already waited on), and
+            # the draft req_to_token writes. Without this wait the plan stream
+            # runs immediately (it is otherwise idle) and reads unwritten
+            # memory -> negative input_ids / garbage out_cache_loc -> async IMA.
+            # Same contract as DFlashDraftInputV2.prepare_for_decode.
+            self.plan_stream.wait_stream(fwd_stream)
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
