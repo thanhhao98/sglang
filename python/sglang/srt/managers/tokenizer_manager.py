@@ -886,6 +886,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._validate_mm_limits(obj)
 
             mm_inputs = None
+            mm_processor_input = (
+                input_ids
+                if self.mm_processor.prefer_tokenized_input and input_ids is not None
+                else (input_text or input_ids)
+            )
 
             if (
                 not self.server_args.language_only
@@ -895,7 +900,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
+                        prompt=mm_processor_input,
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
@@ -907,7 +912,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
+                        input_text=mm_processor_input,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
@@ -922,7 +927,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
+                    input_text=mm_processor_input,
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
                 )

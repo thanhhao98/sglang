@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    _expand_image_token_ids,
     _resize_images_by_source_shape,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -90,6 +91,19 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
+
+
+def test_kimi_expands_pre_tokenized_image_placeholders():
+    input_ids = [1, 99, 2, 99, 3]
+
+    actual = _expand_image_token_ids(input_ids, 99, [3, 2])
+
+    assert actual.tolist() == [[1, 99, 99, 99, 2, 99, 99, 3]]
+
+
+def test_kimi_rejects_mismatched_pre_tokenized_image_placeholders():
+    with pytest.raises(ValueError, match="Expected 2 image placeholder"):
+        _expand_image_token_ids([1, 99, 2], 99, [3, 2])
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():

@@ -79,6 +79,33 @@ def _get_image_dimensions(image: Union[torch.Tensor, Image.Image]) -> tuple[int,
     return image.size  # PIL returns (width, height)
 
 
+def _expand_image_token_ids(
+    input_ids: Union[List[int], torch.Tensor],
+    image_token_id: int,
+    image_token_counts: List[int],
+) -> torch.Tensor:
+    """Expand one placeholder per image without tokenizing the media string again."""
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.flatten().tolist()
+
+    placeholder_count = sum(token == image_token_id for token in input_ids)
+    if placeholder_count != len(image_token_counts):
+        raise ValueError(
+            f"Expected {len(image_token_counts)} image placeholder token(s), "
+            f"found {placeholder_count}."
+        )
+
+    expanded = []
+    image_index = 0
+    for token in input_ids:
+        if token == image_token_id:
+            expanded.extend([image_token_id] * image_token_counts[image_index])
+            image_index += 1
+        else:
+            expanded.append(token)
+    return torch.tensor([expanded], dtype=torch.long)
+
+
 def _pil_to_cuda_chw(image: Image.Image) -> torch.Tensor:
     """Convert PIL Image to (C, H, W) uint8 CUDA tensor."""
     arr = np.asarray(image.convert("RGB"))
@@ -290,6 +317,7 @@ class KimiGPUProcessorWrapper:
         self,
         hf_processor,
         image_token,
+        image_token_id,
         patch_size,
         merge_kernel_size,
         in_patch_limit,
@@ -300,6 +328,7 @@ class KimiGPUProcessorWrapper:
     ):
         self._hf_processor = hf_processor
         self._image_token = image_token
+        self._image_token_id = image_token_id
         self._patch_size = patch_size
         self._merge_kernel_size = merge_kernel_size
         self._in_patch_limit = in_patch_limit
@@ -320,12 +349,35 @@ class KimiGPUProcessorWrapper:
     def __call__(self, text=None, images=None, **kwargs):
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
+        original_input_ids = kwargs.pop("sglang_original_input_ids", None)
 
         if images and torch.cuda.is_available():
-            return self._gpu_call(text, images)
+            return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, **kwargs)
 
-    def _gpu_call(self, text, images):
+    def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
+        if original_input_ids is not None:
+            try:
+                return _expand_image_token_ids(
+                    original_input_ids,
+                    self._image_token_id,
+                    [config["num_tokens"] for config in resize_configs],
+                )
+            except ValueError:
+                # Preserve the existing processor behavior for malformed or
+                # model-specific placeholder layouts.
+                pass
+
+        parts = input_text.split(self._image_token)
+        result = [parts[0]]
+        for config, part in zip(resize_configs, parts[1:]):
+            result.append(self._image_token * config["num_tokens"] + part)
+        expanded_text = "".join(result)
+        return self._hf_processor.tokenizer(expanded_text, return_tensors="pt")[
+            "input_ids"
+        ]
+
+    def _gpu_call(self, text, images, original_input_ids=None):
         """Bypass HF KimiK25VisionProcessor.preprocess entirely -- use GPU ops."""
         input_text = text[0] if isinstance(text, list) else text
 
@@ -345,17 +397,14 @@ class KimiGPUProcessorWrapper:
                 )
             )
 
-        # 2. Expand image tokens
-        parts = input_text.split(self._image_token)
-        result = [parts[0]]
-        for config, part in zip(resize_configs, parts[1:]):
-            result.append(self._image_token * config["num_tokens"] + part)
-        input_text = "".join(result)
+        # 2. Reuse the request's existing tokenization when available. The
+        # media placeholder expansion is exact and avoids tokenizing thousands
+        # of repeated ``<|media_pad|>`` strings.
+        input_ids = self._prepare_input_ids(
+            input_text, resize_configs, original_input_ids
+        )
 
-        # 3. Tokenize
-        text_inputs = self._hf_processor.tokenizer(input_text, return_tensors="pt")
-
-        # 4. GPU image preprocessing
+        # 3. GPU image preprocessing
         image_mean, image_std_inv = self._get_gpu_norm_tensors()
         pixel_values, grid_thws = _gpu_preprocess_images(
             images, resize_configs, image_mean, image_std_inv, self._patch_size
@@ -364,7 +413,7 @@ class KimiGPUProcessorWrapper:
         grid_thws = grid_thws.cpu()
 
         return {
-            "input_ids": text_inputs["input_ids"],
+            "input_ids": input_ids,
             "pixel_values": pixel_values,
             # Use SGL-standard key so get_new_expanded_mm_items() can split
             # per-image for cache granularity (it looks up 'image_grid_thw').
@@ -416,6 +465,7 @@ class KimiGPUProcessorWrapper:
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    prefer_tokenized_input = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -433,6 +483,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         self._processor = KimiGPUProcessorWrapper(
             _processor,
             image_token=self.mm_tokens.image_token,
+            image_token_id=self.mm_tokens.image_token_id,
             patch_size=media_proc_cfg["patch_size"],
             merge_kernel_size=media_proc_cfg["merge_kernel_size"],
             in_patch_limit=media_proc_cfg["in_patch_limit"],
@@ -457,7 +508,9 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output,
+            self.mm_tokens,
+            sglang_original_input_ids=base_output.input_ids,
         )
 
         # K2.5/K2.7 encoder-DP assigns an image to exactly one TP rank. Keep

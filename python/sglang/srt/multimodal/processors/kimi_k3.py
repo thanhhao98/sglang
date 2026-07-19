@@ -127,7 +127,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         super().__init__(*args, **kwargs)
         self._transparent_bg_config = transparent_bg_config
 
-    def _gpu_call(self, text, images):
+    def _gpu_call(self, text, images, original_input_ids=None):
         input_text = text[0] if isinstance(text, list) else text
 
         resize_configs = []
@@ -145,13 +145,9 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                 )
             )
 
-        parts = input_text.split(self._image_token)
-        result = [parts[0]]
-        for config, part in zip(resize_configs, parts[1:]):
-            result.append(self._image_token * config["num_tokens"] + part)
-        input_text = "".join(result)
-
-        text_inputs = self._hf_processor.tokenizer(input_text, return_tensors="pt")
+        input_ids = self._prepare_input_ids(
+            input_text, resize_configs, original_input_ids
+        )
 
         image_mean, image_std_inv = self._get_gpu_norm_tensors()
         patches = []
@@ -172,7 +168,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         grid_thws = torch.stack(grids, dim=0).cpu()
 
         return {
-            "input_ids": text_inputs["input_ids"],
+            "input_ids": input_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": grid_thws,
         }
@@ -181,6 +177,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK3ForConditionalGeneration]
     gpu_image_decode = True
+    prefer_tokenized_input = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -195,6 +192,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         self._processor = KimiK3GPUProcessorWrapper(
             _processor,
             image_token=self.mm_tokens.image_token,
+            image_token_id=self.mm_tokens.image_token_id,
             patch_size=media_proc_cfg["patch_size"],
             merge_kernel_size=media_proc_cfg["merge_kernel_size"],
             in_patch_limit=media_proc_cfg["in_patch_limit"],
@@ -221,7 +219,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output,
+            self.mm_tokens,
+            sglang_original_input_ids=base_output.input_ids,
         )
 
         return MultimodalProcessorOutput(

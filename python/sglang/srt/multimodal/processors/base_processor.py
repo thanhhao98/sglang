@@ -180,6 +180,7 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    prefer_tokenized_input = False
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
