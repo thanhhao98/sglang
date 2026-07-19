@@ -598,16 +598,40 @@ class KimiK3MLP(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+    def forward(
+        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(hidden_states)
+        hidden_states = self.act_fn(gate_up)
+        hidden_states, _ = self.down_proj(hidden_states)
+        # TODO(dark): maybe fuse residual with all reduce of down projection
+        if prefix_sum is not None:
+            hidden_states = hidden_states + prefix_sum
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
 # KimiK3MoE — with Latent MoE support
 # ---------------------------------------------------------------------------
+
+
+def _add3(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: Optional[torch.Tensor],
+    *,
+    prefetch_bc: bool = False,
+) -> torch.Tensor:
+    """bf16(a + b) [+ c]. A pending c (the attn-res delayed +prefix_sum)
+    collapses the two elementwise adds into the 3-way JIT kernel — one
+    launch and one memory pass; its double rounding matches the unfused
+    pair bit-for-bit. prefetch_bc loads b/c before the PDL wait: only pass
+    True when their producers are at least two kernels back."""
+    if c is None:
+        return a + b
+    from sglang.jit_kernel import add3
+
+    return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
 
 class KimiK3MoE(nn.Module):
@@ -830,7 +854,9 @@ class KimiK3MoE(nn.Module):
             return self._fi_fused_reduce_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _forward_unfused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_unfused(
+        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
         # Shared experts on original hidden_states
@@ -847,6 +873,8 @@ class KimiK3MoE(nn.Module):
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
                 expert_output = tensor_model_parallel_all_reduce(expert_output)
+            if prefix_sum is not None:
+                expert_output = expert_output + prefix_sum
             return expert_output
 
         # Latent MoE: compress after routing, before experts
@@ -863,10 +891,12 @@ class KimiK3MoE(nn.Module):
         if shared_output is not None:
             if self.tp_size > 1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
-            out = out + shared_output
-        return out
+            return _add3(out, shared_output, prefix_sum)
+        return out if prefix_sum is None else out + prefix_sum
 
-    def _forward_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_fused(
+        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight, then land both TP-partial sums in
         one flat symmetric [latent | shared] buffer with zero copies — the
@@ -920,17 +950,24 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
-        return out + shared_output
+        # prefetch_bc: b (shared_output) was produced by the all-reduce and
+        # c (prefix_sum) even earlier; the AR is a plain launch (full
+        # barrier), so both are complete once the norm / up_proj GEMM chain
+        # starts — only `a`'s producer can still be in flight at PDL entry.
+        return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """No residual add here: on the attn-res path the +residual add is
-        delayed into the next aggregation point."""
+    def forward(
+        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """A pending prefix_sum is always consumed here: folded into the
+        3-way JIT tail add when covered, plain adds otherwise (bit-identical
+        either way)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if num_tokens > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states)
+            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states)
+            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         return out.view(num_tokens, hidden_size)
 
 
@@ -1302,7 +1339,6 @@ class KimiK3DeltaAttention(nn.Module):
                 if _K3_DECODE_GEMV:
                     from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm as gemm
 
-                    # TODO: can fuse these 2 GEMMs (trust me)
                     bfa = gemm(hidden_states, w)
                     forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 else:
@@ -1509,7 +1545,6 @@ class KimiK3DecoderLayer(nn.Module):
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
             )
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1621,7 +1656,7 @@ class KimiK3DecoderLayer(nn.Module):
         attn_res: BaseAttnResidual,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Between attn-res layers hidden_states carries the previous layer's
         # un-added MLP delta and prefix_sum the prefix it extends (None at
         # stream start / PP entry, where hidden_states already is the head).
@@ -1654,19 +1689,20 @@ class KimiK3DecoderLayer(nn.Module):
             self.post_attention_layernorm,
         )
 
-        # ---- MLP (the +prefix_sum add is delayed into the next point) ----
-        return self.mlp(hidden_states), prefix_sum
+        # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
+        # add, dense adds it after down_proj) ----
+        return self.mlp(hidden_states, prefix_sum=prefix_sum), None
 
     def _forward_attn_residual_legacy(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        prefix_sum: Optional[torch.Tensor],
         attn_res: BaseAttnResidual,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, None]:
-        assert residual is None, "legacy attn-res path does not support extra residual"
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert prefix_sum is None, "legacy attn-res path does not support extra input"
         block_residual = attn_res.block_residual
         prefix_sum = hidden_states
         nvb = self.prev_valid_blocks
@@ -1751,9 +1787,7 @@ class KimiK3DecoderLayer(nn.Module):
             mlp_valid_blocks,
             self.post_attention_layernorm,
         )
-        hidden_states = self.mlp(hidden_states)
-        prefix_sum = prefix_sum + hidden_states
-        return prefix_sum, None
+        return self.mlp(hidden_states, prefix_sum=prefix_sum), None
 
 
 # ---------------------------------------------------------------------------
@@ -1832,8 +1866,9 @@ class KimiK3LinearModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
             # NOTE: assert to bypass the annoying typing errors
-            assert isinstance(hidden_states, torch.Tensor)
-            assert isinstance(residual, torch.Tensor | None)
+            if TYPE_CHECKING:
+                assert isinstance(hidden_states, torch.Tensor)
+                assert isinstance(residual, torch.Tensor | None)
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device

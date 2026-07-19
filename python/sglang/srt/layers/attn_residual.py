@@ -6,10 +6,11 @@
 # [T, NB, H] and the valid-row counter, and dispatches each aggregation point
 # (score rows → softmax → weighted sum → RMSNorm) to the implementation
 # selected by SGLANG_K3_ATTN_RES_MODE:
-#   "fast"   — NV warp-specialized TMA kernel (default): cp.async.bulk
-#              producer + online-softmax consumers, out norm fused, one
-#              persistent CTA per SM. Requires SM100a+ and H=7168; fails
-#              loudly when unsupported — pick another mode there.
+#   "fast"   — warp-specialized TMA kernel (default): cp.async.bulk producer
+#              + online-softmax consumers over a double-buffered chunk ring,
+#              out norm fused, per-nvb tuned launch config, one persistent
+#              CTA per SM. Requires SM100a+ and H=7168; fails loudly when
+#              unsupported — pick another mode there.
 #   "fused"  — Triton 2-kernel pipeline with full H-parallelism
 #   "jit"    — CUDA JIT kernels with lower launch overhead than Triton
 #   "torch"  — PyTorch reference (readable, for debugging)
@@ -66,10 +67,10 @@ def _aggregate_fast(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
 ) -> torch.Tensor:
-    """NV warp-specialized TMA kernel: online softmax over row chunks with
-    the output RMSNorm fused, one persistent CTA per SM (GB300 benchmark
-    winner across nvb; attn_res_fused / attn_res_chain remain available as
-    benchmark alternates)."""
+    """Warp-specialized TMA kernel: online softmax over row chunks with the
+    output RMSNorm fused, one persistent CTA per SM, per-nvb tuned launch
+    config (GB300 benchmark winner across nvb; attn_res_chain remains
+    available as a benchmark alternate)."""
     from sglang.jit_kernel.kimi_k3.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.

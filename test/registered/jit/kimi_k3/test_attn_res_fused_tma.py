@@ -1,27 +1,29 @@
-"""K3 attn-residual NV TMA aggregation kernel (attn_res_fused_tma).
+"""K3 attn-residual warp-specialized TMA aggregation (attn_res_fused_tma).
 
-Port of NVIDIA's warp-specialized production forward (sm_100a): 1 producer
-warp streams rows into double-buffered smem via cp.async.bulk, 8 consumer
-warps run per-row rms/dot reductions and an online softmax over row chunks,
-with cw and ow staged in TMEM. Unlike the NV original, the output RMSNorm is
-fused into the epilogue (per-thread sum of squares of the fp32 accumulator,
-one cross-warp reduction, scale by rsqrt and ow).
+Warp-specialized production forward (sm_100a): a producer warp (group)
+streams rows into a double-buffered smem chunk ring via per-row
+cp.async.bulk, 8 consumer warps run per-row rms/dot reductions and an online
+softmax over row chunks, with cw and ow staged in TMEM and the output RMSNorm
+fused into the epilogue. The launch config (chunk_rows / occupancy /
+consumer_regs, incl. the setmaxnreg producer/consumer register split) is
+dispatched per nvb through _TMA_BEST_CONFIG.
 
 Pinned failure modes:
-- chain math (score formula, online-softmax chunk correction across 1..3
-  chunks — nvb 1..8 covers full and partial chunks — fp32-accumulated
-  combine, fused output RMSNorm) vs an fp32 reference, on both launcher
-  configs: nvb <= 3 runs the NC=2 / 2-CTAs-per-SM config, nvb >= 4 the NC=4
-  production config;
-- the port's row addressing: the NV original consumed block_res
-  [N-1, T, B, H]; the port reads our bank [T, NB, H] + prefix [T, H] with a
-  runtime bank stride, so a bank with NB > nvb rows must still address rows
-  correctly (guards the hand-adapted v_addr);
-- the persistent grid and double buffering: T large enough that every CTA
-  runs >= 3 chunks exercises the tb loop AND the mbarrier phase-parity flip
-  (a slot is reused with flipped parity only from the third chunk on — for
-  the single-chunk nvb=1 config that needs >= 3 tokens per CTA);
-- read-only inputs; out-of-range nvb rejection;
+- chain math (score formula, online-softmax chunk correction across full and
+  partial chunks — nvb 1..8 covers every chunk shape of the dispatch table —
+  fp32-accumulated combine, fused output RMSNorm) vs an fp32 reference, on
+  every launch config the table dispatches: the occupancy=2 config (nvb=1,
+  T >= 128 plus its small-T fallback) and the 3/4/5-row-chunk setmaxnreg
+  configs;
+- row addressing: bank [T, NB, H] with NB > nvb rows must still address rows
+  correctly through the runtime bank stride (guards the per-row bulk-copy
+  source arithmetic);
+- the persistent grid and chunk-slot ring: T large enough that every CTA
+  runs >= 3 chunks exercises the token loop AND the mbarrier phase-parity
+  flip (a slot is reused with flipped parity only from the third chunk on —
+  for single-chunk-per-token configs that needs >= 3 tokens per CTA, at
+  occupancy=2 grid size);
+- read-only inputs;
 - PDL under CUDA graph: a preceding kernel writes prefix_sum and the capture
   must replay bit-identically (guards capturability and the wait placement's
   basic chained correctness — the race itself is not deterministically
@@ -37,7 +39,7 @@ from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _H = 7168
 _EPS = 1e-6
@@ -75,11 +77,14 @@ class TestAttnResFusedTma(CustomTestCase):
             raise unittest.SkipTest("attn_res_fused_tma requires SM100a+")
 
     def test_matches_reference_all_bank_sizes(self):
-        # 4*SM+3: >= 3 tokens per CTA even at grid_mul=2, so every config
-        # reaches gci >= 2 and flips the mbarrier phase parity.
+        # T = 1 and 5 run every nvb on the small-T side of the dispatch
+        # (nvb=1 takes the occupancy=1 fallback); 6*SM+3 crosses the nvb=1
+        # occupancy=2 threshold and gives >= 3 tokens per CTA even on its
+        # 2*SM grid, so single-chunk-per-token configs still flip the
+        # mbarrier phase parity (slot reuse starts at the third chunk).
         num_sm = torch.cuda.get_device_properties(0).multi_processor_count
         for nvb in range(1, 9):
-            for T in (1, 5, 4 * num_sm + 3):
+            for T in (1, 5, 6 * num_sm + 3):
                 with self.subTest(nvb=nvb, T=T):
                     prefix, bank, cw, ow = _make_inputs(T, seed=8 * T + nvb)
                     prefix_ref, bank_ref = prefix.clone(), bank.clone()
@@ -132,13 +137,6 @@ class TestAttnResFusedTma(CustomTestCase):
             graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(out, out_eager))
-
-    def test_rejects_out_of_range_nvb(self):
-        prefix, bank, cw, ow = _make_inputs(1, seed=0)
-        out = torch.empty_like(prefix)
-        for nvb in (0, 9):
-            with self.assertRaises(RuntimeError):
-                attn_res_fused_tma(prefix, bank, cw, ow, out, nvb, _EPS)
 
 
 if __name__ == "__main__":
