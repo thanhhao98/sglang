@@ -202,6 +202,7 @@ class KDAKernelDispatcher:
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
@@ -222,6 +223,7 @@ class KDAKernelDispatcher:
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
         )
 
     def extend(
@@ -366,7 +368,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     cache_indices,
                     scale=layer.head_k_dim**-0.5,
                     onorm_eps=onorm_eps,
-                    lower_bound=getattr(layer, "lower_bound", None),
+                    lower_bound=layer.lower_bound,
                 )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(
@@ -420,7 +422,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
-                lower_bound=getattr(layer, "lower_bound", None),
+                lower_bound=layer.lower_bound,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
@@ -448,7 +450,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            lower_bound=getattr(layer, "lower_bound", None),
+            lower_bound=layer.lower_bound,
         )
 
         self._track_mamba_state_decode(
@@ -552,7 +554,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
-            lower_bound=getattr(layer, "lower_bound", None),
+            lower_bound=layer.lower_bound,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
@@ -648,4 +650,5 @@ class KDAAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=layer.lower_bound,
         )

@@ -389,7 +389,8 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            beta = beta.float().sigmoid()
+            if not forward_batch.forward_mode.is_target_verify():
+                beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

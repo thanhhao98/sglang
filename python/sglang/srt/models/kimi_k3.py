@@ -71,7 +71,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
-from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -665,15 +665,9 @@ class KimiK3MoE(nn.Module):
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
 
-        # Gate
-        self.gate = ReplicatedLinear(
-            hidden_size,
-            num_experts,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.gate",
-        )
-        self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
+        # Gate — fp32 output so routing (sigmoid, bias add, top-k) runs in
+        # full precision (matches GateLinear in mke).
+        self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
         # so FusedMoE's weight_loader uses the MXFP4 fast path
@@ -865,7 +859,10 @@ class KimiK3MoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
 
         # Gate + TopK (on original hidden_states for correct token count)
-        topk_output = self.topk(hidden_states, self.gate(hidden_states)[0])
+        # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
+        # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16).
+        router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
@@ -1374,7 +1371,8 @@ class KimiK3DeltaAttention(nn.Module):
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
-            beta = beta.float().sigmoid()
+            if not forward_batch.forward_mode.is_target_verify():
+                beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
