@@ -1,15 +1,11 @@
-"""Single-token decode handoffs between the router / model and the MoE runner.
+"""Single-token decode handoff between the router and the MoE runner.
 
-Two tiny producer/consumer stashes used only on the M == 1 decode fast path:
+A tiny producer/consumer stash used only on the M == 1 decode fast path:
+the radix router (moe_fused_gate_radix) can emit the moe_align_block_size
+outputs inside its own kernel; fused_marlin_moe consumes them instead of
+launching align_single_token.
 
-- alignment: the radix router (moe_fused_gate_radix) can emit the
-  moe_align_block_size outputs inside its own kernel; fused_marlin_moe
-  consumes them instead of launching align_single_token.
-- output destination: the model can hand the runner a preallocated buffer
-  (e.g. a slice of the K3 concat-allreduce buffer) so the final top-k sum
-  writes there directly instead of being memcpy'd afterwards.
-
-Both handoffs are attempt-and-verify: the consumer checks tensor identity
+The handoff is attempt-and-verify: the consumer checks tensor identity
 (data_ptr) and metadata before use, and every producer entry is dropped on
 the next set or on consume, so a path that bypasses the consumer (another
 runner, a shape change) silently falls back to the regular kernels. All
@@ -62,38 +58,3 @@ def consume_alignment(
     if stashed_block != block_size:
         return None
     return sorted_ids, expert_ids, num_post
-
-
-# ---- Output destination handoff (model -> fused_marlin_moe) -----------------
-
-_dest_key: Optional[int] = None
-_dest_value: Optional[torch.Tensor] = None
-
-
-def stash_output_destination(runner_input: torch.Tensor, dest: torch.Tensor) -> None:
-    global _dest_key, _dest_value
-    _dest_key = runner_input.data_ptr()
-    _dest_value = dest
-
-
-def clear_output_destination() -> None:
-    global _dest_key, _dest_value
-    _dest_key = None
-    _dest_value = None
-
-
-def consume_output_destination(
-    hidden_states: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    global _dest_key, _dest_value
-    if _dest_value is None or _dest_key != hidden_states.data_ptr():
-        return None
-    dest = _dest_value
-    clear_output_destination()
-    if (
-        dest.shape == hidden_states.shape
-        and dest.dtype == hidden_states.dtype
-        and dest.is_contiguous()
-    ):
-        return dest
-    return None
