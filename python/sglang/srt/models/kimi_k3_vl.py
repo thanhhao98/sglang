@@ -20,6 +20,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.jit_kernel.vision_rope import (
+    apply_fused_qk_complex_rope,
+    precompile_fused_qk_complex_rope,
+)
 from sglang.srt.layers.attention.vision import (
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     QKV_BACKEND_IMPL,
@@ -28,6 +32,8 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.runtime_context import get_server_args
+
+_FUSED_ROPE_MIN_TOKENS = 2048
 
 
 def _get_mm_attention_backend() -> str:
@@ -47,6 +53,21 @@ def apply_rope(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def _can_use_fused_rope(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> bool:
+    if hidden_states.shape[0] < _FUSED_ROPE_MIN_TOKENS:
+        return False
+    if not (
+        hidden_states.is_cuda
+        and freqs_cis.is_cuda
+        and hidden_states.device == freqs_cis.device
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and freqs_cis.dtype == torch.complex64
+    ):
+        return False
+    major, _ = torch.cuda.get_device_capability(hidden_states.device)
+    return major >= 9
 
 
 def sdpa_varlen_attention(
@@ -305,6 +326,7 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor,
         forward_metadata: VisionAttentionMetadata,
+        use_fused_rope: bool,
     ) -> torch.Tensor:
         xqkv = self.wqkv(x)
         qkv_shape = xqkv.size()[:-1] + (
@@ -315,7 +337,10 @@ class MoonViTEncoderLayer(nn.Module):
         xqkv = xqkv.view(*qkv_shape)
         xq, xk, xv = torch.unbind(xqkv, dim=-3)
 
-        xq, xk = apply_rope(xq, xk, rope_freqs_cis)
+        if use_fused_rope:
+            xq, xk = apply_fused_qk_complex_rope(xq, xk, rope_freqs_cis)
+        else:
+            xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
         if self.attention_backend_impl is None:
             attn_out = sdpa_varlen_attention(xq, xk, xv, cu_seqlens)
@@ -339,11 +364,16 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor,
         forward_metadata: VisionAttentionMetadata,
+        use_fused_rope: bool,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
         hidden_states = self._attention(
-            hidden_states, cu_seqlens, rope_freqs_cis, forward_metadata
+            hidden_states,
+            cu_seqlens,
+            rope_freqs_cis,
+            forward_metadata,
+            use_fused_rope,
         )
         hidden_states = residual + hidden_states
 
@@ -389,6 +419,16 @@ class MoonViT3dEncoder(nn.Module):
             block_cfg.get("norm_type", "layernorm"), hidden_dim
         )
 
+    def precompile_fused_rope(self, dtype: torch.dtype, device: torch.device) -> bool:
+        if not self.blocks:
+            return False
+        return precompile_fused_qk_complex_rope(
+            num_heads=self.blocks[0].num_heads,
+            head_dim=self.blocks[0].hidden_size_per_attention_head,
+            dtype=dtype,
+            device=device,
+        )
+
     def forward(
         self, hidden_states: torch.Tensor, grid_thws: torch.Tensor
     ) -> torch.Tensor:
@@ -415,9 +455,14 @@ class MoonViT3dEncoder(nn.Module):
                 cu_seqlens, device=hidden_states.device
             )
 
+        use_fused_rope = _can_use_fused_rope(hidden_states, rope_freqs_cis)
         for block in self.blocks:
             hidden_states = block(
-                hidden_states, cu_seqlens, rope_freqs_cis, forward_metadata
+                hidden_states,
+                cu_seqlens,
+                rope_freqs_cis,
+                forward_metadata,
+                use_fused_rope,
             )
 
         return self.final_layernorm(hidden_states)
@@ -515,6 +560,9 @@ class KimiK3VisionTower(nn.Module):
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
+
+    def precompile_fused_rope(self) -> bool:
+        return self.encoder.precompile_fused_rope(self.dtype, self.device)
 
     def forward(
         self,

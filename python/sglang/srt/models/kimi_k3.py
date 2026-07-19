@@ -2337,6 +2337,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 yield name.replace("language_model.", ""), loaded_weight
 
         self.language_model.load_weights(stream_language_weights())
+        if self.vision_tower.precompile_fused_rope():
+            logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
 
     @property
     def stacked_params_mapping(self):

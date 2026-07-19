@@ -138,5 +138,35 @@ def test_flashinfer_cudnn_metadata_uses_bucketed_element_indptrs():
     assert metadata.flashinfer_max_seqlen == 4096
 
 
+def test_kimi_k3_fused_rope_gate_is_prepared_once_per_encoder(monkeypatch):
+    monkeypatch.setattr(kimi_k3_vl, "_can_use_fused_rope", lambda *args: True)
+    fused_calls = []
+
+    def fake_fused(q, k, freqs):
+        fused_calls.append(q.shape)
+        return kimi_k3_vl.apply_rope(q, k, freqs)
+
+    monkeypatch.setattr(kimi_k3_vl, "apply_fused_qk_complex_rope", fake_fused)
+
+    encoder = MoonViT3dEncoder(
+        hidden_dim=8,
+        num_layers=2,
+        block_cfg={
+            "num_heads": 1,
+            "hidden_dim": 8,
+            "qkv_hidden_size": 8,
+            "mlp_dim": 16,
+            "norm_type": "rmsnorm",
+            "activation": F.gelu,
+            "attn_bias": False,
+            "linear_bias": False,
+        },
+    )
+    output = encoder(torch.randn(4, 8), torch.tensor([[1, 2, 2]]))
+
+    assert output.shape == (4, 8)
+    assert fused_calls == [torch.Size([4, 1, 8])] * 2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
