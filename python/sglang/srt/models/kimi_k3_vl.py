@@ -20,6 +20,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.layers.attention.vision import (
+    FLASHINFER_WORKSPACE_SIZE_BYTES,
+    QKV_BACKEND_IMPL,
+    VisionAttentionMetadata,
+    prepare_flashinfer_cudnn_vision_attention_metadata,
+    prepare_vision_attention_metadata,
+)
+from sglang.srt.runtime_context import get_server_args
+
+
+def _get_mm_attention_backend() -> str:
+    try:
+        server_args = get_server_args()
+    except ValueError:
+        return "sdpa"
+    return server_args.mm_attention_backend or "sdpa"
+
 
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
@@ -256,6 +273,8 @@ class MoonViTEncoderLayer(nn.Module):
         activation=F.gelu,
         attn_bias: bool = False,
         linear_bias: bool = True,
+        attention_backend: str = "sdpa",
+        attention_workspace: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -270,12 +289,22 @@ class MoonViTEncoderLayer(nn.Module):
         self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation, bias=linear_bias)
         self.wqkv = nn.Linear(hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias)
         self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
+        self.attention_backend = attention_backend
+        self.attention_backend_impl = (
+            None
+            if attention_backend == "sdpa"
+            else QKV_BACKEND_IMPL[attention_backend](
+                use_data_parallel=True,
+                workspace_buffer=attention_workspace,
+            )
+        )
 
     def _attention(
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor,
+        forward_metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
         xqkv = self.wqkv(x)
         qkv_shape = xqkv.size()[:-1] + (
@@ -288,7 +317,20 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        attn_out = sdpa_varlen_attention(xq, xk, xv, cu_seqlens)
+        if self.attention_backend_impl is None:
+            attn_out = sdpa_varlen_attention(xq, xk, xv, cu_seqlens)
+        else:
+            if self.attention_backend == "flashinfer_cudnn":
+                xv = xv.contiguous()
+            attn_out = self.attention_backend_impl(
+                xq,
+                xk,
+                xv,
+                cu_seqlens=cu_seqlens,
+                bsz=1,
+                seq_len=xq.shape[0],
+                forward_metadata=forward_metadata,
+            ).flatten(start_dim=-2)
         return self.wo(attn_out)
 
     def forward(
@@ -296,10 +338,13 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor,
+        forward_metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
-        hidden_states = self._attention(hidden_states, cu_seqlens, rope_freqs_cis)
+        hidden_states = self._attention(
+            hidden_states, cu_seqlens, rope_freqs_cis, forward_metadata
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -313,11 +358,32 @@ class MoonViT3dEncoder(nn.Module):
     def __init__(self, hidden_dim: int, num_layers: int, block_cfg: dict) -> None:
         super().__init__()
         qkv_hidden_size = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
+        attention_backend = _get_mm_attention_backend()
+        if attention_backend not in QKV_BACKEND_IMPL:
+            raise ValueError(
+                f"Unsupported Kimi-K3 vision attention backend: {attention_backend}"
+            )
+        attention_workspace = None
+        if attention_backend == "flashinfer_cudnn" and torch.cuda.is_available():
+            attention_workspace = torch.empty(
+                FLASHINFER_WORKSPACE_SIZE_BYTES,
+                dtype=torch.uint8,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+        self.attention_backend = attention_backend
+        self.attention_width = qkv_hidden_size
         self.rope_2d = Rope2DPosEmbRepeated(
             qkv_hidden_size // block_cfg["num_heads"], 512, 512
         )
         self.blocks = nn.ModuleList(
-            [MoonViTEncoderLayer(**block_cfg) for _ in range(num_layers)]
+            [
+                MoonViTEncoderLayer(
+                    **block_cfg,
+                    attention_backend=attention_backend,
+                    attention_workspace=attention_workspace,
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.final_layernorm = _make_norm(
             block_cfg.get("norm_type", "layernorm"), hidden_dim
@@ -338,8 +404,21 @@ class MoonViT3dEncoder(nn.Module):
         )
         cu_seqlens = lengths.cumsum(dim=0, dtype=torch.int32)
 
+        if self.attention_backend == "flashinfer_cudnn":
+            forward_metadata = prepare_flashinfer_cudnn_vision_attention_metadata(
+                cu_seqlens,
+                device=hidden_states.device,
+                elem_per_token=self.attention_width,
+            )
+        else:
+            forward_metadata = prepare_vision_attention_metadata(
+                cu_seqlens, device=hidden_states.device
+            )
+
         for block in self.blocks:
-            hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)
+            hidden_states = block(
+                hidden_states, cu_seqlens, rope_freqs_cis, forward_metadata
+            )
 
         return self.final_layernorm(hidden_states)
 
