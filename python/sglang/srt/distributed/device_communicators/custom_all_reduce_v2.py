@@ -31,6 +31,7 @@ from sglang.jit_kernel.all_reduce import (
     IPCManager,
     custom_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -116,6 +117,10 @@ class CustomAllReduceV2:
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
+        # On a multi-node (MNNVL) group the symm-mem workspace plane works
+        # across nodes, but graph zero-copy input registration (cudaIpc /
+        # node-local VMM remap) does not — force eager pull inside graphs.
+        self._multinode = not all(in_the_same_node_as(group, source_rank=0))
         base_config = get_all_reduce_config(self.world_size)
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
@@ -334,7 +339,7 @@ class CustomAllReduceV2:
             yield
             return
         try:
-            self._graph_mode_allowed = not self.tms_cudagraph
+            self._graph_mode_allowed = not self.tms_cudagraph and not self._multinode
             yield
         finally:
             self._graph_mode_allowed = False
@@ -411,6 +416,21 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    # Multi-node (MNNVL): the node-local NVLink/P2P topology checks below
+    # are meaningless across nodes; the torch symm-mem rendezvous (fabric
+    # handles) is the real capability gate there.
+    if envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get() and not all(
+        in_the_same_node_as(group, source_rank=0)
+    ):
+        world_size = dist.get_world_size(group=group)
+        if world_size in range(2, 9):
+            logger.warning(
+                "CustomAllReduceV2 enabled on a multi-node group "
+                "(world_size=%d); graph zero-copy is disabled.",
+                world_size,
+            )
+            return True
+        return False
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
