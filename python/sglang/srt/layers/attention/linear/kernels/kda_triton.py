@@ -167,6 +167,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -195,6 +196,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
         )
 
     def extend(

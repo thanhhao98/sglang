@@ -145,6 +145,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
 
         A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
 
+        # Gate contract matches the Triton decode path (safe gate when
+        # lower_bound set); in-place state update, no rollback for decode.
         output_fi, _ = self._recurrent_kda(
             q=query_fi,
             k=key_fi,

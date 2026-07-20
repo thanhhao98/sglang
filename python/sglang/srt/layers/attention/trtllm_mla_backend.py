@@ -130,6 +130,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False
 
+    # Ragged verify: the packed query is front-aligned into the dense
+    # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
+    supports_ragged_verify_graph: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -341,6 +345,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         device: torch.device,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
+        if forward_mode.is_target_verify() and bs in self.decode_cuda_graph_metadata:
+            # Token tiers at the same slot count must share one per-bs buffer
+            # set (each graph bakes in the tensors it captured).
+            self.forward_decode_metadata = self.decode_cuda_graph_metadata[bs]
+            return
         metadata = TRTLLMMLADecodeMetadata()
 
         if forward_mode.is_target_verify():
@@ -588,14 +597,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cu_seqlens_q: torch.Tensor,
         seq_lens_q: torch.Tensor,
         sum_seq_lens_q: int,
+        zero_uncovered: bool = False,
     ) -> torch.Tensor:
-        """Unpad draft extended output using Triton kernel."""
+        """Unpad draft extended output using Triton kernel.
+
+        zero_uncovered: ragged verify's clamped rows leave output positions
+        unwritten; zero the destination so those discarded rows stay finite
+        (draft_extend writes every position and does not need this).
+        """
+        output_buffer = self.unpad_output_buffer
+        if zero_uncovered:
+            if output_buffer is not None:
+                output_buffer[:sum_seq_lens_q].zero_()
+            else:
+                # No persistent buffer without cuda graph state; the triton
+                # wrapper's dynamic fallback is torch.empty.
+                output_buffer = torch.zeros(
+                    (sum_seq_lens_q, raw_out.shape[2], raw_out.shape[3]),
+                    dtype=raw_out.dtype,
+                    device=raw_out.device,
+                )
         return unpad_draft_extend_output_triton(
             raw_out,
             cu_seqlens_q,
             seq_lens_q,
             sum_seq_lens_q,
-            self.unpad_output_buffer,
+            output_buffer,
         )
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
@@ -901,12 +928,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.to(self.data_type)
 
             if forward_batch.forward_mode.is_target_verify():
-                max_seq_len = (
-                    metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
-                )
-                # For target_verify, all sequences have the same number of draft tokens
-                q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-                needs_unpad = False
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                max_seq_len = metadata.max_seq_len_k + draft_token_num
+                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                if ragged_layout is None:
+                    # Uniform verify: all sequences carry draft_token_num tokens.
+                    q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+                    needs_unpad = False
+                else:
+                    # Front-align packed tokens into a zeroed dense [bs, N]
+                    # buffer under uniform seq_lens_k: row j attends exactly to
+                    # seq_i + j, over-length tier-padding rows are clamped, and
+                    # rows past a request's verify len yield discarded output.
+                    if ragged_layout.bs != bs:
+                        ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+                    total_tokens = q.shape[0]
+                    seq_lens_q = torch.clamp(
+                        ragged_layout.verify_lens, max=draft_token_num
+                    )
+                    cu_seqlens_q = ragged_layout.qo_indptr_device
+                    padded_q = torch.zeros(
+                        (bs, draft_token_num, layer.tp_q_head_num, layer.head_dim),
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    q = self.pad_draft_extend_query(
+                        q, padded_q, seq_lens_q, cu_seqlens_q
+                    )
+                    needs_unpad = True
+                    unpad_zero_uncovered = True
+                    unpad_seq_lens_q = seq_lens_q
+                    unpad_cu_seqlens_q = cu_seqlens_q
+                    unpad_sum_seq_lens_q = total_tokens
             else:
                 # draft_extend: handle varying num_correct_drafts_per_req. If total_tokens % bs == 0,
                 # we can directly reshape q; otherwise, pad to max_seq_len_q.
@@ -950,6 +1003,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                         q, padded_q, actual_seq_lens_q, actual_cu_seqlens_q
                     )
                     needs_unpad = True
+                    unpad_zero_uncovered = False
                     unpad_seq_lens_q = actual_seq_lens_q
                     unpad_cu_seqlens_q = actual_cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
@@ -973,6 +1027,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q,
                     unpad_seq_lens_q,
                     unpad_sum_seq_lens_q,
+                    zero_uncovered=unpad_zero_uncovered,
                 )
                 output = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             else:

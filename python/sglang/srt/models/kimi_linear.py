@@ -390,6 +390,8 @@ class KimiDeltaAttention(nn.Module):
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
             if not forward_batch.forward_mode.is_target_verify():
+                # Only chunk_kda (extend) wants pre-activated beta; the verify
+                # kernel sigmoids it in-kernel like decode.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)

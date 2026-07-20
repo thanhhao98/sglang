@@ -1372,6 +1372,8 @@ class KimiK3DeltaAttention(nn.Module):
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             if not forward_batch.forward_mode.is_target_verify():
+                # Only chunk_kda (extend) wants pre-activated beta; the verify
+                # kernel sigmoids it in-kernel like decode.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -1803,6 +1805,7 @@ class KimiK3LinearModel(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_pp_group()
+        self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1887,6 +1890,7 @@ class KimiK3LinearModel(nn.Module):
             )
             residual = None
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = self.layers[i](
@@ -1897,6 +1901,13 @@ class KimiK3LinearModel(nn.Module):
                     attn_res=attn_res,
                     zero_allocator=zero_allocator,
                 )
+            if (
+                self.dspark_layers_to_capture is not None
+                and i in self.dspark_layers_to_capture
+            ):
+                # Raw residual-stream capture, attn-res aggregation not
+                # folded in; the draft trains on whatever is exposed here.
+                aux_hidden_states.append(hidden_states)
 
         if not self.pp_group.is_last_rank:
             if attn_res is not None:
@@ -1935,6 +1946,8 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if self.dspark_layers_to_capture is not None:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -1968,9 +1981,26 @@ class KimiK3LinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.pp_group.world_size > 1:
+            # Capture layers living on non-last PP ranks would be silently
+            # skipped (the flag is only set on the last rank).
+            raise NotImplementedError(
+                "DSPARK aux hidden capture requires PP=1."
+            )
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -1987,8 +2017,15 @@ class KimiK3LinearForCausalLM(nn.Module):
             input_ids, positions, forward_batch, embeds, pp_proxy_tensors
         )
         if self.pp_group.is_last_rank:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 
@@ -2269,6 +2306,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.language_model.set_dspark_layers_to_capture(layer_ids)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device

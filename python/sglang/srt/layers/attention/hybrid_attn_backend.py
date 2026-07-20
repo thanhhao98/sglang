@@ -37,6 +37,14 @@ class HybridAttnBackend(AttentionBackend):
             prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
         )
 
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
+        backend = (
+            self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
+        )
+        return backend.supports_ragged_verify_graph
+
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
         Select the appropriate attention backend based on the forward mode.

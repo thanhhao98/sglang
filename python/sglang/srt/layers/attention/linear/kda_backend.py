@@ -252,8 +252,37 @@ class KDAKernelDispatcher:
         )
 
 
+def ragged_verify_dense_scatter_indices(
+    *,
+    query_start_loc: torch.Tensor,
+    seq_len: int,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
+
+    Rows never exceed draft_token_num under either layout variant (cap for
+    graph replay, planner construction for eager -- see
+    RaggedVerifyLayout.padded_to_bucket), so in-row offsets stay in-row;
+    tokens past the layout's coverage collapse into one ghost row at index
+    bs * draft_token_num.
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(
+        seq_len, device=query_start_loc.device, dtype=torch.int32
+    )
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
+
+
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
+
+    # The verify kernel is varlen and the conv path scatters ragged tokens
+    # to its dense layout, so ragged verify graphs are supported.
+    supports_ragged_verify_graph: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -608,13 +637,37 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = self.verify_intermediate_state_indices
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        batch_size = seq_len // draft_token_num
+        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        if ragged_layout is None:
+            batch_size = seq_len // draft_token_num
+            dense_token_indices = None
+            mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+        else:
+            # Conv update and its per-step scratch want the dense
+            # [bs, draft_token_num] layout: scatter ragged tokens to their
+            # step slots, gather back after (pad steps are never committed).
+            # Uncovered tier-leftover tokens land in the ghost row (see
+            # ragged_verify_dense_scatter_indices); their values are pad
+            # garbage, discarded downstream (ghost collisions are
+            # value-irrelevant).
+            batch_size = query_start_loc.shape[0] - 1
+            num_dense_tokens = batch_size * draft_token_num
+            dense_token_indices = ragged_verify_dense_scatter_indices(
+                query_start_loc=query_start_loc,
+                seq_len=seq_len,
+                draft_token_num=draft_token_num,
+            )
+            dense = mixed_qkv.new_zeros(
+                num_dense_tokens + 1, mixed_qkv.shape[-1]
+            )
+            dense.index_copy_(0, dense_token_indices, mixed_qkv)
+            mixed_qkv_dense = dense[:num_dense_tokens].view(
+                batch_size, draft_token_num, -1
+            )
 
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
-        mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(
-            1, 2
-        )
+        mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
             conv_states.transpose(-1, -2),
@@ -628,14 +681,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
         )
-        mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1)
+        mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+            batch_size * draft_token_num, -1
+        )
+        if dense_token_indices is None:
+            mixed_qkv = mixed_qkv_flat
+        else:
+            # Ghost row (zeros) so uncovered tail tokens gather finite values.
+            padded_flat = mixed_qkv_flat.new_zeros(
+                batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+            )
+            padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
+            mixed_qkv = padded_flat[dense_token_indices]
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        return self.kernel_dispatcher.target_verify(
+        core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
@@ -652,3 +716,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
         )
+        if dense_token_indices is not None:
+            # Kernel output is empty-allocated and the capped qsl skips the
+            # uncovered tail rows; zero them so discarded pad hidden states
+            # stay finite. Uncovered == clamped-to-ghost.
+            covered = dense_token_indices < (batch_size * draft_token_num)
+            core_attn_out = torch.where(
+                covered.view(1, -1, 1, 1), core_attn_out, 0.0
+            )
+        return core_attn_out

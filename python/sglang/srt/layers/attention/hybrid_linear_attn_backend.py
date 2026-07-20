@@ -158,13 +158,18 @@ class MambaAttnBackendBase(AttentionBackend):
                 # skip mamba metadata.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                query_start_loc = torch.arange(
-                    0,
-                    forward_batch.input_ids.shape[0] + 1,
-                    step=forward_batch.spec_info.draft_token_num,
-                    dtype=torch.int32,
-                    device=forward_batch.input_ids.device,
-                )
+                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                if ragged_layout is not None:
+                    # Compact ragged verify: variable per-request verify lens.
+                    query_start_loc = ragged_layout.qo_indptr_device
+                else:
+                    query_start_loc = torch.arange(
+                        0,
+                        forward_batch.input_ids.shape[0] + 1,
+                        step=forward_batch.spec_info.draft_token_num,
+                        dtype=torch.int32,
+                        device=forward_batch.input_ids.device,
+                    )
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
@@ -441,9 +446,18 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+            ragged_layout = (
+                spec_info.ragged_verify_layout if spec_info is not None else None
             )
+            if ragged_layout is not None:
+                # Ragged capture: qsl from the runner's synthetic layout.
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_layout.qo_indptr_device
+                )
+            else:
+                self.query_start_loc_list[bs - 1].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -592,7 +606,21 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            if num_padding == 0:
+            ragged_layout = (
+                spec_info.ragged_verify_layout if spec_info is not None else None
+            )
+            if ragged_layout is not None:
+                # Mamba kernels index dense [bs, N] scratch, so they need the
+                # capped variant (see padded_to_bucket). Padding rows carry
+                # mamba slot -1 and are skipped.
+                if ragged_layout.bs != bs or ragged_layout.cap is None:
+                    ragged_layout = ragged_layout.padded_to_bucket(
+                        padded_bs=bs, cap=spec_info.draft_token_num
+                    )
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_layout.qo_indptr_device
+                )
+            elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
@@ -881,6 +909,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         # wrapper since split backends are wrapped once (#31439); the full-attn
         # side owns the KV cache, so its dtype is authoritative.
         return self.full_attn_backend.data_type
+
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        return (
+            self.full_attn_backend.supports_ragged_verify_graph
+            and self.linear_attn_backend.supports_ragged_verify_graph
+        )
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
