@@ -27,6 +27,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiK2_5VLImageProcessor,
     _expand_image_token_ids,
     _grid_thw_from_resize_config,
+    _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -213,6 +214,21 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
+
+
+def test_kimi_skips_noop_bicubic_resize():
+    image = torch.arange(2 * 3 * 16 * 12, dtype=torch.uint8).reshape(2, 3, 16, 12)
+    expected = F.interpolate(
+        image.float(), size=(16, 12), mode="bicubic", align_corners=False
+    )
+
+    with patch(
+        "sglang.srt.multimodal.processors.kimi_k25.F.interpolate"
+    ) as interpolate:
+        actual = _resize_bicubic_if_needed(image, 16, 12)
+
+    interpolate.assert_not_called()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

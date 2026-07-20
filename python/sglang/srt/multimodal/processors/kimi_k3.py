@@ -13,7 +13,6 @@ from typing import Dict, List, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
@@ -30,6 +29,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _grid_thw_from_resize_config,
+    _resize_bicubic_if_needed,
     navit_resize_config,
 )
 
@@ -104,8 +104,7 @@ def _k3_process_single_image(
     padded_h = new_h + config["pad_height"]
     padded_w = new_w + config["pad_width"]
 
-    x = image.unsqueeze(0).float()
-    x = F.interpolate(x, size=(new_h, new_w), mode="bicubic", align_corners=False)
+    x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
     x = _fill_transparent_bg(x, transparent_bg_config)
 
     return normalize_and_patchify(

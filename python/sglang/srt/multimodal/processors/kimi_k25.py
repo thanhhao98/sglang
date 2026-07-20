@@ -134,6 +134,20 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     return image[:3]
 
 
+def _resize_bicubic_if_needed(
+    image: torch.Tensor, target_height: int, target_width: int
+) -> torch.Tensor:
+    image = image.float()
+    if image.shape[-2:] == (target_height, target_width):
+        return image
+    return F.interpolate(
+        image,
+        size=(target_height, target_width),
+        mode="bicubic",
+        align_corners=False,
+    )
+
+
 def _grid_thw_from_resize_config(config: dict, patch_size: int) -> tuple[int, int, int]:
     height = config["new_height"] + config["pad_height"]
     width = config["new_width"] + config["pad_width"]
@@ -157,8 +171,7 @@ def _process_single_image(
     padded_h = new_h + config["pad_height"]
     padded_w = new_w + config["pad_width"]
 
-    x = image.unsqueeze(0).float()
-    x = F.interpolate(x, size=(new_h, new_w), mode="bicubic", align_corners=False)
+    x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
 
     return normalize_and_patchify(
         x, image_scale, image_bias, patch_size, padded_h, padded_w
@@ -185,22 +198,14 @@ def _resize_images_by_source_shape(
     for images in by_source_shape.values():
         if len(images) == 1:
             index, image = images[0]
-            resized_by_index[index] = F.interpolate(
-                image.unsqueeze(0).float(),
-                size=(target_height, target_width),
-                mode="bicubic",
-                align_corners=False,
+            resized_by_index[index] = _resize_bicubic_if_needed(
+                image.unsqueeze(0), target_height, target_width
             )
             continue
 
-        source_batch = torch.cat(
-            [image.unsqueeze(0) for _, image in images], dim=0
-        ).float()
-        resized_batch = F.interpolate(
-            source_batch,
-            size=(target_height, target_width),
-            mode="bicubic",
-            align_corners=False,
+        source_batch = torch.cat([image.unsqueeze(0) for _, image in images], dim=0)
+        resized_batch = _resize_bicubic_if_needed(
+            source_batch, target_height, target_width
         )
         for local_index, (index, _) in enumerate(images):
             resized_by_index[index] = resized_batch[local_index : local_index + 1]
