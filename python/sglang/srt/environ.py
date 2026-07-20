@@ -341,6 +341,11 @@ class Envs:
     # torch.where/.contiguous/pack-copy path for A/B (a2a comm backend only;
     # fi_a2a always uses the old path).
     SGLANG_DCP_FUSED_PACK = EnvBool(True)
+    # DCP verify cascade: run the pre-packed a2a on a dedicated side stream so
+    # the NCCL exchange overlaps with pass-2 (the local draft-chain fold). Set
+    # to 0 to serialize on the current stream for A/B. Only effective with
+    # SGLANG_DCP_FUSED_PACK=1.
+    SGLANG_DCP_A2A_OVERLAP = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

@@ -36,11 +36,13 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 )
 from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.dcp import (
+    dcp_a2a_exchange_packed,
     dcp_a2a_lse_reduce,
     dcp_a2a_lse_reduce_prepacked,
     dcp_enabled,
     dcp_lse_combine_triton,
     dcp_mask_pack_triton,
+    dcp_unpack_lse_combine,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
     get_dcp_lens,
@@ -239,9 +241,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # DCP verify cascade: fused mask+pack A/B flag, cached once (read per
-        # layer otherwise). See _forward_verify_dcp.
+        # DCP verify cascade: fused mask+pack / a2a-overlap A/B flags, cached
+        # once (read per layer otherwise). See _forward_verify_dcp.
         self._dcp_fused_pack = envs.SGLANG_DCP_FUSED_PACK.get()
+        self._dcp_a2a_overlap = envs.SGLANG_DCP_A2A_OVERLAP.get()
+        # Dedicated side stream (+ fork/join events) for the overlapped verify
+        # a2a; created lazily on first use, shared across CUDA graphs.
+        self._dcp_comm_stream: Optional[torch.cuda.Stream] = None
+        self._dcp_a2a_fork_ev: Optional[torch.cuda.Event] = None
+        self._dcp_a2a_join_ev: Optional[torch.cuda.Event] = None
+        # Extends the send/recv buffers' lifetime beyond the calling frame:
+        # the side stream may still be consuming them when the locals die.
+        self._dcp_a2a_keepalive = None
+
+    def _get_dcp_comm_stream(self) -> torch.cuda.Stream:
+        """Lazily create the DCP verify-a2a side stream and its fork/join
+        events. One stream per backend, reused by every layer and every CUDA
+        graph (events are re-recorded per fork/join pair, which is capture-safe
+        — same pattern as memory_pool's alt_stream KV write)."""
+        if self._dcp_comm_stream is None:
+            self._dcp_comm_stream = torch.cuda.Stream()
+            self._dcp_a2a_fork_ev = torch.cuda.Event()
+            self._dcp_a2a_join_ev = torch.cuda.Event()
+        return self._dcp_comm_stream
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -1183,15 +1205,36 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # replacing 2x torch.where + 2x .contiguous() + the pack copies. Only
         # the a2a backend consumes the packed layout (fi_a2a packs its own).
         use_fused_pack = self._dcp_fused_pack and comm_backend == "a2a"
+        overlap_a2a = use_fused_pack and self._dcp_a2a_overlap
+        recv_buf = None
         if use_fused_pack:
             send_buf = dcp_mask_pack_triton(o1, lse1, zero, dcp_world)
-            prefix_full, prefix_lse = dcp_a2a_lse_reduce_prepacked(
-                send_buf,
-                vd,
-                get_dcp_group(),
-                is_lse_base_on_e=False,
-                return_lse=True,
-            )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
+            if overlap_a2a:
+                # Overlap (SGLANG_DCP_A2A_OVERLAP=0 serializes): launch the
+                # exchange on a dedicated side stream so the NCCL a2a runs
+                # concurrently with pass-2 below; the combine joins after.
+                # Event fork/join is CUDA-graph-capture safe (same pattern as
+                # memory_pool's alt_stream KV write). recv_buf is allocated on
+                # the CURRENT stream so all captured allocations stay on the
+                # capture stream; the side stream only touches existing
+                # buffers, whose lifetime the backend keepalive extends.
+                recv_buf = torch.empty_like(send_buf)
+                comm_stream = self._get_dcp_comm_stream()
+                self._dcp_a2a_fork_ev.record(torch.cuda.current_stream())
+                comm_stream.wait_event(self._dcp_a2a_fork_ev)
+                with torch.cuda.stream(comm_stream):
+                    dcp_a2a_exchange_packed(send_buf, recv_buf, get_dcp_group())
+                self._dcp_a2a_join_ev.record(comm_stream)
+                self._dcp_a2a_keepalive = (send_buf, recv_buf)
+                prefix_full = prefix_lse = None
+            else:
+                prefix_full, prefix_lse = dcp_a2a_lse_reduce_prepacked(
+                    send_buf,
+                    vd,
+                    get_dcp_group(),
+                    is_lse_base_on_e=False,
+                    return_lse=True,
+                )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
         else:
             o1 = torch.where(zero.view(bs, 1, 1, 1), o1.new_zeros(()), o1)
             lse1 = torch.where(
@@ -1236,6 +1279,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             causal_seqs=None,
             causal_mask=True,
         )  # o2 [bs, T, H_local, vd], lse2 [bs, T, H_local]
+
+        if overlap_a2a:
+            # Join: pass-2 was issued while the side stream ran the a2a; gate
+            # the recv-side unpack+combine (current stream) on its completion.
+            torch.cuda.current_stream().wait_event(self._dcp_a2a_join_ev)
+            prefix_full, prefix_lse = dcp_unpack_lse_combine(
+                recv_buf,
+                vd,
+                is_lse_base_on_e=False,
+                return_lse=True,
+            )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
 
         # ---- Combine prefix_full ⊕ pass-2 (base-2 online softmax) ----
         recv_out = torch.stack(
