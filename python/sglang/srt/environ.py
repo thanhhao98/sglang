@@ -354,6 +354,12 @@ class Envs:
     # and the plain variant attends to the identical seq_lens[b]-token local
     # slice. Set to 0 to revert to the cp_world>1 call for A/B.
     SGLANG_DCP_PASS1_NO_CP = EnvBool(True)
+    # DCP verify cascade pass-2: fold the T-token draft chain with the tiny
+    # Triton causal-attention kernel (kernels.dcp_pass2_causal_attn_triton)
+    # instead of the full tokenspeed decode kernel, whose launch/tiling floor
+    # dwarfs the actual <=64-token workload. Also skips the per-layer draft
+    # page-pool build (cat + zeros + copy). Set to 0 to revert for A/B.
+    SGLANG_DCP_TRITON_PASS2 = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
