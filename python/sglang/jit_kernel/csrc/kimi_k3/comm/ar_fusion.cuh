@@ -32,6 +32,13 @@ namespace {
 // two whole bf16 markers (ptxas rejects vector .b64/.f64 forms that would
 // give 8B atoms, and scalar b64 pairs cost two instructions).
 
+// NOTE: an ordinary st.relaxed.sys.v2.b64 to the multicast VA also works
+// (verified bit-exact incl. stress on B200x8; the multicast routing lives
+// in the VA/aperture and both forms lower to the same STG.E.128 desc[]
+// SASS with identical timings) and would give 8B store atoms — but plain
+// accesses to multimem addresses are undefined per the PTX spec, so we
+// stay on the spec-defined multimem.st form.
+
 struct ArFusionParams {
   uint8_t* input;                             // push: tensor pointer (in place); pull_mc: multicast VA of the tensor
   const uint8_t* residual;                    // may be null (compile-time kHasResidual selects)
