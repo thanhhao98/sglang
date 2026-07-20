@@ -19,7 +19,11 @@
 //   * padded cuda-graph slots (index < 0) zero the output row and skip all
 //     pool updates, mirroring kda_packed_decode;
 //   * tvm-ffi host wrapper (KdaFusedDecodeKernel) with TensorMatcher shape /
-//     stride / dtype validation replaces the pybind binding.
+//     stride / dtype validation replaces the pybind binding;
+//   * optional 1D-TMA bulk state load (SGLANG_KDA_FUSED_DECODE_TMA_LOAD),
+//     ported from the standalone KDA_decode/kda_decode_fusion_kernel.cu
+//     experiment on chunan/kda (same mbarrier staging, same 3/4-stage
+//     dispatch by grid size).
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
@@ -30,6 +34,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -165,6 +170,79 @@ __device__ __forceinline__ void cp_async_state_chunk(float *s_state,
                                                      int slot, int i_hv, int HV,
                                                      int chunk) {
   cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, HV, chunk);
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define KDA_FUSED_DECODE_HAS_TMA 1
+#else
+#define KDA_FUSED_DECODE_HAS_TMA 0
+#endif
+
+__device__ __forceinline__ void mbarrier_init_one(uint64_t *bar) {
+#if KDA_FUSED_DECODE_HAS_TMA
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(addr));
+#endif
+}
+
+__device__ __forceinline__ void mbarrier_wait_parity(uint64_t *bar,
+                                                     uint32_t parity) {
+#if KDA_FUSED_DECODE_HAS_TMA
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t done = 0;
+  while (!done) {
+    asm volatile("{\n"
+                 ".reg .pred P;\n"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n"
+                 "selp.b32 %0, 1, 0, P;\n"
+                 "}\n"
+                 : "=r"(done)
+                 : "r"(addr), "r"(parity));
+  }
+#endif
+}
+
+// 1D TMA bulk copy gmem -> smem; the issuing thread arrives with expect-tx on
+// the mbarrier, completion is observed via mbarrier_wait_parity.
+__device__ __forceinline__ void tma_load_1d(float *smem_dst,
+                                            const float *gmem_src,
+                                            uint64_t *bar, uint32_t bytes) {
+#if KDA_FUSED_DECODE_HAS_TMA
+  const uint32_t dst =
+      static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  const uint32_t mbar = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("fence.proxy.async.shared::cta;" ::);
+  asm volatile(
+      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mbar),
+      "r"(bytes));
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::"
+               "bytes [%0], [%1], %2, [%3];" ::"r"(dst),
+               "l"(gmem_src), "r"(bytes), "r"(mbar)
+               : "memory");
+#else
+  __trap();
+#endif
+}
+
+template <int kStageChunkV>
+__device__ __forceinline__ void
+tma_state_chunk_stage(float *s_state, const float *state, int slot, int i_hv,
+                      int HV, int chunk, int stage, uint64_t *bar) {
+  constexpr uint32_t kBytes = kStageChunkV * kDimK * sizeof(float);
+  float *dst = s_state + stage * kStageChunkV * kDimK;
+  const float *src =
+      state + ((slot * HV + i_hv) * kDimV + chunk * kStageChunkV) * kDimK;
+  tma_load_1d(dst, src, bar, kBytes);
+}
+
+bool kda_fused_decode_use_tma_load() {
+  const char *v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_LOAD");
+  return v != nullptr && v[0] == '1';
+}
+
+int kda_fused_decode_tma_stages_override() {
+  const char *v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_STAGES");
+  return v != nullptr ? std::atoi(v) : 0;
 }
 
 __device__ __forceinline__ float block_reduce_sum(float value, float *scratch) {
@@ -331,7 +409,8 @@ template <bool kApplyOnorm, bool kUseStaticDecodeLayout = false,
           bool kPreloadOnormParams = false,
           bool kPrefetchNextStateChunk = false,
           bool kUseActiveOnormReduction = false, bool kUpdateConvState = false,
-          bool kUseLowerBound = false, bool kApplyBetaSigmoid = true>
+          bool kUseLowerBound = false, bool kApplyBetaSigmoid = true,
+          bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
 __global__
 __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
     const __nv_bfloat16 *__restrict__ x_q,
@@ -405,7 +484,9 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   const int hkv_dim = h_count * kDimK;
   const int hvv_dim = hv_count * kDimV;
 
-  __shared__ float s_state[2][kChunkV][kDimK];
+  // Dynamic size: 2 cp.async stages (32KB) or kTmaStages TMA stages (16KB per
+  // stage; kTmaStages == kNumChunks means no buffer reuse).
+  extern __shared__ __align__(16) float s_state[];
   __shared__ float s_q[kDimK];
   __shared__ float s_k[kDimK];
   __shared__ float s_decay[kDimK];
@@ -413,10 +494,32 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   __shared__ float s_o[kDimV];
   __shared__ float s_reduce[kThreads];
   __shared__ float s_beta;
+  __shared__ uint64_t s_tma_bar[kNumChunks];
   float pre_onorm_gate = 0.0f;
   float pre_onorm_weight = 0.0f;
 
-  cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count, 0);
+  if constexpr (kUseTmaLoad) {
+    // Chunk c lives in stage c % kTmaStages behind barrier c % kTmaStages
+    // (wait parity (c / kTmaStages) & 1). Chunks 0/1 are issued here; chunk+2
+    // is issued at the loop top while its stage is still fresh, and chunks
+    // that reuse a stage are issued at the loop bottom behind a
+    // __syncthreads(). Barrier-init visibility for waiting threads is
+    // covered by the __syncthreads() before the chunk loop.
+    if (tid == 0) {
+#pragma unroll
+      for (int c = 0; c < kTmaStages; ++c) {
+        mbarrier_init_one(&s_tma_bar[c]);
+      }
+      tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 0,
+                                     0, &s_tma_bar[0]);
+      if (kTmaStages > 1 && kNumChunks > 1) {
+        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 1,
+                                       1, &s_tma_bar[1]);
+      }
+    }
+  } else {
+    cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, 0);
+  }
 
   if constexpr (kUpdateConvState) {
     if (tid < kDimK) {
@@ -573,8 +676,8 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   }
   __syncthreads();
 
-  if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
-    cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count, 1);
+  if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk && kNumChunks > 1) {
+    cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, 1);
   }
 
   const float q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
@@ -602,7 +705,15 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 
 #pragma unroll
   for (int chunk = 0; chunk < kNumChunks; ++chunk) {
-    if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
+    if constexpr (kUseTmaLoad) {
+      if (tid == 0 && chunk + 2 < kNumChunks && chunk + 2 < kTmaStages) {
+        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count,
+                                       chunk + 2, chunk + 2,
+                                       &s_tma_bar[chunk + 2]);
+      }
+      mbarrier_wait_parity(&s_tma_bar[chunk % kTmaStages],
+                           (chunk / kTmaStages) & 1);
+    } else if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
       if (chunk + 1 < kNumChunks) {
         cp_async_wait_group_1();
       } else {
@@ -611,16 +722,19 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
     } else {
       cp_async_wait_all();
     }
-    if constexpr (!kSkipWarpSync) {
+    if constexpr (!kUseTmaLoad && !kSkipWarpSync) {
       __syncwarp();
     }
 
-    if constexpr (!kPrefetchNextStateChunk) {
+    if constexpr (!kUseTmaLoad && !kPrefetchNextStateChunk) {
       if (chunk + 1 < kNumChunks) {
-        cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count,
-                             chunk + 1);
+        cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, chunk + 1);
       }
     }
+
+    const float *state_stage =
+        s_state +
+        (kUseTmaLoad ? (chunk % kTmaStages) : (chunk & 1)) * kChunkV * kDimK;
 
 #pragma unroll
     for (int row = 0; row < kRowsPerWarp; row += 2) {
@@ -634,9 +748,9 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       float dot_hk_b = 0.0f;
 
       const float4 raw_h_a = *reinterpret_cast<const float4 *>(
-          &s_state[chunk & 1][v_row_a][k_base]);
+          state_stage + v_row_a * kDimK + k_base);
       const float4 raw_h_b = *reinterpret_cast<const float4 *>(
-          &s_state[chunk & 1][v_row_b][k_base]);
+          state_stage + v_row_b * kDimK + k_base);
       h_a_vals[0] = raw_h_a.x * r_decay[0];
       h_a_vals[1] = raw_h_a.y * r_decay[1];
       h_a_vals[2] = raw_h_a.z * r_decay[2];
@@ -698,10 +812,20 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       }
     }
 
-    if constexpr (kPrefetchNextStateChunk) {
+    if constexpr (kUseTmaLoad && kTmaStages < kNumChunks) {
+      // chunk + kTmaStages reuses the stage this chunk just read; every warp
+      // must be done with it before the single issuing thread overwrites it.
+      if (chunk + kTmaStages < kNumChunks) {
+        __syncthreads();
+        if (tid == 0) {
+          tma_state_chunk_stage<kChunkV>(
+              s_state, state, slot, i_hv, hv_count, chunk + kTmaStages,
+              chunk % kTmaStages, &s_tma_bar[chunk % kTmaStages]);
+        }
+      }
+    } else if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk) {
       if (chunk + 2 < kNumChunks) {
-        cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count,
-                             chunk + 2);
+        cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, chunk + 2);
       }
     }
   }
@@ -784,7 +908,10 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 // chunk prefetched, active onorm reduction, conv cache updated in place,
 // beta sigmoid in-kernel. Both forget-gate variants are compiled (softplus
 // and lower-bounded sigmoid) and selected at launch from the model config.
-template <bool kUseLowerBound>
+// kUseTmaLoad/kTmaStages select the optional 1D-TMA state-staging path
+// (SGLANG_KDA_FUSED_DECODE_TMA_LOAD) in place of the default cp.async path.
+template <bool kUseLowerBound, bool kUseTmaLoad = false,
+         int kTmaStages = kNumChunks>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true, /*kUseStaticDecodeLayout=*/true, /*kFixedHeads=*/12,
     /*kFixedValueHeads=*/12, /*kUseHeadGrid=*/true,
@@ -793,7 +920,7 @@ constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kSkipWarpSync=*/false, /*kPreloadOnormParams=*/true,
     /*kPrefetchNextStateChunk=*/true, /*kUseActiveOnormReduction=*/true,
     /*kUpdateConvState=*/true, kUseLowerBound,
-    /*kApplyBetaSigmoid=*/true>;
+    /*kApplyBetaSigmoid=*/true, kUseTmaLoad, kTmaStages>;
 
 struct KdaFusedDecodeKernel {
   static void
@@ -856,10 +983,38 @@ struct KdaFusedDecodeKernel {
     const auto* mixed_ptr = static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr());
     auto* cs_ptr = static_cast<__nv_bfloat16*>(conv_states.data_ptr());
     const auto* bias_ptr = static_cast<const float*>(conv_bias.data_ptr());
-    const auto kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true>
-                                        : kda_fused_decode_k3_kernel<false>;
+    auto kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true>
+                                  : kda_fused_decode_k3_kernel<false>;
+    int tma_stages = 0;
+    if (kda_fused_decode_use_tma_load()) {
+      // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
+      // is small enough that occupancy isn't the limiter; past that the
+      // 48KB 3-stage variant (one sync for the single stage reuse) benches
+      // fastest. Mirrors the KDA_decode standalone-kernel dispatch on
+      // chunan/kda (KDA_DECODE_TMA_LOAD/KDA_DECODE_TMA_STAGES).
+      const int override_stages = kda_fused_decode_tma_stages_override();
+      tma_stages = override_stages != 0 ? override_stages
+                                        : (B * static_cast<int>(kH) >= 1024 ? 3 : 4);
+      if (tma_stages == 2) {
+        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 2>
+                                  : kda_fused_decode_k3_kernel<false, true, 2>;
+      } else if (tma_stages == 3) {
+        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 3>
+                                  : kda_fused_decode_k3_kernel<false, true, 3>;
+      } else {
+        tma_stages = 4;
+        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 4>
+                                  : kda_fused_decode_k3_kernel<false, true, 4>;
+      }
+    }
+    const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
+    const size_t smem_bytes =
+        static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
+    host::RuntimeDeviceCheck(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)));
 
-    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap())(
+    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)(
         kernel,
         /*x_q=*/mixed_ptr,
         /*x_k=*/mixed_ptr + kSeg,
