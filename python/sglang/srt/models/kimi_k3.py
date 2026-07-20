@@ -33,7 +33,14 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, BaseAttnResidual
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    dp_scatter,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
+    is_allocation_symmetric,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -48,13 +55,18 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -78,7 +90,7 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -556,6 +568,29 @@ def _apply_attn_res_torch(
 
 
 # ---------------------------------------------------------------------------
+# DP attention helpers
+#
+# K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
+# input_layernorm / post_attention_layernorm, which the communicator expects
+# to own. Instead the MLP/MoE modules gather/scatter around their own body:
+# attention and the attn-res buffers stay in local (per-DP-rank) token space,
+# the MLP/MoE runs on the DP-gathered global batch with plain full-TP
+# semantics (its internal all-reduces are unchanged and required — the latent
+# reduce must happen in latent space before the norm), and the delayed
+# prefix_sum add stays local, applied after the scatter back.
+# ---------------------------------------------------------------------------
+
+
+def _dp_local_buffer_group():
+    """Symmetric-memory group for the local DP buffer (mirrors
+    CommunicateSummableTensorPairFn._scatter_hidden_states)."""
+    parallel = get_parallel()
+    if parallel.tp_size == parallel.attn_dp_size:
+        return get_tp_group()
+    return parallel.attn_tp_group
+
+
+# ---------------------------------------------------------------------------
 # KimiK3MLP — supports both SiLU and SiTU
 # ---------------------------------------------------------------------------
 
@@ -597,13 +632,30 @@ class KimiK3MLP(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
+        self._dp_attention = is_dp_attention_enabled()
 
     def forward(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        # DP attention only when driven from the decoder layer (forward_batch
+        # given); the shared-experts instance inside KimiK3MoE passes None and
+        # runs on the already-gathered buffer.
+        use_dp = self._dp_attention and forward_batch is not None
+        if use_dp:
+            local_hidden_states = hidden_states
+            hidden_states = get_global_dp_buffer(get_tp_group())
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
+        if use_dp:
+            global_out = hidden_states
+            hidden_states = get_local_dp_buffer(_dp_local_buffer_group())
+            dp_scatter(hidden_states, global_out, forward_batch)
         # TODO(dark): maybe fuse residual with all reduce of down projection
         if prefix_sum is not None:
             hidden_states = hidden_states + prefix_sum
@@ -653,6 +705,7 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        self._dp_attention = is_dp_attention_enabled()
 
         # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
@@ -692,6 +745,12 @@ class KimiK3MoE(nn.Module):
             gemm1_alpha=config.activation_situ_beta,
             gemm1_clamp_limit=config.activation_situ_linear_beta,
             gate_up_interleaved=False,
+            # trtllm fused-routing MoE backends (e.g. nvfp4 w4a4) route inside
+            # the kernel and require the routing method; K3 uses DSv3-style
+            # grouped topk with e_score_correction_bias.
+            routing_method_type=getattr(
+                config, "routing_method_type", RoutingMethodType.DeepSeekV3
+            ),
             prefix=add_prefix("experts", prefix),
         )
 
@@ -954,17 +1013,38 @@ class KimiK3MoE(nn.Module):
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
     def forward(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """A pending prefix_sum is always consumed here: folded into the
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
-        either way)."""
+        either way).
+
+        Under DP attention (forward_batch given) the experts run on the
+        DP-gathered global batch — the internal reduces stay over the full TP
+        group, which is exactly right in gathered space — while prefix_sum
+        stays in local token space, added after the scatter back."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if num_tokens > 0 and self._eligible_for_fused_front:
+        use_dp = self._dp_attention and forward_batch is not None
+        if use_dp:
+            local_hidden_states = hidden_states
+            hidden_states = get_global_dp_buffer(get_tp_group())
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            dp_prefix_sum, prefix_sum = prefix_sum, None
+        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+        if use_dp:
+            global_out = out
+            out = get_local_dp_buffer(_dp_local_buffer_group())
+            dp_scatter(out, global_out, forward_batch)
+            if dp_prefix_sum is not None:
+                out = out + dp_prefix_sum
         return out.view(num_tokens, hidden_size)
 
 
@@ -1222,6 +1302,11 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            # Reduce within the attn-TP group: the default reduce path uses
+            # the full-TP collective, which at attn_tp>1 is both the wrong
+            # group (sums across DP groups) and asymmetric vs idle DP ranks
+            # (deadlocks the per-layer DP gather).
+            use_dp_attention_reduce=True,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -1432,6 +1517,11 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             kv_lora_rank=config.kv_lora_rank,
             skip_rope=True,
         )
+        # K3 has no LayerCommunicator, so o_proj (reduce_results=True by
+        # default here, unlike deepseek's communicator flow) must reduce
+        # within the attn-TP group itself — the default full-TP collective is
+        # the wrong group at attn_tp>1 and deadlocks against idle DP ranks.
+        self.o_proj.use_dp_attention_reduce = True
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -1503,6 +1593,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.is_moe = config.is_moe
         self.layer_idx = layer_idx
+        self._dp_attention = is_dp_attention_enabled()
 
         # Attention
         if config.is_kda_layer(layer_idx):
@@ -1590,6 +1681,45 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        # DP attention: idle ranks (padded to the global shape) have no
+        # attention metadata; pass hidden_states through shape-preserving
+        # (same as the LayerCommunicator models' is_idle skip).
+        if forward_batch.forward_mode.is_idle():
+            return hidden_states
+
+        # DP attention pads extend batches to a multiple of attn_tp_size
+        # (prepare_mlp_sync_batch ceil_align), but the attention metadata
+        # (qo_indptr / query_start_loc) covers only the real tokens — the
+        # flashinfer ragged prefill rejects the row mismatch. Run attention
+        # on the real rows and zero-pad the output back; padded rows are
+        # discarded downstream.
+        num_padded = hidden_states.shape[0]
+        num_real = num_padded
+        if self._dp_attention and forward_batch.forward_mode.is_extend():
+            extend_lens = forward_batch.extend_seq_lens_cpu
+            if extend_lens is not None:
+                num_real = min(int(sum(extend_lens)), num_padded)
+        if num_real != num_padded:
+            attn_out = self._run_self_attn_inner(
+                hidden_states[:num_real],
+                positions[:num_real],
+                forward_batch,
+                zero_allocator,
+            )
+            out = hidden_states.new_zeros(num_padded, attn_out.shape[-1])
+            out[:num_real] = attn_out
+            return out
+        return self._run_self_attn_inner(
+            hidden_states, positions, forward_batch, zero_allocator
+        )
+
+    def _run_self_attn_inner(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
         # For MLA layers with q_lora_rank, set up communicator attn_inputs
         # before the forward call (normally done by LayerCommunicator).
         from sglang.srt.layers.communicator import (
@@ -1645,7 +1775,7 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual
 
     def _forward_attn_residual_clean(
@@ -1691,7 +1821,10 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        return self.mlp(hidden_states, prefix_sum=prefix_sum), None
+        return (
+            self.mlp(hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch),
+            None,
+        )
 
     def _forward_attn_residual_legacy(
         self,
@@ -1787,7 +1920,10 @@ class KimiK3DecoderLayer(nn.Module):
             mlp_valid_blocks,
             self.post_attention_layernorm,
         )
-        return self.mlp(hidden_states, prefix_sum=prefix_sum), None
+        return (
+            self.mlp(hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch),
+            None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1806,12 +1942,16 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        self._dp_attention = is_dp_attention_enabled()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
+                # Under DP attention each rank embeds only its local tokens:
+                # reduce within the attention-TP group, not the full TP group.
+                **get_embedding_tp_kwargs(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -1870,6 +2010,20 @@ class KimiK3LinearModel(nn.Module):
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
+
+        # DP attention pads extend batches to a multiple of attn_tp_size;
+        # attention layers run on the real rows only (_run_self_attn trims),
+        # so the KV write locations must match the trimmed length. positions
+        # and hidden_states keep the padded length for the DP gather/scatter.
+        if (
+            self._dp_attention
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            num_real = int(sum(forward_batch.extend_seq_lens_cpu))
+            if forward_batch.out_cache_loc.shape[0] > num_real:
+                forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_real]
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -1976,6 +2130,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
