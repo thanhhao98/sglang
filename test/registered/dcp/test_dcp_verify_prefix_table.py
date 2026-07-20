@@ -95,7 +95,7 @@ def _build_table(
     table: torch.Tensor,
     eff_page: int,
 ) -> None:
-    from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    from sglang.kernels.ops.kvcache.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )
@@ -142,7 +142,7 @@ class TestDcpVerifyPrefixTable(unittest.TestCase):
     ]
 
     def _run_site(self, page_size: int, persistent: bool):
-        from sglang.srt.layers.attention.triton_ops.kv_indices import (
+        from sglang.kernels.ops.kvcache.kv_indices import (
             get_num_page_per_block_flashmla,
         )
 
