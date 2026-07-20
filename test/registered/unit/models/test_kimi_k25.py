@@ -25,6 +25,8 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     KimiK2_5VLImageProcessor,
     _expand_image_token_ids,
+    _grid_thw_from_resize_config,
+    _normalize_image,
     _resize_images_by_source_shape,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -63,6 +65,48 @@ class _HFProcessor:
 def test_kimi_processors_precompute_hash_before_cpu_transfer():
     assert KimiK2_5VLImageProcessor.precompute_hash_before_cpu_transfer
     assert KimiK3ImageProcessor.precompute_hash_before_cpu_transfer
+
+
+def test_kimi_k3_builds_grid_metadata_on_cpu_from_resize_config():
+    config = {
+        "new_height": 224,
+        "new_width": 322,
+        "pad_height": 0,
+        "pad_width": 14,
+    }
+
+    grid_thw = torch.tensor(
+        [_grid_thw_from_resize_config(config, patch_size=14)], dtype=torch.int64
+    )
+
+    assert grid_thw.device.type == "cpu"
+    assert grid_thw.tolist() == [[1, 16, 24]]
+
+
+def test_kimi_fused_image_normalization_matches_reference():
+    image = torch.linspace(0.0, 255.0, 3 * 8 * 8).reshape(1, 3, 8, 8)
+    image_mean_values = [0.48145466, 0.4578275, 0.40821073]
+    image_std_values = [0.26862954, 0.26130258, 0.27577711]
+    wrapper = KimiGPUProcessorWrapper(
+        _HFProcessor(),
+        image_token="<|media_pad|>",
+        image_token_id=42,
+        patch_size=14,
+        merge_kernel_size=2,
+        in_patch_limit=16384,
+        patch_limit_on_one_side=256,
+        fixed_output_tokens=None,
+        image_mean=image_mean_values,
+        image_std=image_std_values,
+    )
+    image_scale, image_bias = wrapper._get_gpu_norm_tensors(device="cpu")
+    image_mean = torch.tensor(image_mean_values).view(1, 3, 1, 1)
+    image_std = torch.tensor(image_std_values).view(1, 3, 1, 1)
+
+    actual = _normalize_image(image, image_scale, image_bias)
+    expected = (image / 255.0 - image_mean) / image_std
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize(

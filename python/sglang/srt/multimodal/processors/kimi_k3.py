@@ -28,6 +28,8 @@ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
+    _grid_thw_from_resize_config,
+    _normalize_image,
     navit_resize_config,
 )
 
@@ -91,11 +93,11 @@ def _fill_transparent_bg(x: torch.Tensor, bg_cfg: Union[dict, None]) -> torch.Te
 def _k3_process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
-    image_mean: torch.Tensor,
-    image_std_inv: torch.Tensor,
+    image_scale: torch.Tensor,
+    image_bias: torch.Tensor,
     patch_size: int,
     transparent_bg_config: Union[dict, None],
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     image = _k3_to_cuda_chw(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
@@ -108,8 +110,7 @@ def _k3_process_single_image(
     if pad_h > 0 or pad_w > 0:
         x = F.pad(x, (0, pad_w, 0, pad_h), value=0.0)
 
-    x = x / 255.0
-    x = (x - image_mean) * image_std_inv
+    x = _normalize_image(x, image_scale, image_bias)
 
     _, C, H, W = x.shape
     T = 1
@@ -117,12 +118,10 @@ def _k3_process_single_image(
     x = x.view(T, C, gh, patch_size, gw, patch_size)
     x = x.permute(0, 2, 4, 1, 3, 5).reshape(-1, C, patch_size, patch_size)
 
-    grid_thw = torch.tensor([T, gh, gw], dtype=torch.int64, device=x.device)
-    return x, grid_thw
+    return x
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
-
     def __init__(self, *args, transparent_bg_config=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._transparent_bg_config = transparent_bg_config
@@ -149,23 +148,24 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             input_text, resize_configs, original_input_ids
         )
 
-        image_mean, image_std_inv = self._get_gpu_norm_tensors()
+        image_scale, image_bias = self._get_gpu_norm_tensors()
         patches = []
         grids = []
         for image, config in zip(images, resize_configs):
-            p, g = _k3_process_single_image(
-                image,
-                config,
-                image_mean,
-                image_std_inv,
-                self._patch_size,
-                self._transparent_bg_config,
+            patches.append(
+                _k3_process_single_image(
+                    image,
+                    config,
+                    image_scale,
+                    image_bias,
+                    self._patch_size,
+                    self._transparent_bg_config,
+                )
             )
-            patches.append(p)
-            grids.append(g)
+            grids.append(_grid_thw_from_resize_config(config, self._patch_size))
 
         pixel_values = torch.cat(patches, dim=0)
-        grid_thws = torch.stack(grids, dim=0).cpu()
+        grid_thws = torch.tensor(grids, dtype=torch.int64)
 
         return {
             "input_ids": input_ids,

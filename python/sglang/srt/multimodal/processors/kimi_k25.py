@@ -122,9 +122,8 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     consistent channel dimension. Normalize every tensor to 3 channels.
 
     Also move the tensor to the GPU (matching _pil_to_cuda_chw) so a CPU
-    input does not trip a device mismatch against the CUDA image_mean /
-    image_std_inv normalization constants downstream. No-op if already on
-    the device.
+    input does not trip a device mismatch against the CUDA normalization
+    constants downstream. No-op if already on the device.
     """
     image = image.cuda()
     if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
@@ -138,13 +137,25 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     return image[:3]
 
 
+def _grid_thw_from_resize_config(config: dict, patch_size: int) -> tuple[int, int, int]:
+    height = config["new_height"] + config["pad_height"]
+    width = config["new_width"] + config["pad_width"]
+    return 1, height // patch_size, width // patch_size
+
+
+def _normalize_image(
+    image: torch.Tensor, image_scale: torch.Tensor, image_bias: torch.Tensor
+) -> torch.Tensor:
+    return torch.addcmul(image_bias, image, image_scale)
+
+
 def _process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
-    image_mean: torch.Tensor,
-    image_std_inv: torch.Tensor,
+    image_scale: torch.Tensor,
+    image_bias: torch.Tensor,
     patch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
     if isinstance(image, Image.Image):
         image = _pil_to_cuda_chw(image)
@@ -160,8 +171,7 @@ def _process_single_image(
     if pad_h > 0 or pad_w > 0:
         x = F.pad(x, (0, pad_w, 0, pad_h), value=0.0)
 
-    x = x / 255.0
-    x = (x - image_mean) * image_std_inv
+    x = _normalize_image(x, image_scale, image_bias)
 
     _, C, H, W = x.shape
     T = 1
@@ -169,8 +179,7 @@ def _process_single_image(
     x = x.view(T, C, gh, patch_size, gw, patch_size)
     x = x.permute(0, 2, 4, 1, 3, 5).reshape(-1, C, patch_size, patch_size)
 
-    grid_thw = torch.tensor([T, gh, gw], dtype=torch.int64, device=x.device)
-    return x, grid_thw
+    return x
 
 
 def _resize_images_by_source_shape(
@@ -219,8 +228,8 @@ def _resize_images_by_source_shape(
 def _gpu_preprocess_images(
     images: list[Union[torch.Tensor, Image.Image]],
     resize_configs: list[dict],
-    image_mean: torch.Tensor,
-    image_std_inv: torch.Tensor,
+    image_scale: torch.Tensor,
+    image_bias: torch.Tensor,
     patch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
@@ -229,10 +238,10 @@ def _gpu_preprocess_images(
     """
     n = len(images)
     if n == 0:
-        device = image_mean.device
+        device = image_scale.device
         return (
             torch.empty(0, 3, patch_size, patch_size, device=device),
-            torch.empty(0, 3, dtype=torch.int64, device=device),
+            torch.empty(0, 3, dtype=torch.int64),
         )
 
     groups = defaultdict(list)
@@ -249,11 +258,11 @@ def _gpu_preprocess_images(
     for (target_h, target_w, padded_h, padded_w), group in groups.items():
         if len(group) == 1:
             idx, image, config = group[0]
-            patches, grid = _process_single_image(
-                image, config, image_mean, image_std_inv, patch_size
+            patches = _process_single_image(
+                image, config, image_scale, image_bias, patch_size
             )
             all_patches[idx] = patches
-            all_grids[idx] = grid
+            all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
         else:
             indexed_images = []
             for idx, image, _ in group:
@@ -277,8 +286,7 @@ def _gpu_preprocess_images(
             if pad_h > 0 or pad_w > 0:
                 batch = F.pad(batch, (0, pad_w, 0, pad_h), value=0.0)
 
-            batch = batch / 255.0
-            batch = (batch - image_mean) * image_std_inv
+            batch = _normalize_image(batch, image_scale, image_bias)
 
             B, C, H, W = batch.shape
             T = 1
@@ -288,13 +296,13 @@ def _gpu_preprocess_images(
                 B, -1, C, patch_size, patch_size
             )
 
-            grid = torch.tensor([T, gh, gw], dtype=torch.int64, device=batch.device)
+            grid = (T, gh, gw)
             for i, (idx, _, _) in enumerate(group):
                 all_patches[idx] = batch[i]
                 all_grids[idx] = grid
 
     pixel_values = torch.cat(all_patches, dim=0)
-    grid_thws = torch.stack(all_grids, dim=0)
+    grid_thws = torch.tensor(all_grids, dtype=torch.int64)
     return pixel_values, grid_thws
 
 
@@ -405,12 +413,10 @@ class KimiGPUProcessorWrapper:
         )
 
         # 3. GPU image preprocessing
-        image_mean, image_std_inv = self._get_gpu_norm_tensors()
+        image_scale, image_bias = self._get_gpu_norm_tensors()
         pixel_values, grid_thws = _gpu_preprocess_images(
-            images, resize_configs, image_mean, image_std_inv, self._patch_size
+            images, resize_configs, image_scale, image_bias, self._patch_size
         )
-
-        grid_thws = grid_thws.cpu()
 
         return {
             "input_ids": input_ids,
@@ -446,13 +452,17 @@ class KimiGPUProcessorWrapper:
 
     def _get_gpu_norm_tensors(self, device="cuda"):
         if self._gpu_norm_tensors is None:
-            image_mean = torch.tensor(
-                self._image_mean, device=device, dtype=torch.float32
+            image_scale = torch.tensor(
+                [1.0 / (255.0 * std) for std in self._image_std],
+                device=device,
+                dtype=torch.float32,
             ).view(1, 3, 1, 1)
-            image_std_inv = (
-                1.0 / torch.tensor(self._image_std, device=device, dtype=torch.float32)
+            image_bias = torch.tensor(
+                [-mean / std for mean, std in zip(self._image_mean, self._image_std)],
+                device=device,
+                dtype=torch.float32,
             ).view(1, 3, 1, 1)
-            self._gpu_norm_tensors = (image_mean, image_std_inv)
+            self._gpu_norm_tensors = (image_scale, image_bias)
         return self._gpu_norm_tensors
 
 
