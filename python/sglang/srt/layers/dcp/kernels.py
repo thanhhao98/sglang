@@ -338,6 +338,7 @@ def correct_attn_out(
 # Used by the a2a / fi_a2a communication backends (see comm.py).
 # ---------------------------------------------------------------------------
 
+
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:
     """Number of output-dtype elements needed to store one fp32 LSE value."""
     return torch.finfo(torch.float32).bits // torch.finfo(output_dtype).bits
@@ -529,3 +530,164 @@ def _lse_weighted_combine_cpu(
     # Weighted sum: [N, B, H_local, D] * [N, B, H_local, 1] -> sum -> [B, H_local, D]
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Fused mask+pack for the DCP verify cascade: build the a2a send buffer
+# (comm.dcp_a2a_lse_reduce eager layout) directly from the strided pass-1
+# outputs, applying the zero-owner row mask inline. Replaces, per layer:
+# 2x torch.where + 2x .contiguous() + the two pack copies (~6 kernels).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dcp_mask_pack_kernel(
+    o_ptr,
+    lse_ptr,
+    zero_ptr,
+    send_ptr,
+    send_f32_ptr,
+    o_stride_b,
+    o_stride_t,
+    o_stride_h,
+    o_stride_d,
+    lse_stride_b,
+    lse_stride_t,
+    lse_stride_h,
+    send_stride_n,
+    send_stride_tok,
+    send_stride_h,
+    sendf_stride_n,
+    sendf_stride_tok,
+    sendf_stride_h,
+    T,
+    H_PER_RANK,
+    LSE_F32_IDX,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One program per (token, full head): write the head's D output values
+    into send[rank_slot, token, local_head, :D] and its fp32 LSE into the
+    packed tail (through the fp32 alias of the same buffer). Masked batch
+    rows (zero_ptr[b] != 0) get out -> 0 and lse -> -inf, bit-identical to
+    the torch.where pair they replace (pure select, no dtype promotion)."""
+    tok = tl.program_id(0).to(tl.int64)
+    hf = tl.program_id(1).to(tl.int64)
+    b = tok // T
+    t = tok - b * T
+    n = hf // H_PER_RANK
+    h = hf - n * H_PER_RANK
+
+    masked = tl.load(zero_ptr + b) != 0
+
+    d_off = tl.arange(0, BLOCK_D)
+    d_msk = d_off < D
+    o = tl.load(
+        o_ptr + b * o_stride_b + t * o_stride_t + hf * o_stride_h + d_off * o_stride_d,
+        mask=d_msk,
+    )
+    o = tl.where(masked, tl.zeros_like(o), o)
+    tl.store(
+        send_ptr
+        + n * send_stride_n
+        + tok * send_stride_tok
+        + h * send_stride_h
+        + d_off,
+        o,
+        mask=d_msk,
+    )
+
+    lse = tl.load(lse_ptr + b * lse_stride_b + t * lse_stride_t + hf * lse_stride_h).to(
+        tl.float32
+    )
+    lse = tl.where(masked, float("-inf"), lse)
+    tl.store(
+        send_f32_ptr
+        + n * sendf_stride_n
+        + tok * sendf_stride_tok
+        + h * sendf_stride_h
+        + LSE_F32_IDX,
+        lse,
+    )
+
+
+def dcp_mask_pack_triton(
+    o1: torch.Tensor,
+    lse1: torch.Tensor,
+    zero_mask: torch.Tensor,
+    cp_world: int,
+    send_buf: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused zero-owner mask + a2a-send pack for the DCP verify cascade.
+
+    Produces EXACTLY the eager send layout of ``comm.dcp_a2a_lse_reduce``:
+    ``send_combined [cp_world, bs*T, H_per_rank, D + lse_pack_dim]`` in the
+    output dtype, with the fp32 LSE bit-packed (reinterpreted as output-dtype
+    elements) into the ``[D:]`` tail columns. The zero-owner row mask is
+    applied inline (masked rows: out -> 0, lse -> -inf), collapsing the two
+    ``torch.where``, the two ``.contiguous()`` and the pack copies of the old
+    path into a single kernel.
+
+    Args:
+        o1:        [bs, T, H_full, D] pass-1 attention output (any stride).
+        lse1:      [bs, T, H_full]    fp32 pass-1 LSE (any stride).
+        zero_mask: [bs] bool — requests whose rank-local prefix is empty.
+        cp_world:  DCP world size (H_full % cp_world == 0).
+        send_buf:  optional preallocated [cp_world, bs*T, H_per_rank, D+lpd]
+                   contiguous buffer in ``o1.dtype``.
+
+    Returns:
+        The packed send buffer, ready for the byte-level all_to_all
+        (``comm.dcp_a2a_exchange_packed``).
+    """
+    bs, T, H_full, D = o1.shape
+    assert (
+        H_full % cp_world == 0
+    ), f"num_heads ({H_full}) must be divisible by dcp_size ({cp_world})"
+    H_per_rank = H_full // cp_world
+    out_dtype = o1.dtype
+    lpd = _lse_pack_dim(out_dtype)
+    itemsize = out_dtype.itemsize
+    # The fp32 LSE tail is written through an fp32 alias of the send buffer,
+    # so every LSE slot must be 4-byte aligned.
+    assert (D * itemsize) % 4 == 0 and ((D + lpd) * itemsize) % 4 == 0, (
+        f"dcp_mask_pack_triton needs 4-byte-aligned LSE slots "
+        f"(D={D}, itemsize={itemsize}, lse_pack_dim={lpd})"
+    )
+    assert lse1.dtype == torch.float32 and zero_mask.dtype == torch.bool
+
+    B = bs * T
+    if send_buf is None:
+        send_buf = torch.empty(
+            (cp_world, B, H_per_rank, D + lpd), dtype=out_dtype, device=o1.device
+        )
+    assert send_buf.is_contiguous() and send_buf.dtype == out_dtype
+    send_f32 = send_buf.view(torch.float32)
+
+    grid = (B, H_full)
+    _dcp_mask_pack_kernel[grid](
+        o1,
+        lse1,
+        zero_mask.view(torch.uint8),
+        send_buf,
+        send_f32,
+        o1.stride(0),
+        o1.stride(1),
+        o1.stride(2),
+        o1.stride(3),
+        lse1.stride(0),
+        lse1.stride(1),
+        lse1.stride(2),
+        send_buf.stride(0),
+        send_buf.stride(1),
+        send_buf.stride(2),
+        send_f32.stride(0),
+        send_f32.stride(1),
+        send_f32.stride(2),
+        T,
+        H_per_rank,
+        (D * itemsize) // 4,
+        D=D,
+        BLOCK_D=triton.next_power_of_2(D),
+    )
+    return send_buf

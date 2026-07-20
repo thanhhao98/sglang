@@ -26,8 +26,10 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
 from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
+    dcp_a2a_lse_reduce_prepacked,
     dcp_enabled,
     dcp_lse_combine_triton,
+    dcp_mask_pack_triton,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
     get_dcp_lens,
@@ -236,6 +238,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+
+        # DCP verify cascade: fused mask+pack A/B flag, cached once (read per
+        # layer otherwise). See _forward_verify_dcp.
+        self._dcp_fused_pack = envs.SGLANG_DCP_FUSED_PACK.get()
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -1186,16 +1192,34 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if metadata.dcp_zero_mask is not None
             else local_prefix == 0
         )
-        o1 = torch.where(zero.view(bs, 1, 1, 1), o1.new_zeros(()), o1)
-        lse1 = torch.where(zero.view(bs, 1, 1), lse1.new_full((), float("-inf")), lse1)
-        prefix_full, prefix_lse = dcp_a2a_lse_reduce(
-            o1.reshape(N, H_full, vd).contiguous(),
-            lse1.reshape(N, H_full).contiguous(),
-            get_dcp_group(),
-            is_lse_base_on_e=False,
-            comm_backend=get_global_server_args().dcp_comm_backend,
-            return_lse=True,
-        )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
+        comm_backend = get_global_server_args().dcp_comm_backend
+        # Fused mask+pack (SGLANG_DCP_FUSED_PACK=0 reverts): one Triton kernel
+        # builds the a2a send buffer straight from the strided pass-1 outputs,
+        # replacing 2x torch.where + 2x .contiguous() + the pack copies. Only
+        # the a2a backend consumes the packed layout (fi_a2a packs its own).
+        use_fused_pack = self._dcp_fused_pack and comm_backend == "a2a"
+        if use_fused_pack:
+            send_buf = dcp_mask_pack_triton(o1, lse1, zero, dcp_world)
+            prefix_full, prefix_lse = dcp_a2a_lse_reduce_prepacked(
+                send_buf,
+                vd,
+                get_dcp_group(),
+                is_lse_base_on_e=False,
+                return_lse=True,
+            )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
+        else:
+            o1 = torch.where(zero.view(bs, 1, 1, 1), o1.new_zeros(()), o1)
+            lse1 = torch.where(
+                zero.view(bs, 1, 1), lse1.new_full((), float("-inf")), lse1
+            )
+            prefix_full, prefix_lse = dcp_a2a_lse_reduce(
+                o1.reshape(N, H_full, vd).contiguous(),
+                lse1.reshape(N, H_full).contiguous(),
+                get_dcp_group(),
+                is_lse_base_on_e=False,
+                comm_backend=comm_backend,
+                return_lse=True,
+            )  # prefix_full [N, H_local, vd], prefix_lse [N, H_local]
 
         # ---- Pass-2: local causal-chain draft fold (drafts NOT sharded) ----
         q_local = q[
