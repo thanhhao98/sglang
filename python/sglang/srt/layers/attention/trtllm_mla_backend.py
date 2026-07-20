@@ -142,6 +142,15 @@ class TRTLLMMLADecodeMetadata:
     # max_seq_len for CUDA graph (None on the eager path).
     dcp_prefix_block_kv_indices: Optional[torch.Tensor] = None
     dcp_prefix_local_max: Optional[int] = None
+    # DCP verify per-STEP hoists (layer-invariant; previously recomputed in
+    # every layer's _forward_verify_dcp call = 61x per step): the rank-local
+    # prefix lengths, the zero-owner mask, and the pass-2 block-table/seq
+    # constants. Filled by init_forward_metadata (eager) or
+    # _apply_cuda_graph_metadata (replay prep).
+    dcp_local_prefix: Optional[torch.Tensor] = None
+    dcp_zero_mask: Optional[torch.Tensor] = None
+    dcp_draft_bt: Optional[torch.Tensor] = None
+    dcp_draft_seq: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -446,6 +455,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.dcp_prefix_local_max = max(
                 (self.max_context_len + dcp_world - 1) // dcp_world, 1
             )
+            # Persistent per-step hoist buffers for the verify cascade. The
+            # graph captures these tensors' ADDRESSES, so replay-prep must
+            # write them IN PLACE (see _apply_cuda_graph_metadata); the pass-2
+            # block table / seq-len constants are truly static per bs.
+            metadata.dcp_local_prefix = torch.zeros(
+                (bs,), dtype=torch.int32, device=device
+            )
+            metadata.dcp_zero_mask = torch.zeros((bs,), dtype=torch.bool, device=device)
+            metadata.dcp_draft_bt = torch.arange(
+                bs, dtype=torch.int32, device=device
+            ).view(bs, 1)
+            metadata.dcp_draft_seq = torch.full(
+                (bs,), self.num_draft_tokens, dtype=torch.int32, device=device
+            )
 
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
@@ -525,6 +548,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 metadata.dcp_prefix_block_kv_indices.shape[1],
                 PAGED_SIZE=eff_page,
             )
+            # Refresh the per-step hoist buffers IN PLACE (captured addresses).
+            metadata.dcp_local_prefix.copy_(
+                get_dcp_lens(
+                    prefix_lens,
+                    get_attention_dcp_world_size(),
+                    get_attention_dcp_rank(),
+                )
+            )
+            torch.eq(metadata.dcp_local_prefix, 0, out=metadata.dcp_zero_mask)
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -747,6 +779,22 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
                 self.forward_decode_metadata.dcp_prefix_block_kv_indices = (
                     dcp_prefix_bt
+                )
+                # Per-STEP hoists for the verify cascade (layer-invariant;
+                # previously rebuilt 61x per step inside _forward_verify_dcp).
+                md = self.forward_decode_metadata
+                md.dcp_local_prefix = get_dcp_lens(
+                    prefix_lens, dcp_world, get_attention_dcp_rank()
+                ).to(torch.int32)
+                md.dcp_zero_mask = md.dcp_local_prefix == 0
+                md.dcp_draft_bt = torch.arange(
+                    bs, dtype=torch.int32, device=seq_lens.device
+                ).view(bs, 1)
+                md.dcp_draft_seq = torch.full(
+                    (bs,),
+                    self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
                 )
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
@@ -1087,8 +1135,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # ---- Pass-1: non-causal prefix fold over the local strided slice ----
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
-        global_prefix = forward_batch.seq_lens.to(torch.int32)  # prefix = seq_lens_k - T
-        local_prefix = get_dcp_lens(global_prefix, dcp_world, dcp_rank).to(torch.int32)
+        global_prefix = forward_batch.seq_lens.to(
+            torch.int32
+        )  # prefix = seq_lens_k - T
+        # Layer-invariant values hoisted to per-step metadata (fallback keeps
+        # the old inline path for callers without the hoist).
+        if metadata.dcp_local_prefix is not None:
+            local_prefix = metadata.dcp_local_prefix
+        else:
+            local_prefix = get_dcp_lens(global_prefix, dcp_world, dcp_rank).to(
+                torch.int32
+            )
         local_prefix_max = metadata.dcp_prefix_local_max
         if local_prefix_max is None:
             local_prefix_max = (
@@ -1109,7 +1166,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         # o1 [bs, T, H_full, vd], lse1 [bs, T, H_full]. Mask requests this rank
         # owns no prefix tokens for (local prefix len == 0).
-        zero = local_prefix == 0
+        zero = (
+            metadata.dcp_zero_mask
+            if metadata.dcp_zero_mask is not None
+            else local_prefix == 0
+        )
         o1 = torch.where(zero.view(bs, 1, 1, 1), o1.new_zeros(()), o1)
         lse1 = torch.where(
             zero.view(bs, 1, 1), lse1.new_full((), float("-inf")), lse1
@@ -1134,8 +1195,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         draft_pool = draft_latent.new_zeros(bs, self.page_size, self.kv_cache_dim)
         draft_pool[:, :T, :] = draft_latent.reshape(bs, T, self.kv_cache_dim)
         draft_pool = draft_pool.unsqueeze(1)  # [bs, 1, page_size, kv_cache_dim]
-        draft_bt = torch.arange(bs, dtype=torch.int32, device=q.device).view(bs, 1)
-        draft_seq = torch.full((bs,), T, dtype=torch.int32, device=q.device)
+        if metadata.dcp_draft_bt is not None:
+            draft_bt = metadata.dcp_draft_bt
+            draft_seq = metadata.dcp_draft_seq
+        else:
+            draft_bt = torch.arange(bs, dtype=torch.int32, device=q.device).view(bs, 1)
+            draft_seq = torch.full((bs,), T, dtype=torch.int32, device=q.device)
         o2, lse2 = self._run_decode_kernel(
             query=q_local,
             kv_cache=draft_pool,
