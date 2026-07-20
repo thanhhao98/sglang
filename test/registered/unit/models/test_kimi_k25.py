@@ -212,11 +212,15 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
         torch.testing.assert_close(result, reference)
 
 
-def test_kimi_expands_pre_tokenized_image_placeholders():
-    input_ids = [1, 99, 2, 99, 3]
-
+@pytest.mark.parametrize(
+    "input_ids",
+    ([1, 99, 2, 99, 3], torch.tensor([[1, 99, 2, 99, 3]], dtype=torch.int32)),
+)
+def test_kimi_expands_pre_tokenized_image_placeholders(input_ids):
     actual = _expand_image_token_ids(input_ids, 99, [3, 2])
 
+    assert actual.dtype == torch.long
+    assert actual.device.type == "cpu"
     assert actual.tolist() == [[1, 99, 99, 99, 2, 99, 99, 3]]
 
 

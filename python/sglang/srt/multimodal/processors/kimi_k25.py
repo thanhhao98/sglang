@@ -86,24 +86,20 @@ def _expand_image_token_ids(
 ) -> torch.Tensor:
     """Expand one placeholder per image without tokenizing the media string again."""
     if isinstance(input_ids, torch.Tensor):
-        input_ids = input_ids.flatten().tolist()
+        input_ids = input_ids.detach().flatten().cpu().numpy()
+    input_ids = np.asarray(input_ids, dtype=np.int64)
 
-    placeholder_count = sum(token == image_token_id for token in input_ids)
+    placeholder_mask = input_ids == image_token_id
+    placeholder_count = np.count_nonzero(placeholder_mask)
     if placeholder_count != len(image_token_counts):
         raise ValueError(
             f"Expected {len(image_token_counts)} image placeholder token(s), "
             f"found {placeholder_count}."
         )
 
-    expanded = []
-    image_index = 0
-    for token in input_ids:
-        if token == image_token_id:
-            expanded.extend([image_token_id] * image_token_counts[image_index])
-            image_index += 1
-        else:
-            expanded.append(token)
-    return torch.tensor([expanded], dtype=torch.long)
+    repeats = np.ones(input_ids.shape, dtype=np.int64)
+    repeats[placeholder_mask] = image_token_counts
+    return torch.from_numpy(np.repeat(input_ids, repeats)).unsqueeze(0)
 
 
 def _pil_to_cuda_chw(image: Image.Image) -> torch.Tensor:
