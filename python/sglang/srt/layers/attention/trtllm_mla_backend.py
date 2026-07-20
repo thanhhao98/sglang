@@ -29,12 +29,12 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.dcp import (
     dcp_a2a_exchange_packed,
     dcp_a2a_lse_reduce,
@@ -53,6 +53,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -1140,7 +1141,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k_rope: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        metadata: "TRTLLMMLADecodeMetadata",
+        metadata: TRTLLMMLADecodeMetadata,
     ) -> torch.Tensor:
         """DCP target-verify via the validated 2-pass cascade.
 

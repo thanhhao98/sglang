@@ -31,11 +31,11 @@ out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
+    dcp_lse_combine_triton,
+    dcp_mask_pack_triton,
+    dcp_pass2_causal_attn_triton,
 )
 from sglang.srt.layers.dcp.comm import (
-    dcp_a2a_exchange_packed,
-    dcp_a2a_lse_reduce_prepacked,
-    dcp_unpack_lse_combine,
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -43,18 +43,15 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
+    dcp_a2a_exchange_packed,
     dcp_a2a_lse_reduce,
+    dcp_a2a_lse_reduce_prepacked,
     dcp_enabled,
+    dcp_unpack_lse_combine,
     draft_forward_guard,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
-    draft_forward_guard,
     init_fi_a2a_workspace,
-)
-from sglang.kernels.ops.attention.dcp_kernels import (
-    dcp_lse_combine_triton,
-    dcp_mask_pack_triton,
-    dcp_pass2_causal_attn_triton,
 )
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,

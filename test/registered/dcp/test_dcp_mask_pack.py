@@ -241,12 +241,12 @@ class TestMaskPackE2EOldVsNew(unittest.TestCase):
     N, BS, T, H_FULL, D = 4, 5, 3, 8, 64
 
     def test_e2e_old_vs_new(self):
+        from sglang.srt.layers.dcp import dcp_mask_pack_triton
         from sglang.srt.layers.dcp.comm import (
             dcp_a2a_exchange_packed,
             dcp_a2a_lse_reduce,
             dcp_unpack_lse_combine,
         )
-        from sglang.srt.layers.dcp import dcp_mask_pack_triton
 
         torch.manual_seed(23)
         N, bs, T, H, D = self.N, self.BS, self.T, self.H_FULL, self.D

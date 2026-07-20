@@ -187,6 +187,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_host_cpu_arm64,
     is_npu,
     numa_utils,
