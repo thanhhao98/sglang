@@ -23,14 +23,14 @@
 
 namespace {
 
-// The push protocol uses the same per-bf16-element zero markers as the
-// generic CustomAllReduceV2 push (clear_pos_zero / is_pos_zero from
-// custom_all_reduce.cuh): +0.0 elements are remapped to -0.0 (a no-op for
-// the sum), so a slot whose every element is non-+0 has fully arrived.
-// Element granularity is what makes a single multimem.st.weak.v4.f32 legal
-// here — its 4B elements are stored independently, and each 4B atom holds
-// two whole bf16 markers (ptxas rejects vector .b64/.f64 forms that would
-// give 8B atoms, and scalar b64 pairs cost two instructions).
+// Zero-marker protocol at bf16x2 (u32) granularity — the atom size of the
+// single multimem.st.weak.v4.f32 the producer uses (ptxas rejects the
+// vector .b64/.f64 forms that would give 8B atoms, and scalar b64 pairs
+// cost two instructions). An all-zero u32 is the "slot empty" marker, so
+// the producer remaps only all-zero bf16x2 pairs to 0x00008000 (a single
+// -0.0 bf16: sum-neutral and non-zero); a u32 with one +0.0 half is
+// already non-zero and needs no touch. The poll then just checks each
+// received u32 against 0.
 
 // NOTE: an ordinary st.relaxed.sys.v2.b64 to the multicast VA also works
 // (verified bit-exact incl. stress on B200x8; the multicast routing lives
@@ -76,15 +76,17 @@ __global__ __launch_bounds__(1024, 1)  //
   const auto push_ptr = params.push_ws_mc + r * stride_bytes + phase_stride_bytes;
   const auto poll_ptr = params.push_ws_local + phase_stride_bytes;
 
-  // stage 1: multicast-push local data, remapping +0.0 elements
+  // stage 1: multicast-push local data, remapping all-zero bf16x2 pairs
+  static_assert(fp_trait<bf16_t>::pos_zero == 0, "the empty marker is all-zero bits");
+  constexpr uint32_t kNegZeroPair = 0x8000u;  // {-0.0, +0.0}: sum-neutral, non-zero
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec;
     ld_global_16B(vec, params.input, vid);
-#pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      clear_pos_zero(vec[j].x);
-      clear_pos_zero(vec[j].y);
-    }
+    auto& bits = *reinterpret_cast<uint4*>(&vec);
+    if (bits.x == 0) bits.x = kNegZeroPair;
+    if (bits.y == 0) bits.y = kNegZeroPair;
+    if (bits.z == 0) bits.z = kNegZeroPair;
+    if (bits.w == 0) bits.w = kNegZeroPair;
     st_multimem_16B(vec, push_ptr, vid);
   }
 
@@ -100,9 +102,8 @@ __global__ __launch_bounds__(1024, 1)  //
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
         ld_relaxed_16B(vec[i], poll_ptr + i * stride_bytes, vid);
-        // 4B-atom granularity arrival check: the producer cleared every +0
-        // element, so a written u32 is never 0 and never contains a +0 half;
-        // u32 == 0 <=> the atom still holds the empty marker.
+        // the producer remapped all-zero pairs, so a written u32 is never
+        // 0: u32 == 0 <=> the 4B atom still holds the empty marker
         const auto bits = *reinterpret_cast<const uint4*>(&vec[i]);
         has_zero |= bits.x == 0;
         has_zero |= bits.y == 0;
