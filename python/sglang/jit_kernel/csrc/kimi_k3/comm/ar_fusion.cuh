@@ -23,54 +23,14 @@
 
 namespace {
 
-namespace ptx {
-
-// The push protocol needs 8-byte atoms: the "slot empty" marker is a fully
-// zero 8-byte group, so producers store and consumers load in units whose
-// atomicity matches the marker granularity (v2.b64 = 2 independent 8B atoms).
-
-template <typename V>
-SGL_DEVICE void ld_global_16B_atom8B(V& x, const void* addr, int64_t vec_offset) {
-  static_assert(alignof(V) == 16 && sizeof(V) == 16);
-  addr = static_cast<const uint8_t*>(addr) + vec_offset * sizeof(V);
-  ulong2 val;
-  asm volatile("ld.global.v2.b64 {%0, %1}, [%2];" : "=l"(val.x), "=l"(val.y) : "l"(addr));
-  x = *reinterpret_cast<const V*>(&val);
-}
-
-template <typename V>
-SGL_DEVICE void ld_relaxed_16B_atom8B(V& x, const void* addr, int64_t vec_offset) {
-  static_assert(alignof(V) == 16 && sizeof(V) == 16);
-  addr = static_cast<const uint8_t*>(addr) + vec_offset * sizeof(V);
-  ulong2 val;
-  asm volatile("ld.relaxed.sys.global.v2.b64 {%0, %1}, [%2];" : "=l"(val.x), "=l"(val.y) : "l"(addr) : "memory");
-  x = *reinterpret_cast<const V*>(&val);
-}
-
-template <typename V>
-SGL_DEVICE void st_global_16B_atom8B(const V& x, void* addr, int64_t vec_offset) {
-  static_assert(alignof(V) == 16 && sizeof(V) == 16);
-  const auto val = *reinterpret_cast<const ulong2*>(&x);
-  addr = static_cast<uint8_t*>(addr) + vec_offset * sizeof(V);
-  asm volatile("st.global.v2.b64 [%2], {%0, %1};" : : "l"(val.x), "l"(val.y), "l"(addr));
-}
-
-template <typename V>
-SGL_DEVICE void st_multimem_16B_atom8B(const V& x, void* mc_addr, int64_t vec_offset) {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  static_assert(alignof(V) == 16 && sizeof(V) == 16);
-  const auto val = *reinterpret_cast<const ulong2*>(&x);
-  const auto addr = static_cast<uint8_t*>(mc_addr) + vec_offset * sizeof(V);
-  // multimem.st rejects vector qualifiers on .b64; two scalar stores keep the
-  // 8-byte atomicity the zero-marker protocol relies on.
-  asm volatile("multimem.st.relaxed.sys.global.b64 [%1], %0;" : : "l"(val.x), "l"(addr) : "memory");
-  asm volatile("multimem.st.relaxed.sys.global.b64 [%1], %0;" : : "l"(val.y), "l"(addr + 8) : "memory");
-#else
-  assert(false && "multimem store is only supported on Hopper or later architecture");
-#endif
-}
-
-}  // namespace ptx
+// The push protocol uses the same per-bf16-element zero markers as the
+// generic CustomAllReduceV2 push (clear_pos_zero / is_pos_zero from
+// custom_all_reduce.cuh): +0.0 elements are remapped to -0.0 (a no-op for
+// the sum), so a slot whose every element is non-+0 has fully arrived.
+// Element granularity is what makes a single multimem.st.weak.v4.f32 legal
+// here — its 4B elements are stored independently, and each 4B atom holds
+// two whole bf16 markers (ptxas rejects vector .b64/.f64 forms that would
+// give 8B atoms, and scalar b64 pairs cost two instructions).
 
 struct ArFusionParams {
   uint8_t* input;                             // push: tensor pointer (in place); pull_mc: multicast VA of the tensor
@@ -92,9 +52,6 @@ template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
 __global__ __launch_bounds__(1024, 1)  //
     void ar_fusion_push_kernel(const __grid_constant__ ArFusionParams params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;
-  // one -0.0 bf16 in an otherwise +0.0 8-byte group: numerically a no-op for
-  // the sum, but the group is no longer the all-zero "slot empty" marker
-  constexpr uint64_t kNegZeroMark = 0x8000ull;
 
   const auto tx = threadIdx.x;
   const auto bx = blockIdx.x;
@@ -112,20 +69,22 @@ __global__ __launch_bounds__(1024, 1)  //
   const auto push_ptr = params.push_ws_mc + r * stride_bytes + phase_stride_bytes;
   const auto poll_ptr = params.push_ws_local + phase_stride_bytes;
 
-  // stage 1: multicast-push local data, clearing all-zero 8B groups
+  // stage 1: multicast-push local data, remapping +0.0 elements
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
-    ulong2 vec;
-    ptx::ld_global_16B_atom8B(vec, params.input, vid);
-    static_assert(fp_trait<bf16_t>::pos_zero == 0);
-    if (vec.x == 0) vec.x = kNegZeroMark;
-    if (vec.y == 0) vec.y = kNegZeroMark;
-    ptx::st_multimem_16B_atom8B(vec, push_ptr, vid);
+    vec_t vec;
+    ld_global_16B(vec, params.input, vid);
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      clear_pos_zero(vec[j].x);
+      clear_pos_zero(vec[j].y);
+    }
+    st_multimem_16B(vec, push_ptr, vid);
   }
 
   // stage 2: poll all slots, reduce (+ residual), write back in place,
   // re-establish the empty markers for the next same-phase round
   vec_t zero_vec;
-  *reinterpret_cast<ulong2*>(&zero_vec) = ulong2{0, 0};
+  zero_vec.fill(bf16x2_t{get_pos_zero<bf16_t>(), get_pos_zero<bf16_t>()});
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec[kWorldSize + kHasResidual];
     if constexpr (kHasResidual) vec[kWorldSize].load(params.residual, vid);
@@ -133,18 +92,23 @@ __global__ __launch_bounds__(1024, 1)  //
       bool has_zero = false;
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        ptx::ld_relaxed_16B_atom8B(vec[i], poll_ptr + i * stride_bytes, vid);
-        const auto bits = *reinterpret_cast<const ulong2*>(&vec[i]);
+        ld_relaxed_16B(vec[i], poll_ptr + i * stride_bytes, vid);
+        // 4B-atom granularity arrival check: the producer cleared every +0
+        // element, so a written u32 is never 0 and never contains a +0 half;
+        // u32 == 0 <=> the atom still holds the empty marker.
+        const auto bits = *reinterpret_cast<const uint4*>(&vec[i]);
         has_zero |= bits.x == 0;
         has_zero |= bits.y == 0;
+        has_zero |= bits.z == 0;
+        has_zero |= bits.w == 0;
       }
       if (!has_zero) break;
     } while (true);
     const auto out_vec = reduce(vec);  // fp32 accumulation over 8(+1) inputs
-    ptx::st_global_16B_atom8B(out_vec, params.input, vid);
+    st_global_16B(out_vec, params.input, vid);
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_global_16B_atom8B(zero_vec, poll_ptr + i * stride_bytes, vid);
+      st_global_16B(zero_vec, poll_ptr + i * stride_bytes, vid);
     }
   }
 
