@@ -1534,11 +1534,23 @@ class KVCacheConfigurator:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
+        capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
-            )
+            mamba_cap = self.server_args.max_mamba_cache_size // ratio
+            if mamba_cap < max_num_reqs:
+                capped_by_mamba = True
+                logger.warning(
+                    "max_running_requests is capped to %d by the mamba state "
+                    "cache (max_mamba_cache_size=%d, %d state slots per "
+                    "request). To raise it: increase --mamba-full-memory-ratio "
+                    "or --max-mamba-cache-size, or halve the state size with "
+                    "--mamba-ssm-dtype bfloat16.",
+                    mamba_cap,
+                    self.server_args.max_mamba_cache_size,
+                    ratio,
+                )
+            max_num_reqs = min(max_num_reqs, mamba_cap)
 
             if max_num_reqs <= 0:
                 raise RuntimeError(
@@ -1549,7 +1561,11 @@ class KVCacheConfigurator:
                     f"(2) increase --mem-fraction-static, or "
                     f"(3) use GPUs with more memory."
                 )
-        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
+        if (
+            requested_per_worker is not None
+            and max_num_reqs < requested_per_worker
+            and not capped_by_mamba
+        ):
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
                 "(per dp worker) due to the available KV cache capacity.",
