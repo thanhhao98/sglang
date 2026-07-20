@@ -12,7 +12,6 @@ mm_projector.proj.0/proj.2, mm_projector.post_norm), so loading needs no
 renames.
 """
 
-import math
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -160,10 +159,9 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
-                pos_emb_3d = (
-                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1)
-                    + self.time_weight[0:t].to(pos_emb_2d.dtype)
-                )
+                pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
+                    0:t
+                ].to(pos_emb_2d.dtype)
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
@@ -235,7 +233,9 @@ class Rope2DPosEmbRepeated(nn.Module):
         y_freqs = torch.outer(y_pos, freqs).float()
         x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)
         y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)
-        freqs_cis = torch.cat([x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1)
+        freqs_cis = torch.cat(
+            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+        )
         return freqs_cis.reshape(self.max_height, self.max_width, -1)
 
     def get_freqs_cis(
@@ -248,8 +248,7 @@ class Rope2DPosEmbRepeated(nn.Module):
 
         shapes = grid_thws.tolist()
         assert all(
-            1 <= h <= self.max_height and 1 <= w <= self.max_width
-            for t, h, w in shapes
+            1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
         ), (shapes, self.max_height, self.max_width)
         return torch.cat(
             [
@@ -534,9 +533,7 @@ class KimiK3VisionTower(nn.Module):
         elif activation_func == "gelu":
             activation = F.gelu
         else:
-            raise NotImplementedError(
-                f"Not support activation_func: {activation_func}"
-            )
+            raise NotImplementedError(f"Not support activation_func: {activation_func}")
 
         self.encoder = MoonViT3dEncoder(
             hidden_dim=hidden_size,
@@ -592,7 +589,9 @@ class KimiK3MultiModalProjector(nn.Module):
     def __init__(self, vision_config):
         super().__init__()
         config = vision_config
-        mm_hidden_size = getattr(config, "mm_hidden_size", None) or config.vt_hidden_size
+        mm_hidden_size = (
+            getattr(config, "mm_hidden_size", None) or config.vt_hidden_size
+        )
         merge_h, merge_w = config.merge_kernel_size
         self.hidden_size = mm_hidden_size * merge_h * merge_w
         text_hidden_size = getattr(config, "text_hidden_size", None) or getattr(

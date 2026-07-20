@@ -383,7 +383,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
                 out,
                 ssm_state_indices,
                 H,
-                lower_bound,
+                None,  # plain GDN gate: no lower bound
             )
             return out, initial_state
 

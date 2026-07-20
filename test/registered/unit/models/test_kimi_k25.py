@@ -16,12 +16,12 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiK2_5VLImageProcessor,
     _expand_image_token_ids,
     _resize_images_by_source_shape,
 )
-from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,

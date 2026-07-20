@@ -119,7 +119,7 @@ class TestKimiK3FuncDetector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(result.calls[0].name, "a&b")
         self.assertEqual(
-            json.loads(result.calls[0].parameters), {"q": 'say &quot;hi&quot;'}
+            json.loads(result.calls[0].parameters), {"q": "say &quot;hi&quot;"}
         )
 
     def test_non_string_arg_json_decoding(self):
@@ -301,7 +301,9 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         self.assertTrue(content.startswith(f"ok{TOOLS_OPEN}"))
 
         func_detector = KimiK3FuncDetector()
-        result = func_detector.parse_streaming_increment(content, [_make_tool("python")])
+        result = func_detector.parse_streaming_increment(
+            content, [_make_tool("python")]
+        )
         self.assertEqual(result.normal_text, "ok")
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(json.loads(result.calls[0].parameters), {"code": "1"})

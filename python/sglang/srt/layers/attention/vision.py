@@ -181,9 +181,7 @@ def prepare_flashinfer_cudnn_vision_attention_metadata(
     )
     if padded_batch_size != batch_size:
         pad_size = padded_batch_size - batch_size
-        padded_indptrs = torch.cat(
-            [cu_seqlens, cu_seqlens[-1].expand(pad_size)]
-        )
+        padded_indptrs = torch.cat([cu_seqlens, cu_seqlens[-1].expand(pad_size)])
         padded_seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad_size)])
     else:
         padded_indptrs = cu_seqlens

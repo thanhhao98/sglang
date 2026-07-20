@@ -501,10 +501,7 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if (
-            not self.keep_mm_feature_on_device
-            and not defer_feature_cpu_transfer
-        ):
+        if not self.keep_mm_feature_on_device and not defer_feature_cpu_transfer:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if self.use_cuda_ipc:
@@ -1284,9 +1281,7 @@ class BaseMultimodalProcessor(ABC):
         if isinstance(value, list):
             return [BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value]
         if isinstance(value, tuple):
-            return tuple(
-                BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value
-            )
+            return tuple(BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value)
         return value
 
     def _precompute_hashes_before_cpu_transfer(

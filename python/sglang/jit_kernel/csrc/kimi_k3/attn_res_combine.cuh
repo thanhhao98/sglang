@@ -26,12 +26,12 @@ struct AttnResCombineParams {
   const bf16_t* __restrict__ bank;        // [T, NB_total, H]
   const fp32_t* __restrict__ scores;      // [T, MAX_ROWS]
   bf16_t* __restrict__ out;               // [T, H]
-  int64_t stride_pm;   // prefix_sum stride along T (in elements)
-  int64_t stride_bm;   // bank stride along T (in elements)
-  int64_t stride_bb;   // bank stride along NB (in elements, = H)
-  int64_t stride_sm;   // scores stride along T (in elements, = MAX_ROWS)
-  int64_t stride_om;   // out stride along T (in elements, = H)
-  uint32_t NVB;        // number of valid bank rows (0..8)
+  int64_t stride_pm;                      // prefix_sum stride along T (in elements)
+  int64_t stride_bm;                      // bank stride along T (in elements)
+  int64_t stride_bb;                      // bank stride along NB (in elements, = H)
+  int64_t stride_sm;                      // scores stride along T (in elements, = MAX_ROWS)
+  int64_t stride_om;                      // out stride along T (in elements, = H)
+  uint32_t NVB;                           // number of valid bank rows (0..8)
 };
 
 // kChunkH: H elements per chunk (e.g. 1024). Grid.y = H / kChunkH.
@@ -41,9 +41,9 @@ template <int kChunkH, int kMaxRows, bool kUsePDL>
 __global__ void attn_res_combine_kernel(const AttnResCombineParams __grid_constant__ params) {
   using namespace device;
 
-  const uint32_t pid_t = blockIdx.x;   // token index
-  const uint32_t pid_h = blockIdx.y;   // H-chunk index
-  const uint32_t h0 = pid_h * kChunkH; // first element of this chunk
+  const uint32_t pid_t = blockIdx.x;    // token index
+  const uint32_t pid_h = blockIdx.y;    // H-chunk index
+  const uint32_t h0 = pid_h * kChunkH;  // first element of this chunk
   const uint32_t tid = threadIdx.x;
   const uint32_t NVB = params.NVB;
 
@@ -133,8 +133,8 @@ struct AttnResCombineKernel {
   static constexpr auto kernel = attn_res_combine_kernel<kChunkH, kMaxRows, kUsePDL>;
   static constexpr uint32_t kNumThreads = kChunkH / 8;  // 128 for 1024-element chunks
 
-  static void run(
-      const tvm::ffi::TensorView prefix_sum,
+  static void
+  run(const tvm::ffi::TensorView prefix_sum,
       const tvm::ffi::TensorView bank,
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView out,
@@ -148,22 +148,10 @@ struct AttnResCombineKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({T_, H_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(prefix_sum);
-    TensorMatcher({T_, NB_, H_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(bank);
-    TensorMatcher({T_, MR_})
-        .with_dtype<fp32_t>()
-        .with_device(device)
-        .verify(scores);
-    TensorMatcher({T_, H_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(out);
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum);
+    TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
+    TensorMatcher({T_, MR_}).with_dtype<fp32_t>().with_device(device).verify(scores);
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(out);
 
     const auto num_tokens = static_cast<uint32_t>(T_.unwrap());
     const auto H = static_cast<uint32_t>(H_.unwrap());
@@ -190,8 +178,7 @@ struct AttnResCombineKernel {
     };
 
     dim3 grid(num_tokens, n_h_blocks);
-    LaunchKernel(grid, kNumThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid, kNumThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

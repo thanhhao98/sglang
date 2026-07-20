@@ -85,7 +85,9 @@ class DsparkDraftSampler:
         vocab = int(model.lm_head.org_vocab_size)
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
-        self.exp_noise = torch.empty((max_bs, vocab), dtype=torch.float32, device=device)
+        self.exp_noise = torch.empty(
+            (max_bs, vocab), dtype=torch.float32, device=device
+        )
         self.corrected_out = torch.empty(
             (max_bs * self.gamma, vocab),
             dtype=model.lm_head.weight.dtype,

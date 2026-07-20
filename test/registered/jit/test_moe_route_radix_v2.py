@@ -12,9 +12,7 @@ TOPK = 16
 
 
 def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = torch.randn(
-        num_tokens, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda"
-    )
+    scores = torch.randn(num_tokens, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.float32, device="cuda")
     if case == "random":
         pass
@@ -117,9 +115,7 @@ def test_route_radix_v2_flag_dispatch():
     assert torch.equal(i, i.sort(dim=-1).values), "dispatch did not reach v2-unsorted"
     ref_order = ref_i.argsort(dim=-1)
     assert torch.equal(ref_i.to(torch.int32).gather(1, ref_order), i)
-    torch.testing.assert_close(
-        ref_w.gather(1, ref_order), w, rtol=1e-6, atol=0.0
-    )
+    torch.testing.assert_close(ref_w.gather(1, ref_order), w, rtol=1e-6, atol=0.0)
 
     # Kill-switch: with the flag off, dispatch falls back to the triton path.
     # ids come back in the triton (biased-descending) order — proof the v2
@@ -133,14 +129,10 @@ def test_route_radix_v2_flag_dispatch():
 
 
 def test_route_radix_v2_all_equal_min_id():
-    scores = torch.full(
-        (2, NUM_EXPERTS), 0.5, dtype=torch.bfloat16, device="cuda"
-    )
+    scores = torch.full((2, NUM_EXPERTS), 0.5, dtype=torch.bfloat16, device="cuda")
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda")
     for sorted_flag in (True, False):
-        _, ids = route_radix_v2(
-            scores, bias, TOPK, True, 2.5, True, sorted=sorted_flag
-        )
+        _, ids = route_radix_v2(scores, bias, TOPK, True, 2.5, True, sorted=sorted_flag)
         expected = torch.arange(TOPK, dtype=torch.int32, device="cuda")
         assert torch.equal(ids, expected.expand(2, -1))
 

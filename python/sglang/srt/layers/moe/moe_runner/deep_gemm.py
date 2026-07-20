@@ -738,10 +738,7 @@ def pre_permute_standard_to_deep_gemm(
     # are compacted per expert, so no [E, m_max, ...] capacity buffers and
     # far fewer kernels. Small batches (decode eager / graph warmup+capture)
     # stay on the masked path.
-    if (
-        hidden_states.shape[0] >= 512
-        and not torch.cuda.is_current_stream_capturing()
-    ):
+    if hidden_states.shape[0] >= 512 and not torch.cuda.is_current_stream_capturing():
         return _pre_permute_standard_contiguous(
             hidden_states, topk_ids, topk_weights, runner_config, running_state
         )
@@ -824,9 +821,7 @@ def _pre_permute_standard_contiguous(
     K = hidden_states.shape[1]
     flat = topk_ids.view(-1)
     cnt = torch.zeros(num_local, device=device, dtype=torch.int32)
-    cnt.scatter_add_(
-        0, flat.clamp_min(0).to(torch.int64), (flat >= 0).to(torch.int32)
-    )
+    cnt.scatter_add_(0, flat.clamp_min(0).to(torch.int64), (flat >= 0).to(torch.int32))
     aligned_cnt = ((cnt + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
 
     bound = ceil_div(topk_ids.numel(), BLOCK_E) * BLOCK_E + num_local * BLOCK_E

@@ -2180,9 +2180,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         if self.pp_group.world_size > 1:
             # Capture layers living on non-last PP ranks would be silently
             # skipped (the flag is only set on the last rank).
-            raise NotImplementedError(
-                "DSPARK aux hidden capture requires PP=1."
-            )
+            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
         if not self.pp_group.is_last_rank:
             return
         if layer_ids is None:

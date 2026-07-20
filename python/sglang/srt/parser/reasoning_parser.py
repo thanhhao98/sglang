@@ -547,8 +547,6 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         return emit
 
 
-
-
 class Glm45Detector(BaseReasoningFormatDetector):
     """
     Detector for GLM-4.5 models.

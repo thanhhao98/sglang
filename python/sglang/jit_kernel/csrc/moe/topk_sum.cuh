@@ -77,14 +77,8 @@ struct TopkSumKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M_, T_, K_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(in);
-    TensorMatcher({M_, K_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(out);
+    TensorMatcher({M_, T_, K_}).with_dtype<bf16_t>().with_device(device).verify(in);
+    TensorMatcher({M_, K_}).with_dtype<bf16_t>().with_device(device).verify(out);
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     const auto topk = static_cast<uint32_t>(T_.unwrap());
@@ -102,8 +96,7 @@ struct TopkSumKernel {
 
     const uint32_t n_vecs = K / 8;
     dim3 grid((n_vecs + kThreads - 1) / kThreads, M);
-    LaunchKernel(grid, kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

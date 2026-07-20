@@ -24,13 +24,13 @@ struct AttnResScoreParams {
   const bf16_t* __restrict__ bank;        // [T, NB_total, H]
   const fp32_t* __restrict__ cw;          // [H]
   fp32_t* __restrict__ scores;            // [T, MAX_ROWS]
-  int64_t stride_pm;   // prefix_sum stride along T (in elements)
-  int64_t stride_bm;   // bank stride along T (in elements)
-  int64_t stride_bb;   // bank stride along NB (in elements, = H)
-  int64_t stride_sm;   // scores stride along T (in elements, = MAX_ROWS)
-  uint32_t H;          // hidden size (e.g. 7168)
-  uint32_t NVB;        // number of valid bank rows (0..8)
-  float eps;           // RMSNorm epsilon
+  int64_t stride_pm;                      // prefix_sum stride along T (in elements)
+  int64_t stride_bm;                      // bank stride along T (in elements)
+  int64_t stride_bb;                      // bank stride along NB (in elements, = H)
+  int64_t stride_sm;                      // scores stride along T (in elements, = MAX_ROWS)
+  uint32_t H;                             // hidden size (e.g. 7168)
+  uint32_t NVB;                           // number of valid bank rows (0..8)
+  float eps;                              // RMSNorm epsilon
 };
 
 // kBlockH: number of threads per CTA = number of H elements per iteration
@@ -133,8 +133,8 @@ template <int kBlockH, bool kUsePDL>
 struct AttnResScoreKernel {
   static constexpr auto kernel = attn_res_score_kernel<kBlockH, kUsePDL>;
 
-  static void run(
-      const tvm::ffi::TensorView prefix_sum,
+  static void
+  run(const tvm::ffi::TensorView prefix_sum,
       const tvm::ffi::TensorView bank,
       const tvm::ffi::TensorView cw,
       const tvm::ffi::TensorView scores,
@@ -149,22 +149,10 @@ struct AttnResScoreKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({T_, H_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(prefix_sum);
-    TensorMatcher({T_, NB_, H_})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(bank);
-    TensorMatcher({H_})
-        .with_dtype<fp32_t>()
-        .with_device(device)
-        .verify(cw);
-    TensorMatcher({T_, MR_})
-        .with_dtype<fp32_t>()
-        .with_device(device)
-        .verify(scores);
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum);
+    TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
+    TensorMatcher({H_}).with_dtype<fp32_t>().with_device(device).verify(cw);
+    TensorMatcher({T_, MR_}).with_dtype<fp32_t>().with_device(device).verify(scores);
 
     const auto num_tokens = static_cast<uint32_t>(T_.unwrap());
     const auto H = static_cast<uint32_t>(H_.unwrap());
@@ -191,8 +179,7 @@ struct AttnResScoreKernel {
     };
 
     dim3 grid(num_tokens, NVB + 1);
-    LaunchKernel(grid, kBlockH, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid, kBlockH, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

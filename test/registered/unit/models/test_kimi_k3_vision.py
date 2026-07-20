@@ -96,9 +96,7 @@ def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch):
         "get_server_args",
         lambda: SimpleNamespace(mm_attention_backend="flashinfer_cudnn"),
     )
-    monkeypatch.setitem(
-        kimi_k3_vl.QKV_BACKEND_IMPL, "flashinfer_cudnn", FakeAttention
-    )
+    monkeypatch.setitem(kimi_k3_vl.QKV_BACKEND_IMPL, "flashinfer_cudnn", FakeAttention)
 
     encoder = MoonViT3dEncoder(
         hidden_dim=8,

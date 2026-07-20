@@ -267,9 +267,7 @@ def ragged_verify_dense_scatter_indices(
     bs * draft_token_num.
     """
     batch_size = query_start_loc.shape[0] - 1
-    token_pos = torch.arange(
-        seq_len, device=query_start_loc.device, dtype=torch.int32
-    )
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
     token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
     return (
         token_slots * draft_token_num
@@ -377,9 +375,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     onorm_gate,
                 )
             ):
-                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = (
-                    fused_static
-                )
+                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
                 core_attn_out = kda_fused_decode.kda_fused_decode(
                     mixed_qkv,
                     a,
@@ -657,9 +653,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 seq_len=seq_len,
                 draft_token_num=draft_token_num,
             )
-            dense = mixed_qkv.new_zeros(
-                num_dense_tokens + 1, mixed_qkv.shape[-1]
-            )
+            dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
             dense.index_copy_(0, dense_token_indices, mixed_qkv)
             mixed_qkv_dense = dense[:num_dense_tokens].view(
                 batch_size, draft_token_num, -1
@@ -721,7 +715,5 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # uncovered tail rows; zero them so discarded pad hidden states
             # stay finite. Uncovered == clamped-to-ghost.
             covered = dense_token_indices < (batch_size * draft_token_num)
-            core_attn_out = torch.where(
-                covered.view(1, -1, 1, 1), core_attn_out, 0.0
-            )
+            core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out

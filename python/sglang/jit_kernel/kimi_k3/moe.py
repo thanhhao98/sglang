@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from sglang.jit_kernel.utils import (

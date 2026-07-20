@@ -50,7 +50,7 @@ constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
 
-__device__ __forceinline__ float bf16_load(const __nv_bfloat16 *ptr, int idx) {
+__device__ __forceinline__ float bf16_load(const __nv_bfloat16* ptr, int idx) {
   return __bfloat162float(ptr[idx]);
 }
 
@@ -59,11 +59,11 @@ __device__ __forceinline__ __nv_bfloat16 bf16_store(float value) {
 }
 
 template <bool kUseCacheGlobalStore>
-__device__ __forceinline__ void store_state_float4(float *ptr, float4 value) {
+__device__ __forceinline__ void store_state_float4(float* ptr, float4 value) {
   if constexpr (kUseCacheGlobalStore) {
-    __stcg(reinterpret_cast<float4 *>(ptr), value);
+    __stcg(reinterpret_cast<float4*>(ptr), value);
   } else {
-    *reinterpret_cast<float4 *>(ptr) = value;
+    *reinterpret_cast<float4*>(ptr) = value;
   }
 }
 
@@ -87,13 +87,9 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   return value;
 }
 
-__device__ __forceinline__ void cp_async_cg_16b(float *smem_ptr,
-                                                const float *gmem_ptr) {
-  uint32_t smem_addr =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-               :
-               : "r"(smem_addr), "l"(gmem_ptr));
+__device__ __forceinline__ void cp_async_cg_16b(float* smem_ptr, const float* gmem_ptr) {
+  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_ptr));
 }
 
 __device__ __forceinline__ void cp_async_commit() {
@@ -128,8 +124,7 @@ __device__ __forceinline__ void cp_async_wait_oldest(int outstanding_groups) {
 
 template <int kStageChunkV>
 __device__ __forceinline__ void
-cp_async_state_chunk_stage(float *s_state, const float *state, int slot,
-                           int i_hv, int HV, int chunk, int stage) {
+cp_async_state_chunk_stage(float* s_state, const float* state, int slot, int i_hv, int HV, int chunk, int stage) {
   constexpr int kFloat4PerChunk = kStageChunkV * kDimK / 4;
   const int tid = threadIdx.x;
   const int v_base = chunk * kStageChunkV;
@@ -137,9 +132,8 @@ cp_async_state_chunk_stage(float *s_state, const float *state, int slot,
     const int elem = linear4 * 4;
     const int row = elem / kDimK;
     const int k = elem - row * kDimK;
-    float *dst = s_state + (stage * kStageChunkV + row) * kDimK + k;
-    const float *src =
-        state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
+    float* dst = s_state + (stage * kStageChunkV + row) * kDimK + k;
+    const float* src = state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
     cp_async_cg_16b(dst, src);
   }
   cp_async_commit();
@@ -147,8 +141,7 @@ cp_async_state_chunk_stage(float *s_state, const float *state, int slot,
 
 template <int kCopyThreads>
 __device__ __forceinline__ void
-cp_async_state_chunk_for(float *s_state, const float *state, int slot, int i_hv,
-                         int HV, int chunk) {
+cp_async_state_chunk_for(float* s_state, const float* state, int slot, int i_hv, int HV, int chunk) {
   constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
   const int tid = threadIdx.x;
   const int stage = chunk & 1;
@@ -157,18 +150,15 @@ cp_async_state_chunk_for(float *s_state, const float *state, int slot, int i_hv,
     const int elem = linear4 * 4;
     const int row = elem / kDimK;
     const int k = elem - row * kDimK;
-    float *dst = s_state + (stage * kChunkV + row) * kDimK + k;
-    const float *src =
-        state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
+    float* dst = s_state + (stage * kChunkV + row) * kDimK + k;
+    const float* src = state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
     cp_async_cg_16b(dst, src);
   }
   cp_async_commit();
 }
 
-__device__ __forceinline__ void cp_async_state_chunk(float *s_state,
-                                                     const float *state,
-                                                     int slot, int i_hv, int HV,
-                                                     int chunk) {
+__device__ __forceinline__ void
+cp_async_state_chunk(float* s_state, const float* state, int slot, int i_hv, int HV, int chunk) {
   cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, HV, chunk);
 }
 
@@ -178,74 +168,70 @@ __device__ __forceinline__ void cp_async_state_chunk(float *s_state,
 #define KDA_FUSED_DECODE_HAS_TMA 0
 #endif
 
-__device__ __forceinline__ void mbarrier_init_one(uint64_t *bar) {
+__device__ __forceinline__ void mbarrier_init_one(uint64_t* bar) {
 #if KDA_FUSED_DECODE_HAS_TMA
   const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(addr));
 #endif
 }
 
-__device__ __forceinline__ void mbarrier_wait_parity(uint64_t *bar,
-                                                     uint32_t parity) {
+__device__ __forceinline__ void mbarrier_wait_parity(uint64_t* bar, uint32_t parity) {
 #if KDA_FUSED_DECODE_HAS_TMA
   const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   uint32_t done = 0;
   while (!done) {
-    asm volatile("{\n"
-                 ".reg .pred P;\n"
-                 "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n"
-                 "selp.b32 %0, 1, 0, P;\n"
-                 "}\n"
-                 : "=r"(done)
-                 : "r"(addr), "r"(parity));
+    asm volatile(
+        "{\n"
+        ".reg .pred P;\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n"
+        "selp.b32 %0, 1, 0, P;\n"
+        "}\n"
+        : "=r"(done)
+        : "r"(addr), "r"(parity));
   }
 #endif
 }
 
 // 1D TMA bulk copy gmem -> smem; the issuing thread arrives with expect-tx on
 // the mbarrier, completion is observed via mbarrier_wait_parity.
-__device__ __forceinline__ void tma_load_1d(float *smem_dst,
-                                            const float *gmem_src,
-                                            uint64_t *bar, uint32_t bytes) {
+__device__ __forceinline__ void tma_load_1d(float* smem_dst, const float* gmem_src, uint64_t* bar, uint32_t bytes) {
 #if KDA_FUSED_DECODE_HAS_TMA
-  const uint32_t dst =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
   const uint32_t mbar = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   asm volatile("fence.proxy.async.shared::cta;" ::);
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mbar), "r"(bytes));
   asm volatile(
-      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mbar),
-      "r"(bytes));
-  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::"
-               "bytes [%0], [%1], %2, [%3];" ::"r"(dst),
-               "l"(gmem_src), "r"(bytes), "r"(mbar)
-               : "memory");
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::"
+      "bytes [%0], [%1], %2, [%3];" ::"r"(dst),
+      "l"(gmem_src),
+      "r"(bytes),
+      "r"(mbar)
+      : "memory");
 #else
   __trap();
 #endif
 }
 
 template <int kStageChunkV>
-__device__ __forceinline__ void
-tma_state_chunk_stage(float *s_state, const float *state, int slot, int i_hv,
-                      int HV, int chunk, int stage, uint64_t *bar) {
+__device__ __forceinline__ void tma_state_chunk_stage(
+    float* s_state, const float* state, int slot, int i_hv, int HV, int chunk, int stage, uint64_t* bar) {
   constexpr uint32_t kBytes = kStageChunkV * kDimK * sizeof(float);
-  float *dst = s_state + stage * kStageChunkV * kDimK;
-  const float *src =
-      state + ((slot * HV + i_hv) * kDimV + chunk * kStageChunkV) * kDimK;
+  float* dst = s_state + stage * kStageChunkV * kDimK;
+  const float* src = state + ((slot * HV + i_hv) * kDimV + chunk * kStageChunkV) * kDimK;
   tma_load_1d(dst, src, bar, kBytes);
 }
 
 bool kda_fused_decode_use_tma_load() {
-  const char *v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_LOAD");
+  const char* v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_LOAD");
   return v != nullptr && v[0] == '1';
 }
 
 int kda_fused_decode_tma_stages_override() {
-  const char *v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_STAGES");
+  const char* v = std::getenv("SGLANG_KDA_FUSED_DECODE_TMA_STAGES");
   return v != nullptr ? std::atoi(v) : 0;
 }
 
-__device__ __forceinline__ float block_reduce_sum(float value, float *scratch) {
+__device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -289,8 +275,7 @@ struct Sum4 {
   float d;
 };
 
-__device__ __forceinline__ Sum4 warp_reduce_sum4(float a, float b, float c,
-                                                 float d) {
+__device__ __forceinline__ Sum4 warp_reduce_sum4(float a, float b, float c, float d) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     a += __shfl_xor_sync(0xffffffffu, a, offset);
@@ -302,8 +287,7 @@ __device__ __forceinline__ Sum4 warp_reduce_sum4(float a, float b, float c,
 }
 
 template <int kReduceWarps>
-__device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y,
-                                                      float *scratch) {
+__device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
@@ -331,14 +315,12 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y,
   return {scratch[0], scratch[1]};
 }
 
-__device__ __forceinline__ Sum2 block_reduce_sum2(float x, float y,
-                                                  float *scratch) {
+__device__ __forceinline__ Sum2 block_reduce_sum2(float x, float y, float* scratch) {
   return block_reduce_sum2_for<kWarps>(x, y, scratch);
 }
 
 template <int kReduceWarps>
-__device__ __forceinline__ float block_reduce_sum_active_for(float value,
-                                                             float *scratch) {
+__device__ __forceinline__ float block_reduce_sum_active_for(float value, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
@@ -364,8 +346,7 @@ __device__ __forceinline__ float block_reduce_sum_active_for(float value,
 }
 
 template <int kReduceWarps>
-__device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y,
-                                                             float *scratch) {
+__device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
@@ -397,41 +378,63 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y,
   return {scratch[0], scratch[1]};
 }
 
-__device__ __forceinline__ float fp32_at(const float *ptr, int64_t idx) {
+__device__ __forceinline__ float fp32_at(const float* ptr, int64_t idx) {
   return ptr[idx];
 }
 
-template <bool kApplyOnorm, bool kUseStaticDecodeLayout = false,
-          int kFixedHeads = 0, int kFixedValueHeads = 0,
-          bool kUseHeadGrid = false, bool kAccumulateOnormSumsq = false,
-          bool kUseActiveQkReduction = false, bool kUseCacheGlobalStore = false,
-          bool kComputeOutputBeforeStore = false, bool kSkipWarpSync = false,
-          bool kPreloadOnormParams = false,
-          bool kPrefetchNextStateChunk = false,
-          bool kUseActiveOnormReduction = false, bool kUpdateConvState = false,
-          bool kUseLowerBound = false, bool kApplyBetaSigmoid = true,
-          bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
-__global__
-__launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
-    const __nv_bfloat16 *__restrict__ x_q,
-    const __nv_bfloat16 *__restrict__ x_k,
-    const __nv_bfloat16 *__restrict__ x_v,
-    const float *__restrict__ w_q_t,
-    const float *__restrict__ w_k_t,
-    const float *__restrict__ w_v_t,
-    const float *__restrict__ bias_q,
-    const float *__restrict__ bias_k,
-    const float *__restrict__ bias_v, __nv_bfloat16 *__restrict__ cs_q,
-    __nv_bfloat16 *__restrict__ cs_k, __nv_bfloat16 *__restrict__ cs_v,
-    const float *__restrict__ a_log, const __nv_bfloat16 *__restrict__ g,
-    const float *__restrict__ dt_bias, const __nv_bfloat16 *__restrict__ beta,
-    const __nv_bfloat16 *__restrict__ onorm_g,
-    const float *__restrict__ onorm_weight,
-    const int *__restrict__ ssm_state_indices,
-    const int *__restrict__ cu_seqlens, float *__restrict__ state,
-    __nv_bfloat16 *__restrict__ out, int B, int H, int HV, float lower_bound,
-    float scale, float onorm_eps, int64_t x_row_stride, int64_t g_row_stride,
-    int64_t beta_row_stride, int64_t onormg_row_stride, int64_t cs_slot_stride,
+template <
+    bool kApplyOnorm,
+    bool kUseStaticDecodeLayout = false,
+    int kFixedHeads = 0,
+    int kFixedValueHeads = 0,
+    bool kUseHeadGrid = false,
+    bool kAccumulateOnormSumsq = false,
+    bool kUseActiveQkReduction = false,
+    bool kUseCacheGlobalStore = false,
+    bool kComputeOutputBeforeStore = false,
+    bool kSkipWarpSync = false,
+    bool kPreloadOnormParams = false,
+    bool kPrefetchNextStateChunk = false,
+    bool kUseActiveOnormReduction = false,
+    bool kUpdateConvState = false,
+    bool kUseLowerBound = false,
+    bool kApplyBetaSigmoid = true,
+    bool kUseTmaLoad = false,
+    int kTmaStages = kNumChunks>
+__global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
+    const __nv_bfloat16* __restrict__ x_q,
+    const __nv_bfloat16* __restrict__ x_k,
+    const __nv_bfloat16* __restrict__ x_v,
+    const float* __restrict__ w_q_t,
+    const float* __restrict__ w_k_t,
+    const float* __restrict__ w_v_t,
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v,
+    __nv_bfloat16* __restrict__ cs_q,
+    __nv_bfloat16* __restrict__ cs_k,
+    __nv_bfloat16* __restrict__ cs_v,
+    const float* __restrict__ a_log,
+    const __nv_bfloat16* __restrict__ g,
+    const float* __restrict__ dt_bias,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ onorm_g,
+    const float* __restrict__ onorm_weight,
+    const int* __restrict__ ssm_state_indices,
+    const int* __restrict__ cu_seqlens,
+    float* __restrict__ state,
+    __nv_bfloat16* __restrict__ out,
+    int B,
+    int H,
+    int HV,
+    float lower_bound,
+    float scale,
+    float onorm_eps,
+    int64_t x_row_stride,
+    int64_t g_row_stride,
+    int64_t beta_row_stride,
+    int64_t onormg_row_stride,
+    int64_t cs_slot_stride,
     int64_t cs_w_stride) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -510,11 +513,9 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       for (int c = 0; c < kTmaStages; ++c) {
         mbarrier_init_one(&s_tma_bar[c]);
       }
-      tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 0,
-                                     0, &s_tma_bar[0]);
+      tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 0, 0, &s_tma_bar[0]);
       if (kTmaStages > 1 && kNumChunks > 1) {
-        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 1,
-                                       1, &s_tma_bar[1]);
+        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 1, 1, &s_tma_bar[1]);
       }
     }
   } else {
@@ -527,8 +528,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       const int hk = hk_off + k;
       const int64_t cs_base = slot * cs_slot_stride + hk;
       const int64_t xq_idx = bos * x_row_stride + hk;
-      const float exp_a =
-          __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
+      const float exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
 
       float q_acc = bias_q[hk];
       float k_acc = bias_k[hk];
@@ -552,10 +552,8 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       }
       const __nv_bfloat16 q_new = x_q[xq_idx];
       const __nv_bfloat16 k_new = x_k[xq_idx];
-      q_acc += __bfloat162float(q_new) *
-               fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
-      k_acc += __bfloat162float(k_new) *
-               fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
+      q_acc += __bfloat162float(q_new) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
+      k_acc += __bfloat162float(k_new) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
       cs_q[cs_base + 0] = q_shift0;
       cs_q[cs_base + cs_w_stride] = q_shift1;
@@ -567,8 +565,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       s_q[k] = silu_fast(q_acc);
       s_k[k] = silu_fast(k_acc);
 
-      const float g_raw =
-          bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
+      const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
         s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
       } else {
@@ -579,8 +576,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
     if (tid < kDimK) {
       const int k = tid;
       const int hk = hk_off + k;
-      const float exp_a =
-          __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
+      const float exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
 
       float q_acc = bias_q[hk];
       float k_acc = bias_k[hk];
@@ -590,16 +586,13 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
         q_acc += bf16_load(cs_q, cs_idx) * fp32_at(w_q_t, w * hkv_dim + hk);
         k_acc += bf16_load(cs_k, cs_idx) * fp32_at(w_k_t, w * hkv_dim + hk);
       }
-      q_acc += bf16_load(x_q, bos * x_row_stride + hk) *
-               fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
-      k_acc += bf16_load(x_k, bos * x_row_stride + hk) *
-               fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
+      q_acc += bf16_load(x_q, bos * x_row_stride + hk) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
+      k_acc += bf16_load(x_k, bos * x_row_stride + hk) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
       s_q[k] = silu_fast(q_acc);
       s_k[k] = silu_fast(k_acc);
 
-      const float g_raw =
-          bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
+      const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
         s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
       } else {
@@ -621,8 +614,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 #pragma unroll
       for (int w = 0; w < kConvStateWidth; ++w) {
         const __nv_bfloat16 v_state = cs_v[cs_base + w * cs_w_stride];
-        v_acc +=
-            __bfloat162float(v_state) * fp32_at(w_v_t, w * hvv_dim + hvv);
+        v_acc += __bfloat162float(v_state) * fp32_at(w_v_t, w * hvv_dim + hvv);
         if (w == 1) {
           v_shift0 = v_state;
         } else if (w == 2) {
@@ -630,8 +622,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
         }
       }
       const __nv_bfloat16 v_new = x_v[xv_idx];
-      v_acc += __bfloat162float(v_new) *
-               fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
+      v_acc += __bfloat162float(v_new) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
@@ -654,8 +645,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
         const int64_t cs_idx = slot * cs_slot_stride + hvv + w * cs_w_stride;
         v_acc += bf16_load(cs_v, cs_idx) * fp32_at(w_v_t, w * hvv_dim + hvv);
       }
-      v_acc += bf16_load(x_v, bos * x_row_stride + hvv) *
-               fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
+      v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
       s_v[v] = silu_fast(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
@@ -695,9 +685,9 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   __syncthreads();
 
   const int k_base = lane * 4;
-  const float4 q4 = *reinterpret_cast<const float4 *>(s_q + k_base);
-  const float4 k4 = *reinterpret_cast<const float4 *>(s_k + k_base);
-  const float4 decay4 = *reinterpret_cast<const float4 *>(s_decay + k_base);
+  const float4 q4 = *reinterpret_cast<const float4*>(s_q + k_base);
+  const float4 k4 = *reinterpret_cast<const float4*>(s_k + k_base);
+  const float4 decay4 = *reinterpret_cast<const float4*>(s_decay + k_base);
   float r_q[4] = {q4.x, q4.y, q4.z, q4.w};
   float r_k[4] = {k4.x, k4.y, k4.z, k4.w};
   float r_decay[4] = {decay4.x, decay4.y, decay4.z, decay4.w};
@@ -707,12 +697,10 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   for (int chunk = 0; chunk < kNumChunks; ++chunk) {
     if constexpr (kUseTmaLoad) {
       if (tid == 0 && chunk + 2 < kNumChunks && chunk + 2 < kTmaStages) {
-        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count,
-                                       chunk + 2, chunk + 2,
-                                       &s_tma_bar[chunk + 2]);
+        tma_state_chunk_stage<kChunkV>(
+            s_state, state, slot, i_hv, hv_count, chunk + 2, chunk + 2, &s_tma_bar[chunk + 2]);
       }
-      mbarrier_wait_parity(&s_tma_bar[chunk % kTmaStages],
-                           (chunk / kTmaStages) & 1);
+      mbarrier_wait_parity(&s_tma_bar[chunk % kTmaStages], (chunk / kTmaStages) & 1);
     } else if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
       if (chunk + 1 < kNumChunks) {
         cp_async_wait_group_1();
@@ -732,9 +720,7 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       }
     }
 
-    const float *state_stage =
-        s_state +
-        (kUseTmaLoad ? (chunk % kTmaStages) : (chunk & 1)) * kChunkV * kDimK;
+    const float* state_stage = s_state + (kUseTmaLoad ? (chunk % kTmaStages) : (chunk & 1)) * kChunkV * kDimK;
 
 #pragma unroll
     for (int row = 0; row < kRowsPerWarp; row += 2) {
@@ -747,10 +733,8 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       float dot_hk_a = 0.0f;
       float dot_hk_b = 0.0f;
 
-      const float4 raw_h_a = *reinterpret_cast<const float4 *>(
-          state_stage + v_row_a * kDimK + k_base);
-      const float4 raw_h_b = *reinterpret_cast<const float4 *>(
-          state_stage + v_row_b * kDimK + k_base);
+      const float4 raw_h_a = *reinterpret_cast<const float4*>(state_stage + v_row_a * kDimK + k_base);
+      const float4 raw_h_b = *reinterpret_cast<const float4*>(state_stage + v_row_b * kDimK + k_base);
       h_a_vals[0] = raw_h_a.x * r_decay[0];
       h_a_vals[1] = raw_h_a.y * r_decay[1];
       h_a_vals[2] = raw_h_a.z * r_decay[2];
@@ -759,10 +743,8 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       h_b_vals[1] = raw_h_b.y * r_decay[1];
       h_b_vals[2] = raw_h_b.z * r_decay[2];
       h_b_vals[3] = raw_h_b.w * r_decay[3];
-      dot_hk_a = h_a_vals[0] * r_k[0] + h_a_vals[1] * r_k[1] +
-                 h_a_vals[2] * r_k[2] + h_a_vals[3] * r_k[3];
-      dot_hk_b = h_b_vals[0] * r_k[0] + h_b_vals[1] * r_k[1] +
-                 h_b_vals[2] * r_k[2] + h_b_vals[3] * r_k[3];
+      dot_hk_a = h_a_vals[0] * r_k[0] + h_a_vals[1] * r_k[1] + h_a_vals[2] * r_k[2] + h_a_vals[3] * r_k[3];
+      dot_hk_b = h_b_vals[0] * r_k[0] + h_b_vals[1] * r_k[1] + h_b_vals[2] * r_k[2] + h_b_vals[3] * r_k[3];
 
       const Sum2 dot_hk = warp_reduce_sum_pair(dot_hk_a, dot_hk_b);
       const float v_new0 = (s_v[v0] - dot_hk.x) * s_beta;
@@ -770,10 +752,8 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 
       float dot_hq_a = 0.0f;
       float dot_hq_b = 0.0f;
-      const int state_idx_a =
-          ((slot * hv_count + i_hv) * kDimV + v0) * kDimK + k_base;
-      const int state_idx_b =
-          ((slot * hv_count + i_hv) * kDimV + v1) * kDimK + k_base;
+      const int state_idx_a = ((slot * hv_count + i_hv) * kDimV + v0) * kDimK + k_base;
+      const int state_idx_b = ((slot * hv_count + i_hv) * kDimV + v1) * kDimK + k_base;
       const float h_a_0 = h_a_vals[0] + r_k[0] * v_new0;
       const float h_a_1 = h_a_vals[1] + r_k[1] * v_new0;
       const float h_a_2 = h_a_vals[2] + r_k[2] * v_new0;
@@ -783,23 +763,15 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       const float h_b_2 = h_b_vals[2] + r_k[2] * v_new1;
       const float h_b_3 = h_b_vals[3] + r_k[3] * v_new1;
       if constexpr (kComputeOutputBeforeStore) {
-        dot_hq_a =
-            h_a_0 * r_q[0] + h_a_1 * r_q[1] + h_a_2 * r_q[2] + h_a_3 * r_q[3];
-        dot_hq_b =
-            h_b_0 * r_q[0] + h_b_1 * r_q[1] + h_b_2 * r_q[2] + h_b_3 * r_q[3];
-        store_state_float4<kUseCacheGlobalStore>(
-            state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
-        store_state_float4<kUseCacheGlobalStore>(
-            state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
+        dot_hq_a = h_a_0 * r_q[0] + h_a_1 * r_q[1] + h_a_2 * r_q[2] + h_a_3 * r_q[3];
+        dot_hq_b = h_b_0 * r_q[0] + h_b_1 * r_q[1] + h_b_2 * r_q[2] + h_b_3 * r_q[3];
+        store_state_float4<kUseCacheGlobalStore>(state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
+        store_state_float4<kUseCacheGlobalStore>(state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
       } else {
-        store_state_float4<kUseCacheGlobalStore>(
-            state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
-        store_state_float4<kUseCacheGlobalStore>(
-            state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
-        dot_hq_a =
-            h_a_0 * r_q[0] + h_a_1 * r_q[1] + h_a_2 * r_q[2] + h_a_3 * r_q[3];
-        dot_hq_b =
-            h_b_0 * r_q[0] + h_b_1 * r_q[1] + h_b_2 * r_q[2] + h_b_3 * r_q[3];
+        store_state_float4<kUseCacheGlobalStore>(state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
+        store_state_float4<kUseCacheGlobalStore>(state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
+        dot_hq_a = h_a_0 * r_q[0] + h_a_1 * r_q[1] + h_a_2 * r_q[2] + h_a_3 * r_q[3];
+        dot_hq_b = h_b_0 * r_q[0] + h_b_1 * r_q[1] + h_b_2 * r_q[2] + h_b_3 * r_q[3];
       }
 
       const Sum2 dot_hq = warp_reduce_sum_pair(dot_hq_a, dot_hq_b);
@@ -819,8 +791,14 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
         __syncthreads();
         if (tid == 0) {
           tma_state_chunk_stage<kChunkV>(
-              s_state, state, slot, i_hv, hv_count, chunk + kTmaStages,
-              chunk % kTmaStages, &s_tma_bar[chunk % kTmaStages]);
+              s_state,
+              state,
+              slot,
+              i_hv,
+              hv_count,
+              chunk + kTmaStages,
+              chunk % kTmaStages,
+              &s_tma_bar[chunk % kTmaStages]);
         }
       }
     } else if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk) {
@@ -851,16 +829,14 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       if (tid < kDimV) {
         const int out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
         const float raw_o = s_o[tid];
-        const float rstd =
-            rsqrtf(s_reduce[0] / static_cast<float>(kDimV) + onorm_eps);
+        const float rstd = rsqrtf(s_reduce[0] / static_cast<float>(kDimV) + onorm_eps);
         float gate;
         float weight;
         if constexpr (kPreloadOnormParams) {
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = sigmoid_fast(
-              bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
@@ -878,16 +854,14 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 
       if (tid < kDimV) {
         const int out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
-        const float rstd =
-            rsqrtf(sumsq / static_cast<float>(kDimV) + onorm_eps);
+        const float rstd = rsqrtf(sumsq / static_cast<float>(kDimV) + onorm_eps);
         float gate;
         float weight;
         if constexpr (kPreloadOnormParams) {
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = sigmoid_fast(
-              bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
@@ -902,7 +876,6 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   }
 }
 
-
 // K3 decode configuration of the many-heads kernel: onorm fused, static
 // H = HV = 12 layout with a (B, HV) grid, onorm params preloaded, next state
 // chunk prefetched, active onorm reduction, conv cache updated in place,
@@ -910,35 +883,44 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 // and lower-bounded sigmoid) and selected at launch from the model config.
 // kUseTmaLoad/kTmaStages select the optional 1D-TMA state-staging path
 // (SGLANG_KDA_FUSED_DECODE_TMA_LOAD) in place of the default cp.async path.
-template <bool kUseLowerBound, bool kUseTmaLoad = false,
-         int kTmaStages = kNumChunks>
+template <bool kUseLowerBound, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
-    /*kApplyOnorm=*/true, /*kUseStaticDecodeLayout=*/true, /*kFixedHeads=*/12,
-    /*kFixedValueHeads=*/12, /*kUseHeadGrid=*/true,
-    /*kAccumulateOnormSumsq=*/false, /*kUseActiveQkReduction=*/false,
-    /*kUseCacheGlobalStore=*/false, /*kComputeOutputBeforeStore=*/false,
-    /*kSkipWarpSync=*/false, /*kPreloadOnormParams=*/true,
-    /*kPrefetchNextStateChunk=*/true, /*kUseActiveOnormReduction=*/true,
-    /*kUpdateConvState=*/true, kUseLowerBound,
-    /*kApplyBetaSigmoid=*/true, kUseTmaLoad, kTmaStages>;
+    /*kApplyOnorm=*/true,
+    /*kUseStaticDecodeLayout=*/true,
+    /*kFixedHeads=*/12,
+    /*kFixedValueHeads=*/12,
+    /*kUseHeadGrid=*/true,
+    /*kAccumulateOnormSumsq=*/false,
+    /*kUseActiveQkReduction=*/false,
+    /*kUseCacheGlobalStore=*/false,
+    /*kComputeOutputBeforeStore=*/false,
+    /*kSkipWarpSync=*/false,
+    /*kPreloadOnormParams=*/true,
+    /*kPrefetchNextStateChunk=*/true,
+    /*kUseActiveOnormReduction=*/true,
+    /*kUpdateConvState=*/true,
+    kUseLowerBound,
+    /*kApplyBetaSigmoid=*/true,
+    kUseTmaLoad,
+    kTmaStages>;
 
 struct KdaFusedDecodeKernel {
   static void
-  run(const tvm::ffi::TensorView mixed_qkv,  // [B, 3*H*128] bf16, row-strided
-      const tvm::ffi::TensorView a,          // [B, H*128] bf16 raw forget gate
-      const tvm::ffi::TensorView b,          // [B, H] bf16 raw beta logits
-      const tvm::ffi::TensorView conv_states,  // [slots, 3, conv_dim] bf16 pool
-      const tvm::ffi::TensorView w_q_t,        // [4, H*128] fp32 dense
-      const tvm::ffi::TensorView w_k_t,        // [4, H*128] fp32 dense
-      const tvm::ffi::TensorView w_v_t,        // [4, H*128] fp32 dense
-      const tvm::ffi::TensorView conv_bias,    // [3*H*128] fp32 (zeros if none)
-      const tvm::ffi::TensorView A_log,        // [H] fp32
-      const tvm::ffi::TensorView dt_bias,      // [H*128] fp32
-      const tvm::ffi::TensorView onorm_g,      // [B, H*128] bf16, row-strided
+  run(const tvm::ffi::TensorView mixed_qkv,     // [B, 3*H*128] bf16, row-strided
+      const tvm::ffi::TensorView a,             // [B, H*128] bf16 raw forget gate
+      const tvm::ffi::TensorView b,             // [B, H] bf16 raw beta logits
+      const tvm::ffi::TensorView conv_states,   // [slots, 3, conv_dim] bf16 pool
+      const tvm::ffi::TensorView w_q_t,         // [4, H*128] fp32 dense
+      const tvm::ffi::TensorView w_k_t,         // [4, H*128] fp32 dense
+      const tvm::ffi::TensorView w_v_t,         // [4, H*128] fp32 dense
+      const tvm::ffi::TensorView conv_bias,     // [3*H*128] fp32 (zeros if none)
+      const tvm::ffi::TensorView A_log,         // [H] fp32
+      const tvm::ffi::TensorView dt_bias,       // [H*128] fp32
+      const tvm::ffi::TensorView onorm_g,       // [B, H*128] bf16, row-strided
       const tvm::ffi::TensorView onorm_weight,  // [128] fp32
-      const tvm::ffi::TensorView state,     // [slots, H, 128, 128] fp32 dense
-      const tvm::ffi::TensorView indices,   // [B] int32 (< 0 = padded slot)
-      const tvm::ffi::TensorView out,       // [B, H*128] bf16 dense
+      const tvm::ffi::TensorView state,         // [slots, H, 128, 128] fp32 dense
+      const tvm::ffi::TensorView indices,       // [B] int32 (< 0 = padded slot)
+      const tvm::ffi::TensorView out,           // [B, H*128] bf16 dense
       double scale,
       double onorm_eps,
       double lower_bound,
@@ -983,8 +965,7 @@ struct KdaFusedDecodeKernel {
     const auto* mixed_ptr = static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr());
     auto* cs_ptr = static_cast<__nv_bfloat16*>(conv_states.data_ptr());
     const auto* bias_ptr = static_cast<const float*>(conv_bias.data_ptr());
-    auto kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true>
-                                  : kda_fused_decode_k3_kernel<false>;
+    auto kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true> : kda_fused_decode_k3_kernel<false>;
     int tma_stages = 0;
     if (kda_fused_decode_use_tma_load()) {
       // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
@@ -993,26 +974,23 @@ struct KdaFusedDecodeKernel {
       // fastest. Mirrors the KDA_decode standalone-kernel dispatch on
       // chunan/kda (KDA_DECODE_TMA_LOAD/KDA_DECODE_TMA_STAGES).
       const int override_stages = kda_fused_decode_tma_stages_override();
-      tma_stages = override_stages != 0 ? override_stages
-                                        : (B * static_cast<int>(kH) >= 1024 ? 3 : 4);
+      tma_stages = override_stages != 0 ? override_stages : (B * static_cast<int>(kH) >= 1024 ? 3 : 4);
       if (tma_stages == 2) {
-        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 2>
-                                  : kda_fused_decode_k3_kernel<false, true, 2>;
+        kernel =
+            use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 2> : kda_fused_decode_k3_kernel<false, true, 2>;
       } else if (tma_stages == 3) {
-        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 3>
-                                  : kda_fused_decode_k3_kernel<false, true, 3>;
+        kernel =
+            use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 3> : kda_fused_decode_k3_kernel<false, true, 3>;
       } else {
         tma_stages = 4;
-        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 4>
-                                  : kda_fused_decode_k3_kernel<false, true, 4>;
+        kernel =
+            use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 4> : kda_fused_decode_k3_kernel<false, true, 4>;
       }
     }
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
-    const size_t smem_bytes =
-        static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem_bytes)));
+    const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
+    host::RuntimeDeviceCheck(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
 
     LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)(
         kernel,

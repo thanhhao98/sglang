@@ -1519,8 +1519,7 @@ def biased_grouped_topk_gpu(
             # to fp32 internally anyway (identical math), and skipping the
             # upcast drops one elementwise kernel per MoE layer.
             _use_radix = (
-                MOE_FUSED_GATE_RADIX_ENABLED
-                or envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.get()
+                MOE_FUSED_GATE_RADIX_ENABLED or envs.SGLANG_OPT_USE_ROUTE_RADIX_V2.get()
             )
             _gating = (
                 gating_output
