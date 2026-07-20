@@ -2138,9 +2138,20 @@ class KimiK3LinearForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        # Also invoked by loader post-load hooks (DummyModelLoader,
+        # ShardedStateLoader, remote-instance flows -- none of which call
+        # load_weights), so e.g. dummy-weight benchmarks get w_kc/w_vc and
+        # the fused buffers too. Same pattern as deepseek_v4.
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue  # truncated config (e.g. num_hidden_layers override)
             layer = self.model.layers[layer_id]
+            if isinstance(layer, PPMissingLayer):
+                continue
             self_attn = layer.self_attn
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -2251,6 +2262,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if name == "model":
             return
         super().__setattr__(name, value)
+
+    def post_load_weights(self):
+        # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
+        self.language_model.post_load_weights()
 
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
