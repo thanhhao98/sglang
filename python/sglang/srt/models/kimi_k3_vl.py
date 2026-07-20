@@ -31,16 +31,55 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import print_info_once
 
 _FUSED_ROPE_MIN_TOKENS = 2048
+_SM103_TRITON_MAX_SEQLEN = 1536
+_SM103_FA4_MIN_ATTENTION_WORK = 3_000_000
 
 
 def _get_mm_attention_backend() -> str:
     try:
         server_args = get_server_args()
     except ValueError:
+        return "auto"
+    return server_args.mm_attention_backend or "auto"
+
+
+def _is_fa4_available() -> bool:
+    try:
+        from sglang.jit_kernel.flash_attention_v4 import (
+            is_flash_attention_v4_available,
+        )
+    except ImportError:
+        return False
+    return is_flash_attention_v4_available()
+
+
+def _resolve_mm_attention_backend(
+    configured_backend: str,
+    *,
+    max_seqlen: int,
+    total_tokens: int,
+    device: torch.device,
+    fa4_available: Optional[bool] = None,
+) -> str:
+    if configured_backend != "auto":
+        return configured_backend
+    if device.type != "cuda":
         return "sdpa"
-    return server_args.mm_attention_backend or "sdpa"
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        return "sdpa"
+
+    use_fa4 = (
+        max_seqlen > _SM103_TRITON_MAX_SEQLEN
+        or max_seqlen * total_tokens >= _SM103_FA4_MIN_ATTENTION_WORK
+    )
+    if use_fa4:
+        if fa4_available is None:
+            fa4_available = _is_fa4_available()
+        return "fa4" if fa4_available else "sdpa"
+    return "triton_attn"
 
 
 def apply_rope(
@@ -310,13 +349,22 @@ class MoonViTEncoderLayer(nn.Module):
         self.wqkv = nn.Linear(hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias)
         self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
         self.attention_backend = attention_backend
-        self.attention_backend_impl = (
-            None
-            if attention_backend == "sdpa"
-            else QKV_BACKEND_IMPL[attention_backend](
-                use_data_parallel=True,
-                workspace_buffer=attention_workspace,
+        if attention_backend == "auto":
+            implementation_backends = (
+                ("triton_attn", "fa4") if torch.cuda.is_available() else ()
             )
+        elif attention_backend == "sdpa":
+            implementation_backends = ()
+        else:
+            implementation_backends = (attention_backend,)
+        self.attention_backend_impls = nn.ModuleDict(
+            {
+                backend: QKV_BACKEND_IMPL[backend](
+                    use_data_parallel=True,
+                    workspace_buffer=attention_workspace,
+                )
+                for backend in implementation_backends
+            }
         )
 
     def _attention(
@@ -326,6 +374,7 @@ class MoonViTEncoderLayer(nn.Module):
         rope_freqs_cis: torch.Tensor,
         forward_metadata: VisionAttentionMetadata,
         use_fused_rope: bool,
+        selected_attention_backend: str,
     ) -> torch.Tensor:
         xqkv = self.wqkv(x)
         qkv_shape = xqkv.size()[:-1] + (
@@ -341,12 +390,12 @@ class MoonViTEncoderLayer(nn.Module):
         else:
             xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        if self.attention_backend_impl is None:
+        if selected_attention_backend == "sdpa":
             attn_out = sdpa_varlen_attention(xq, xk, xv, cu_seqlens)
         else:
-            if self.attention_backend == "flashinfer_cudnn":
+            if selected_attention_backend == "flashinfer_cudnn":
                 xv = xv.contiguous()
-            attn_out = self.attention_backend_impl(
+            attn_out = self.attention_backend_impls[selected_attention_backend](
                 xq,
                 xk,
                 xv,
@@ -364,6 +413,7 @@ class MoonViTEncoderLayer(nn.Module):
         rope_freqs_cis: torch.Tensor,
         forward_metadata: VisionAttentionMetadata,
         use_fused_rope: bool,
+        selected_attention_backend: str,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -373,6 +423,7 @@ class MoonViTEncoderLayer(nn.Module):
             rope_freqs_cis,
             forward_metadata,
             use_fused_rope,
+            selected_attention_backend,
         )
         hidden_states = residual + hidden_states
 
@@ -388,7 +439,7 @@ class MoonViT3dEncoder(nn.Module):
         super().__init__()
         qkv_hidden_size = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
         attention_backend = _get_mm_attention_backend()
-        if attention_backend not in QKV_BACKEND_IMPL:
+        if attention_backend != "auto" and attention_backend not in QKV_BACKEND_IMPL:
             raise ValueError(
                 f"Unsupported Kimi-K3 vision attention backend: {attention_backend}"
             )
@@ -400,6 +451,11 @@ class MoonViT3dEncoder(nn.Module):
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
         self.attention_backend = attention_backend
+        if attention_backend == "auto":
+            print_info_once(
+                "Kimi-K3 vision attention uses shape-aware auto selection on "
+                "B300/GB300 (Triton for small workloads, FA4 otherwise)."
+            )
         self.attention_width = qkv_hidden_size
         self.rope_2d = Rope2DPosEmbRepeated(
             qkv_hidden_size // block_cfg["num_heads"], 512, 512
@@ -428,6 +484,53 @@ class MoonViT3dEncoder(nn.Module):
             device=device,
         )
 
+    def precompile_attention_backend(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> bool:
+        if (
+            self.attention_backend != "auto"
+            or not self.blocks
+            or device.type != "cuda"
+            or torch.cuda.get_device_capability(device) != (10, 3)
+            or not _is_fa4_available()
+        ):
+            return False
+
+        block = self.blocks[0]
+        if "fa4" not in block.attention_backend_impls:
+            return False
+
+        num_tokens = 256
+        packed_qkv = torch.zeros(
+            (
+                num_tokens,
+                3,
+                block.num_heads,
+                block.hidden_size_per_attention_head,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        q = packed_qkv[:, 0].contiguous()
+        k = packed_qkv[:, 1].contiguous()
+        v = packed_qkv[:, 2]
+        cu_seqlens = torch.tensor(
+            [0, num_tokens], dtype=torch.int32, device=device
+        )
+        metadata = prepare_vision_attention_metadata(cu_seqlens, device=device)
+        with torch.inference_mode():
+            block.attention_backend_impls["fa4"](
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                bsz=1,
+                seq_len=num_tokens,
+                forward_metadata=metadata,
+            )
+        torch.cuda.synchronize(device)
+        return True
+
     def forward(
         self, hidden_states: torch.Tensor, grid_thws: torch.Tensor
     ) -> torch.Tensor:
@@ -455,6 +558,12 @@ class MoonViT3dEncoder(nn.Module):
             )
 
         use_fused_rope = _can_use_fused_rope(hidden_states, rope_freqs_cis)
+        selected_attention_backend = _resolve_mm_attention_backend(
+            self.attention_backend,
+            max_seqlen=forward_metadata.max_seqlen,
+            total_tokens=hidden_states.shape[0],
+            device=hidden_states.device,
+        )
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
@@ -462,6 +571,7 @@ class MoonViT3dEncoder(nn.Module):
                 rope_freqs_cis,
                 forward_metadata,
                 use_fused_rope,
+                selected_attention_backend,
             )
 
         return self.final_layernorm(hidden_states)
@@ -560,6 +670,9 @@ class KimiK3VisionTower(nn.Module):
 
     def precompile_fused_rope(self) -> bool:
         return self.encoder.precompile_fused_rope(self.dtype, self.device)
+
+    def precompile_attention_backend(self) -> bool:
+        return self.encoder.precompile_attention_backend(self.dtype, self.device)
 
     def forward(
         self,

@@ -11,11 +11,78 @@ from sglang.srt.models import kimi_k3_vl
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3VisionTower,
     MoonViT3dEncoder,
+    _resolve_mm_attention_backend,
     interpolate_pos_emb,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize(
+    (
+        "configured_backend",
+        "device_type",
+        "capability",
+        "max_seqlen",
+        "total_tokens",
+        "fa4_available",
+        "expected",
+    ),
+    [
+        ("sdpa", "cuda", (10, 3), 8192, 8192, True, "sdpa"),
+        ("auto", "cpu", None, 1024, 1024, True, "sdpa"),
+        ("auto", "cuda", (10, 0), 1024, 1024, True, "sdpa"),
+        ("auto", "cuda", (10, 3), 1536, 1536, True, "triton_attn"),
+        ("auto", "cuda", (10, 3), 1600, 1600, True, "fa4"),
+        ("auto", "cuda", (10, 3), 1024, 4096, True, "fa4"),
+        ("auto", "cuda", (10, 3), 1536, 1536, False, "triton_attn"),
+        ("auto", "cuda", (10, 3), 1600, 1600, False, "sdpa"),
+    ],
+)
+def test_kimi_k3_resolves_shape_aware_attention_backend(
+    monkeypatch,
+    configured_backend,
+    device_type,
+    capability,
+    max_seqlen,
+    total_tokens,
+    fa4_available,
+    expected,
+):
+    if capability is not None:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
+
+    actual = _resolve_mm_attention_backend(
+        configured_backend,
+        max_seqlen=max_seqlen,
+        total_tokens=total_tokens,
+        device=torch.device(device_type),
+        fa4_available=fa4_available,
+    )
+
+    assert actual == expected
+
+
+def test_kimi_k3_skips_attention_precompile_on_cpu():
+    encoder = MoonViT3dEncoder(
+        hidden_dim=8,
+        num_layers=1,
+        block_cfg={
+            "num_heads": 1,
+            "hidden_dim": 8,
+            "qkv_hidden_size": 8,
+            "mlp_dim": 16,
+            "norm_type": "rmsnorm",
+            "activation": F.gelu,
+            "attn_bias": False,
+            "linear_bias": False,
+        },
+    )
+
+    assert not encoder.precompile_attention_backend(
+        torch.bfloat16, torch.device("cpu")
+    )
 
 
 @pytest.mark.parametrize("mode", ["bilinear", "bicubic"])
