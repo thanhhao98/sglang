@@ -741,6 +741,12 @@ class Envs:
     )
     # MLA output gate x * sigmoid(g) fused into one kernel.
     SGLANG_K3_FUSE_O_GATE = EnvBool(True)
+    # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
+    # small messages and in-place NVLS 2shot on symmetric-memory tensors for
+    # large ones, with an optional fused residual add. Covers the KDA o_proj
+    # output and the latent|shared MoE reduce; everything else falls back to
+    # the regular all-reduce path. See srt/layers/k3_ar_fusion.py.
+    SGLANG_K3_AR_FUSION = EnvBool(False)
     # AttnRes aggregation backend:
     # fast (optimized CUDA, SM100+/H=7168 only) | fused (triton) | jit (CUDA)
     # | torch | legacy
