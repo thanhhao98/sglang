@@ -49,6 +49,7 @@ from sglang.srt.layers.dcp.kernels import (
     create_triton_kv_indices_for_dcp_triton,
     dcp_lse_combine_triton,
     dcp_mask_pack_triton,
+    dcp_pass2_causal_attn_triton,
 )
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
@@ -72,6 +73,7 @@ __all__ = [
     "dcp_a2a_lse_reduce_prepacked",
     "dcp_lse_combine_triton",
     "dcp_mask_pack_triton",
+    "dcp_pass2_causal_attn_triton",
     "dcp_unpack_lse_combine",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",

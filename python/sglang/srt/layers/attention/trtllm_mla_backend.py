@@ -31,6 +31,7 @@ from sglang.srt.layers.dcp import (
     dcp_enabled,
     dcp_lse_combine_triton,
     dcp_mask_pack_triton,
+    dcp_pass2_causal_attn_triton,
     dcp_unpack_lse_combine,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
@@ -241,12 +242,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
 
-        # DCP verify cascade: fused mask+pack / a2a-overlap / pass-1 no-cp
-        # A/B flags, cached once (read per layer otherwise).
+        # DCP verify cascade: fused mask+pack / a2a-overlap / pass-1 no-cp /
+        # Triton pass-2 A/B flags, cached once (read per layer otherwise).
         # See _forward_verify_dcp.
         self._dcp_fused_pack = envs.SGLANG_DCP_FUSED_PACK.get()
         self._dcp_a2a_overlap = envs.SGLANG_DCP_A2A_OVERLAP.get()
         self._dcp_pass1_no_cp = envs.SGLANG_DCP_PASS1_NO_CP.get()
+        self._dcp_triton_pass2 = envs.SGLANG_DCP_TRITON_PASS2.get()
         # Dedicated side stream (+ fork/join events) for the overlapped verify
         # a2a; created lazily on first use, shared across CUDA graphs.
         self._dcp_comm_stream: Optional[torch.cuda.Stream] = None
@@ -1286,33 +1288,62 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # ---- Pass-2: local causal-chain draft fold (drafts NOT sharded) ----
         q_local = q[
             :, :, dcp_rank * H_local : (dcp_rank + 1) * H_local, :
-        ].contiguous()  # [bs, T, H_local, head_dim]
-        draft_latent = torch.cat(
-            [k.reshape(N, self.kv_lora_rank), k_rope.reshape(N, self.qk_rope_head_dim)],
-            dim=-1,
-        )  # [N, kv_cache_dim] fp8
-        draft_pool = draft_latent.new_zeros(bs, self.page_size, self.kv_cache_dim)
-        draft_pool[:, :T, :] = draft_latent.reshape(bs, T, self.kv_cache_dim)
-        draft_pool = draft_pool.unsqueeze(1)  # [bs, 1, page_size, kv_cache_dim]
-        if metadata.dcp_draft_bt is not None:
-            draft_bt = metadata.dcp_draft_bt
+        ]  # [bs, T, H_local, head_dim] strided view
+        if metadata.dcp_draft_seq is not None:
             draft_seq = metadata.dcp_draft_seq
         else:
-            draft_bt = torch.arange(bs, dtype=torch.int32, device=q.device).view(bs, 1)
             draft_seq = torch.full((bs,), T, dtype=torch.int32, device=q.device)
-        o2, lse2 = self._run_decode_kernel(
-            query=q_local,
-            kv_cache=draft_pool,
-            block_tables=draft_bt,
-            seq_lens=draft_seq,
-            max_seq_len=T,
-            layer=layer,
-            return_lse=True,
-            cp_world=1,
-            cp_rank=0,
-            causal_seqs=None,
-            causal_mask=True,
-        )  # o2 [bs, T, H_local, vd], lse2 [bs, T, H_local]
+        if self._dcp_triton_pass2:
+            # Tiny Triton causal kernel (SGLANG_DCP_TRITON_PASS2=0 reverts):
+            # the T<=8-token chain fold is far below the tokenspeed kernel's
+            # launch/tiling floor, and reading k/k_rope directly also drops the
+            # per-layer draft page-pool build (cat + zeros + copy) and the
+            # q_local .contiguous(). Scales mirror the tokenspeed backend's
+            # _run_decode_kernel fp8-KV convention (softmax_scale =
+            # layer.scaling * k_scale, output_scale = k_scale); out is bf16 and
+            # lse fp32 base-2, the exact contract of the call it replaces.
+            k_scale = getattr(layer, "k_scale_float", None)
+            if k_scale is None:
+                k_scale = 1.0
+            o2, lse2 = dcp_pass2_causal_attn_triton(
+                q_local,
+                k.reshape(N, self.kv_lora_rank),
+                k_rope.reshape(N, self.qk_rope_head_dim),
+                draft_seq,
+                softmax_scale=float(layer.scaling) * float(k_scale),
+                output_scale=float(k_scale),
+            )  # o2 [bs, T, H_local, vd], lse2 [bs, T, H_local]
+        else:
+            q_local = q_local.contiguous()
+            draft_latent = torch.cat(
+                [
+                    k.reshape(N, self.kv_lora_rank),
+                    k_rope.reshape(N, self.qk_rope_head_dim),
+                ],
+                dim=-1,
+            )  # [N, kv_cache_dim] fp8
+            draft_pool = draft_latent.new_zeros(bs, self.page_size, self.kv_cache_dim)
+            draft_pool[:, :T, :] = draft_latent.reshape(bs, T, self.kv_cache_dim)
+            draft_pool = draft_pool.unsqueeze(1)  # [bs, 1, page_size, kv_cache_dim]
+            if metadata.dcp_draft_bt is not None:
+                draft_bt = metadata.dcp_draft_bt
+            else:
+                draft_bt = torch.arange(bs, dtype=torch.int32, device=q.device).view(
+                    bs, 1
+                )
+            o2, lse2 = self._run_decode_kernel(
+                query=q_local,
+                kv_cache=draft_pool,
+                block_tables=draft_bt,
+                seq_lens=draft_seq,
+                max_seq_len=T,
+                layer=layer,
+                return_lse=True,
+                cp_world=1,
+                cp_rank=0,
+                causal_seqs=None,
+                causal_mask=True,
+            )  # o2 [bs, T, H_local, vd], lse2 [bs, T, H_local]
 
         if overlap_a2a:
             # Join: pass-2 was issued while the side stream ran the a2a; gate
