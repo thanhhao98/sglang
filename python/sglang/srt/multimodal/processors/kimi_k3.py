@@ -179,10 +179,12 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     gpu_image_decode = True
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
+    auto_mm_processor_worker_num = 2
+    auto_mm_io_worker_num = 16
+    supports_mm_processor_concurrency = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.mm_tokens = MultimodalSpecialTokens(
+        mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             image_token_id=hf_config.media_placeholder_token_id,
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
@@ -190,10 +192,10 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
         media_proc_cfg = _processor.media_processor.media_proc_cfg
 
-        self._processor = KimiK3GPUProcessorWrapper(
+        processor = KimiK3GPUProcessorWrapper(
             _processor,
-            image_token=self.mm_tokens.image_token,
-            image_token_id=self.mm_tokens.image_token_id,
+            image_token=mm_tokens.image_token,
+            image_token_id=mm_tokens.image_token_id,
             patch_size=media_proc_cfg["patch_size"],
             merge_kernel_size=media_proc_cfg["merge_kernel_size"],
             in_patch_limit=media_proc_cfg["in_patch_limit"],
@@ -203,6 +205,8 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             image_std=media_proc_cfg["image_std"],
             transparent_bg_config=media_proc_cfg.get("transparent_bg_config"),
         )
+        super().__init__(hf_config, server_args, processor, *args, **kwargs)
+        self.mm_tokens = mm_tokens
 
     async def process_mm_data_async(
         self,
@@ -219,7 +223,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             discard_alpha_channel=False,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             sglang_original_input_ids=base_output.input_ids,

@@ -1,5 +1,6 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -16,8 +17,12 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
+from sglang.srt.multimodal.processors.kimi_k3 import (
+    KimiK3GPUProcessorWrapper,
+    KimiK3ImageProcessor,
+)
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    KimiGPUProcessorWrapper,
     KimiK2_5VLImageProcessor,
     _expand_image_token_ids,
     _resize_images_by_source_shape,
@@ -32,9 +37,72 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class _Tokenizer:
+    def encode(self, _text):
+        return []
+
+
+class _HFProcessor:
+    def __init__(self):
+        self.tokenizer = _Tokenizer()
+        self.image_processor = SimpleNamespace()
+        self.media_processor = SimpleNamespace(
+            media_proc_cfg={
+                "patch_size": 14,
+                "merge_kernel_size": 2,
+                "in_patch_limit": 16384,
+                "patch_limit_on_one_side": 256,
+                "fixed_output_tokens": None,
+                "image_mean": [0.5, 0.5, 0.5],
+                "image_std": [0.5, 0.5, 0.5],
+                "transparent_bg_config": None,
+            }
+        )
+
+
 def test_kimi_processors_precompute_hash_before_cpu_transfer():
     assert KimiK2_5VLImageProcessor.precompute_hash_before_cpu_transfer
     assert KimiK3ImageProcessor.precompute_hash_before_cpu_transfer
+
+
+@pytest.mark.parametrize(
+    ("processor_cls", "wrapper_cls"),
+    [
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper),
+        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper),
+    ],
+)
+def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
+    server_args = SimpleNamespace(
+        keep_mm_feature_on_device=True,
+        mm_feature_transport="cpu",
+        disable_fast_image_processor=False,
+        skip_tokenizer_init=False,
+        mm_process_config={},
+        mm_io_worker_num=0,
+        mm_processor_worker_num=0,
+        tokenizer_worker_num=1,
+        base_gpu_id=0,
+    )
+    processor = processor_cls(
+        hf_config=SimpleNamespace(media_placeholder_token_id=42),
+        server_args=server_args,
+        _processor=_HFProcessor(),
+        transport_mode=None,
+    )
+    try:
+        worker_processor = asyncio.run(
+            processor.mm_processor_executor.run(lambda *, processor: processor)
+        )
+        assert processor.mm_processor_worker_num == 2
+        assert processor.mm_io_worker_num == 16
+        assert isinstance(processor._processor, wrapper_cls)
+        assert isinstance(worker_processor, wrapper_cls)
+        assert worker_processor is not processor._processor
+    finally:
+        processor.mm_processor_executor.shutdown()
+        processor.io_executor.shutdown()
+        processor.cpu_executor.shutdown()
 
 
 class _MoonViT3dTower:

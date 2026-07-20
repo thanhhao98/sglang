@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     envs,
@@ -182,6 +183,9 @@ class BaseMultimodalProcessor(ABC):
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
+    auto_mm_processor_worker_num = 1
+    auto_mm_io_worker_num = 4
+    supports_mm_processor_concurrency = False
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -224,9 +228,64 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
+        requested_mm_io_worker_num = self.server_args.mm_io_worker_num
+        env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
+        if requested_mm_io_worker_num:
+            self.mm_io_worker_num = requested_mm_io_worker_num
+            io_worker_source = "explicit"
+        elif env_mm_io_worker_num is not None:
+            self.mm_io_worker_num = int(env_mm_io_worker_num)
+            io_worker_source = "environment"
+        else:
+            self.mm_io_worker_num = self.auto_mm_io_worker_num
+            io_worker_source = "auto"
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+            max_workers=self.mm_io_worker_num,
+            thread_name_prefix="sglang-mm-io",
         )
+        if self.mm_io_worker_num > 4:
+            logger.info(
+                "Multimodal data loading enabled with %d worker threads (%s).",
+                self.mm_io_worker_num,
+                io_worker_source,
+            )
+        skip_mm_pool = kwargs.get("skip_mm_pool", False)
+        requested_mm_processor_worker_num = self.server_args.mm_processor_worker_num
+        self.mm_processor_worker_num = (
+            1
+            if skip_mm_pool
+            else requested_mm_processor_worker_num or self.auto_mm_processor_worker_num
+        )
+        if (
+            self.mm_processor_worker_num > 1
+            and not self.supports_mm_processor_concurrency
+        ):
+            logger.warning(
+                "Concurrent multimodal processing is not supported by %s; "
+                "using synchronous processing.",
+                type(self).__name__,
+            )
+            self.mm_processor_worker_num = 1
+        self.mm_processor_executor = None
+        if self.mm_processor_worker_num > 1:
+            try:
+                self.mm_processor_executor = MultimodalProcessorExecutor(
+                    self._processor, self.mm_processor_worker_num
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to clone the multimodal processor for concurrent "
+                    "workers; falling back to synchronous processing.",
+                    exc_info=True,
+                )
+                self.mm_processor_worker_num = 1
+        if self.mm_processor_executor is not None:
+            logger.info(
+                "Multimodal processor concurrency enabled with %d isolated "
+                "worker threads (%s).",
+                self.mm_processor_worker_num,
+                "auto" if requested_mm_processor_worker_num == 0 else "explicit",
+            )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
@@ -275,8 +334,6 @@ class BaseMultimodalProcessor(ABC):
             "audio_features",
             "input_features",
         ]
-
-        skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if self.use_cuda_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
@@ -422,13 +479,25 @@ class BaseMultimodalProcessor(ABC):
             video_token_id=getattr(self, "VIDEO_TOKEN_ID", None),
         )
 
+    def _resolve_processor(self, processor=None):
+        if processor is None:
+            return self._processor, self._tokenizer
+        return processor, processor.tokenizer
+
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self,
+        input_text,
+        images=None,
+        videos=None,
+        audios=None,
+        processor=None,
+        **kwargs,
     ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
         """
         defer_feature_cpu_transfer = kwargs.pop("_defer_feature_cpu_transfer", False)
+        processor, tokenizer = self._resolve_processor(processor)
 
         if images:
             kwargs["images"] = images
@@ -439,7 +508,7 @@ class BaseMultimodalProcessor(ABC):
             if self.video_config:
                 kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
         if audios:
-            if self._processor.__class__.__name__ in {
+            if processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Gemma4Processor",
                 "Gemma4UnifiedProcessor",
@@ -457,7 +526,6 @@ class BaseMultimodalProcessor(ABC):
             if self.audio_config:
                 kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
-        processor = self._processor
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
@@ -491,7 +559,7 @@ class BaseMultimodalProcessor(ABC):
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
-            bos = getattr(self._tokenizer, "bos_token", None)
+            bos = getattr(tokenizer, "bos_token", None)
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
@@ -1217,7 +1285,13 @@ class BaseMultimodalProcessor(ABC):
         return list(items.values())
 
     def _process_and_collect_mm_items(
-        self, input_text: str, images=None, audios=None, videos=None, **kwargs
+        self,
+        input_text: str,
+        images=None,
+        audios=None,
+        videos=None,
+        processor=None,
+        **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
         Helper method to process multimodal data and create mm_items in one step.
@@ -1225,6 +1299,8 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (created mm_items, input_ids)
         """
+        if processor is not None:
+            kwargs["processor"] = processor
         ret = self.process_mm_data(
             input_text=input_text,
             images=images,
@@ -1354,6 +1430,7 @@ class BaseMultimodalProcessor(ABC):
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
+        processor=None,
         **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
@@ -1363,11 +1440,14 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (list of mm_items, input_ids)
         """
+        processor_override = processor
+        processor, tokenizer = self._resolve_processor(processor)
+
         # Collect all items and categorize them
         all_loaded_data = base_output.organize_results()
         # Handle text-only case
         if not all_loaded_data:
-            input_ids = self._tokenizer(
+            input_ids = tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -1391,6 +1471,8 @@ class BaseMultimodalProcessor(ABC):
         input_ids = None
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
+            if processor_override is not None:
+                kwargs["processor"] = processor
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
@@ -1480,7 +1562,7 @@ class BaseMultimodalProcessor(ABC):
                     break
 
         if input_ids is None:
-            input_ids = self._tokenizer(
+            input_ids = tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -1531,3 +1613,20 @@ class BaseMultimodalProcessor(ABC):
                     )
 
         return all_collected_items, input_ids, ret
+
+    async def process_and_combine_mm_data_async(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        **kwargs,
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        """Run multimodal preprocessing without blocking the event loop."""
+        if self.mm_processor_executor is None:
+            return self.process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
+
+        return await self.mm_processor_executor.run(
+            self.process_and_combine_mm_data,
+            base_output,
+            mm_tokens,
+            **kwargs,
+        )
