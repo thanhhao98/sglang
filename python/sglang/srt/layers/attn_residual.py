@@ -182,14 +182,14 @@ def _combine_kernel(
 # ---- Fused path: score → combine → RMSNorm(standard) ------------------------
 
 
-def _aggregate_fused(
+def _mix_fused(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
     nvb: int,
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
-    out_norm: RMSNorm,
 ) -> torch.Tensor:
+    """Triton score + combine pair: returns the pre-norm mixture."""
     T, H = prefix_sum.shape
     cw = get_cw(score_proj, score_norm)
     n_h_blocks = H // _BLOCK_H
@@ -229,9 +229,19 @@ def _aggregate_fused(
         MAX_ROWS=_MAX_ROWS,
         num_warps=4,
     )
+    return out
 
+
+def _aggregate_fused(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+) -> torch.Tensor:
     # Step 3: standard RMSNorm (sglang's optimized kernel)
-    return out_norm(out)
+    return out_norm(_mix_fused(prefix_sum, bank, nvb, score_proj, score_norm))
 
 
 # ---- JIT CUDA path: score → combine → RMSNorm(standard) ---------------------
@@ -266,14 +276,16 @@ def _aggregate_jit(
 # ---- PyTorch reference -------------------------------------------------------
 
 
-def _aggregate_torch(
+def aggregate_stream_torch(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
     nvb: int,
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
-    out_norm: RMSNorm,
 ) -> torch.Tensor:
+    """Eager reference for aggregate_stream (materializes [T, R, H])."""
+    if nvb == 0:
+        return prefix_sum
     T, H = prefix_sum.shape
     # rows = [bank[0..nvb-1], prefix_sum]  shape [T, nvb+1, H]
     rows = torch.cat([bank[:, :nvb, :], prefix_sum.unsqueeze(1)], dim=1)
@@ -284,8 +296,36 @@ def _aggregate_torch(
     # softmax + weighted sum of original rows
     probs = torch.softmax(scores.float(), dim=-1)
     mixed = (probs.unsqueeze(-1) * rows.float()).sum(dim=1)
-    # output norm
-    return out_norm(mixed.to(prefix_sum.dtype))
+    return mixed.to(prefix_sum.dtype)
+
+
+def _aggregate_torch(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+) -> torch.Tensor:
+    mixed = aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
+    return out_norm(mixed)
+
+
+def aggregate_stream(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+) -> torch.Tensor:
+    """Pre-norm aggregated stream value (softmax mixture, no output norm):
+    the K3 analogue of the residual stream, for dspark aux capture -- the
+    raw wire only carries the current block's running prefix."""
+    if nvb == 0:
+        return prefix_sum
+    if _MODE == "torch" or prefix_sum.shape[1] % _BLOCK_H != 0:
+        return aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
+    return _mix_fused(prefix_sum, bank, nvb, score_proj, score_norm)
 
 
 # ---- Fused residual-add + aggregation (jit mode) -----------------------------

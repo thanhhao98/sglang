@@ -32,7 +32,11 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import AttnResidual, BaseAttnResidual
+from sglang.srt.layers.attn_residual import (
+    AttnResidual,
+    BaseAttnResidual,
+    aggregate_stream,
+)
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_scatter,
@@ -2059,9 +2063,9 @@ class KimiK3LinearModel(nn.Module):
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
-                # Raw residual-stream capture, attn-res aggregation not
-                # folded in; the draft trains on whatever is exposed here.
-                aux_hidden_states.append(hidden_states)
+                aux_hidden_states.append(
+                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                )
 
         if not self.pp_group.is_last_rank:
             if attn_res is not None:
@@ -2103,6 +2107,37 @@ class KimiK3LinearModel(nn.Module):
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _dspark_capture_stream(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        attn_res: Optional[BaseAttnResidual],
+    ) -> torch.Tensor:
+        """Stream value after `layer_idx`: the pre-norm mixture its next
+        consumer would compute (next layer's attention side; output side
+        for the last layer)."""
+        if attn_res is None:
+            return (
+                hidden_states if residual is None else hidden_states + residual
+            )
+        if residual is not None:
+            # Materialize a delayed MLP add (mirrors the PP-wire fold).
+            hidden_states = residual + hidden_states
+        if layer_idx + 1 < self.end_layer:
+            next_layer = self.layers[layer_idx + 1]
+            score_proj = next_layer.self_attention_res_proj
+            score_norm = next_layer.self_attention_res_norm
+            nvb = next_layer.prev_valid_blocks
+        else:
+            # Last layer: the model's own output-side aggregation weights.
+            score_proj = self.output_attn_res_proj
+            score_norm = self.output_attn_res_norm
+            nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
+        return aggregate_stream(
+            hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
+        )
 
 
 # ---------------------------------------------------------------------------
