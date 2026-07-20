@@ -1,6 +1,6 @@
 """K3 MNNVL fused all-reduce dispatch (``SGLANG_K3_AR_FUSION``).
 
-Glue between the model and the ``jit_kernel.kimi_k3.ar_fusion`` kernels,
+Glue between the model and the ``jit_kernel.kimi_k3.all_reduce`` kernels,
 mirroring the NCCL-window design (pool + registered segments + find-window
 dispatch), but backed by torch symmetric memory:
 
@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +40,14 @@ logger = logging.getLogger(__name__)
 # above (measured: push 8.5us vs pull 11.0us at 448KB, 15.5 vs 11.0 at 896KB)
 _PUSH_MAX_BYTES = 512 * 1024
 
+# Latent width of the K3 latent|shared MoE buffer the fused-norm AR expects
+# ([N, NORM_DIM] latent then [N, 2*NORM_DIM] shared). MUST match kNormDim in
+# csrc/kimi_k3/comm/ar_fusion.cuh — the mod hardcodes this row width.
+NORM_DIM = 3584
+
 
 class _State:
-    def __init__(self, comm, world_size: int, group_name: str):
+    def __init__(self, comm: CustomAllReduceV2, world_size: int, group_name: str):
         self.comm = comm  # CustomAllReduceV2 (storage plane owner)
         self.world_size = world_size
         self.group_name = group_name
@@ -74,11 +84,11 @@ def _init_state() -> Optional[_State]:
             "is unavailable; falling back to the regular all-reduce path."
         )
         return None
-    from sglang.jit_kernel.kimi_k3 import ar_fusion
+    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
 
-    ar_fusion.register_comm(comm.obj)
+    mod.register_comm(comm.obj)
     _STATE = _State(comm, comm.world_size, group.cpu_group.group_name)
-    logger.info("K3 ar_fusion enabled (world_size=%d)", comm.world_size)
+    logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
     return _STATE
 
 
@@ -142,23 +152,58 @@ def _find_mc_ptr(state: _State, x: torch.Tensor) -> int:
 
 
 def all_reduce(
-    x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x) [+ residual]``; returns ``x``.
 
     Call-site contract (see module docstring): the state is initialized,
     ``x`` is bf16 and contiguous, and large inputs live in the symm pool.
     """
-    from sglang.jit_kernel.kimi_k3 import ar_fusion
+    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
 
     state = _STATE
+    assert state is not None
     if x.shape[0] == 0:
         return x if residual is None else x + residual
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
-        return ar_fusion.ar_fusion_push(
+        return mod.all_reduce_push_res(
             state.world_size, x, residual, ws_mc_base=state.comm.mc_base_ptr
         )
-    return ar_fusion.ar_fusion_pull_mc(
-        state.world_size, x, residual, input_mc_ptr=_find_mc_ptr(state, x)
-    )
+    else:
+        return mod.all_reduce_pull_res(
+            state.world_size, x, residual, input_mc_ptr=_find_mc_ptr(state, x)
+        )
+
+
+def all_reduce_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """In-place ``x = allreduce(x)`` with a fused RMSNorm over the latent;
+    returns ``x``.
+
+    ``x`` is the flattened K3 latent|shared MoE buffer ([N, :data:`NORM_DIM`]
+    latent then [N, 2*:data:`NORM_DIM`] shared); the first N rows (the latent)
+    get the RMSNorm epilogue with ``weight`` / ``eps``. Same dispatch and
+    call-site contract as :func:`all_reduce` (the eligibility of the buffer
+    layout is a construction-time invariant of the caller, not re-checked
+    here).
+    """
+    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+
+    state = _STATE
+    assert state is not None
+    if x.shape[0] == 0:
+        return x
+    nbytes = x.numel() * 2
+    if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
+        return mod.all_reduce_push_norm(
+            state.world_size, x, weight, eps, ws_mc_base=state.comm.mc_base_ptr
+        )
+    else:
+        return mod.all_reduce_pull_norm(
+            state.world_size, x, weight, eps, input_mc_ptr=_find_mc_ptr(state, x)
+        )

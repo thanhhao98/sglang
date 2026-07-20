@@ -732,7 +732,7 @@ class KimiK3MoE(nn.Module):
         )
 
         # Gate — fp32 output so routing (sigmoid, bias add, top-k) runs in
-        # full precision (matches GateLinear in mke).
+        # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
@@ -857,6 +857,18 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
+
+        # Static eligibility for fusing the fused-front latent all-reduce with
+        # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
+        # [latent | shared] buffer as [3N, NORM_DIM] rows and norms the first N,
+        # so it requires latent width == NORM_DIM and shared width == 2*NORM_DIM
+        # (K3: 3584 / 7168). Decided once here so the hot path only reads a bool
+        # and never re-validates dims per forward.
+        self.fuse_ar_norm = (
+            self.routed_expert_norm is not None
+            and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
+            and hidden_size == 2 * k3_ar_fusion.NORM_DIM
+        )
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1129,14 +1141,24 @@ class KimiK3MoE(nn.Module):
         # guaranteed in-place (custom-AR / pymscclpp paths return a new
         # tensor; only the symmetric-mempool pynccl path and the K3 fused
         # MNNVL path reduce in place).
+        fused_norm = False
         if k3_ar_fusion.enabled():
-            buf = k3_ar_fusion.all_reduce(buf)
+            if self.fuse_ar_norm:
+                fused_norm = True
+                norm = self.routed_expert_norm
+                assert norm is not None
+                k3_ar_fusion.all_reduce_norm(buf, norm.weight, norm.variance_epsilon)
+            else:
+                k3_ar_fusion.all_reduce(buf)
         else:
             buf = tensor_model_parallel_all_reduce(buf)
+
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        # up_proj is replicated, so the routed output is now fully reduced.
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        if not fused_norm:
+            latent = self._latent_norm(latent)
+        out, _ = self.routed_expert_up_proj(latent)
+
         # prefetch_bc: b (shared_output) was produced by the all-reduce and
         # c (prefix_sum) even earlier; the AR is a plain launch (full
         # barrier), so both are complete once the norm / up_proj GEMM chain

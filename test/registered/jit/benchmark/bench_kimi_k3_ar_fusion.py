@@ -14,7 +14,7 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import AllReduceAlgo, custom_all_reduce
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import multigpu_bench_main
-from sglang.jit_kernel.kimi_k3 import ar_fusion
+from sglang.jit_kernel.kimi_k3 import all_reduce
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.utils import cache_once
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -68,7 +68,7 @@ def _init_comm() -> CustomAllReduceV2:
     )
     if comm.disabled or comm.mc_base_ptr == 0:
         marker.skip("ar_fusion requires CustomAllReduceV2 with multicast")
-    ar_fusion.register_comm(comm.obj)
+    all_reduce.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -111,7 +111,9 @@ def benchmark(bs: int, provider: str):
             x = torch.randn(n, dtype=torch.bfloat16, device=device)
 
             def fn(t):
-                ar_fusion.ar_fusion_push(world, t, res, ws_mc_base=comm.mc_base_ptr)
+                all_reduce.all_reduce_push_res(
+                    world, t, res, ws_mc_base=comm.mc_base_ptr
+                )
 
             clone = (0,)
         else:
@@ -120,7 +122,7 @@ def benchmark(bs: int, provider: str):
             x.normal_()
 
             def fn(t):
-                ar_fusion.ar_fusion_pull_mc(world, t, res, input_mc_ptr=mc)
+                all_reduce.all_reduce_pull_res(world, t, res, input_mc_ptr=mc)
 
             clone = None  # the symm buffer must not be cloned
     elif provider == "car_v2":

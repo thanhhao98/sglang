@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.kimi_k3 import ar_fusion
+from sglang.jit_kernel.kimi_k3 import all_reduce
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
 from sglang.jit_kernel.utils import cache_once, get_ci_test_range
@@ -46,7 +46,7 @@ PULL_BS = get_ci_test_range(PULL_BS, [1, 64, 4096])
 
 def _precompile(num_gpus):
     for ws in num_gpus:
-        ar_fusion._jit_ar_fusion_module(ws)
+        all_reduce._jit_module(ws)
 
 
 @cache_once
@@ -84,7 +84,7 @@ def _init_comm() -> CustomAllReduceV2:
     )
     if comm.disabled or comm.mc_base_ptr == 0:
         raise RuntimeError("ar_fusion requires CustomAllReduceV2 with multicast")
-    ar_fusion.register_comm(comm.obj)
+    all_reduce.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -133,7 +133,7 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
     x = _int_input(n, bs, per_rank=True)
     residual = _int_input(n, bs + 7, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
-    ar_fusion.ar_fusion_push(world, x, residual, ws_mc_base=comm.mc_base_ptr)
+    all_reduce.all_reduce_push_res(world, x, residual, ws_mc_base=comm.mc_base_ptr)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -150,7 +150,7 @@ def test_ar_fusion_pull_mc(bs: int, use_residual: bool):
     x.copy_(_int_input(n, bs + 13, per_rank=True))
     residual = _int_input(n, bs + 17, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
-    ar_fusion.ar_fusion_pull_mc(world, x, residual, input_mc_ptr=mc)
+    all_reduce.all_reduce_pull_res(world, x, residual, input_mc_ptr=mc)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -166,12 +166,12 @@ def test_ar_fusion_stress_mixed():
         n = (1, 8, 64)[it % 3] * H
         x = _int_input(n, 3000 + it, per_rank=True)
         ref = _nccl_ref(x, None)
-        ar_fusion.ar_fusion_push(world, x, None, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, x, None, ws_mc_base=comm.mc_base_ptr)
         torch.testing.assert_close(x, ref, atol=0, rtol=0)
         y = buf[:n]
         y.copy_(_int_input(n, 4000 + it, per_rank=True))
         ref2 = _nccl_ref(y, None)
-        ar_fusion.ar_fusion_pull_mc(world, y, None, input_mc_ptr=mc)
+        all_reduce.all_reduce_pull_res(world, y, None, input_mc_ptr=mc)
         torch.testing.assert_close(y, ref2, atol=0, rtol=0)
 
 
@@ -189,16 +189,16 @@ def test_ar_fusion_graph_capture():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        ar_fusion.ar_fusion_push(world, gx, gres, ws_mc_base=comm.mc_base_ptr)
-        ar_fusion.ar_fusion_pull_mc(world, gy, gres, input_mc_ptr=mc)
+        all_reduce.all_reduce_push_res(world, gx, gres, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_pull_res(world, gy, gres, input_mc_ptr=mc)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     dist.barrier(group=cpu_group)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ar_fusion.ar_fusion_push(world, gx, gres, ws_mc_base=comm.mc_base_ptr)
-        ar_fusion.ar_fusion_pull_mc(world, gy, gres, input_mc_ptr=mc)
+        all_reduce.all_reduce_push_res(world, gx, gres, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_pull_res(world, gy, gres, input_mc_ptr=mc)
 
     for it in range(4):
         vx = _int_input(n, 5000 + it, per_rank=True)
