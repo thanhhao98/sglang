@@ -809,9 +809,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     max_prefix_blocks,
                     PAGED_SIZE=eff_page,
                 )
-                self.forward_decode_metadata.dcp_prefix_block_kv_indices = (
-                    dcp_prefix_bt
-                )
+                self.forward_decode_metadata.dcp_prefix_block_kv_indices = dcp_prefix_bt
                 # Per-STEP hoists for the verify cascade (layer-invariant;
                 # previously rebuilt 61x per step inside _forward_verify_dcp).
                 md = self.forward_decode_metadata

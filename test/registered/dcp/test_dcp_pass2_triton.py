@@ -126,7 +126,7 @@ class TestPass2TritonVsRef(unittest.TestCase):
     ]
 
     def _check(self, q, k_latent, k_rope, seq, scale, out_scale, tag):
-        from sglang.srt.layers.dcp.kernels import dcp_pass2_causal_attn_triton
+        from sglang.srt.layers.dcp import dcp_pass2_causal_attn_triton
 
         out, lse = dcp_pass2_causal_attn_triton(
             q, k_latent, k_rope, seq, softmax_scale=scale, output_scale=out_scale
@@ -173,7 +173,7 @@ class TestPass2TritonVsRef(unittest.TestCase):
         """Production passes q as a HEAD-SLICE view of the full-head gathered
         query (no .contiguous()); k/k_rope may be row-strided. The kernel takes
         raw strides, so all must match the contiguous result bit-for-bit."""
-        from sglang.srt.layers.dcp.kernels import dcp_pass2_causal_attn_triton
+        from sglang.srt.layers.dcp import dcp_pass2_causal_attn_triton
 
         bs, T, H_local, W = 2, 8, 8, 8
         H_full = H_local * W
@@ -216,7 +216,7 @@ class TestPass2TritonVsRef(unittest.TestCase):
         """Perturbing draft KV at position j must not change any out/lse row
         with qt < j (bit-identical — the masked loads never touch those
         addresses)."""
-        from sglang.srt.layers.dcp.kernels import dcp_pass2_causal_attn_triton
+        from sglang.srt.layers.dcp import dcp_pass2_causal_attn_triton
 
         bs, T, H = 2, 8, 8
         q, kl, kr, seq = _rand_inputs(bs, T, H, torch.bfloat16, "cuda", seed=17)
@@ -249,7 +249,7 @@ class TestPass2CascadeCombine(unittest.TestCase):
     """
 
     def test_cascade_identity(self):
-        from sglang.srt.layers.dcp.kernels import (
+        from sglang.srt.layers.dcp import (
             dcp_lse_combine_triton,
             dcp_pass2_causal_attn_triton,
         )
@@ -322,7 +322,7 @@ class TestPass2TritonVsTokenspeed(unittest.TestCase):
     def test_both_within_fp32_reference(self):
         import tokenspeed_mla
 
-        from sglang.srt.layers.dcp.kernels import dcp_pass2_causal_attn_triton
+        from sglang.srt.layers.dcp import dcp_pass2_causal_attn_triton
 
         bs, T, H, PAGE = 4, 8, 8, 64
         dev, dtype = torch.device("cuda"), torch.float8_e4m3fn

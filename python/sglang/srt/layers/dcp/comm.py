@@ -46,6 +46,7 @@ def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
         stacklevel=2,
     )
 
+
 # DCP shards only the TARGET's decode/verify. The speculative DRAFT model runs
 # unsharded (dcp_size=1, its own small KV pool); disable DCP for the duration of
 # any draft forward so its (MLA) attention + KV write stay full and match its

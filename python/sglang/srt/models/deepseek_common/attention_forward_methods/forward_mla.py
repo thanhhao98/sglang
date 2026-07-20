@@ -802,9 +802,7 @@ class DeepseekMLAForwardMixin:
                             else {}
                         ),
                     )
-                elif (
-                    forward_batch.forward_mode.is_target_verify() and dcp_enabled()
-                ):
+                elif forward_batch.forward_mode.is_target_verify() and dcp_enabled():
                     # verify: the backend runs the 2-pass cascade and returns the
                     # already cross-rank-merged FINAL output (a single tensor), so
                     # the decode-only LSE merge below (is_decode()-guarded) is

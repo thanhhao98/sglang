@@ -45,7 +45,6 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
     dcp_enabled,
-    draft_forward_active,
     draft_forward_guard,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,

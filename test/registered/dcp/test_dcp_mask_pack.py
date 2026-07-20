@@ -47,7 +47,7 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 def _lse_pack_dim(dtype: torch.dtype) -> int:
-    # Mirror of sglang.srt.layers.dcp.kernels._lse_pack_dim, kept local so the
+    # Mirror of sglang.kernels.ops.attention.dcp_kernels._lse_pack_dim, kept local so the
     # CPU-reference tests run without importing triton.
     return torch.finfo(torch.float32).bits // torch.finfo(dtype).bits
 
@@ -174,7 +174,7 @@ class TestMaskPackKernelVsRef(unittest.TestCase):
     ]
 
     def _check(self, o1, lse1, zero, cp_world, tag):
-        from sglang.srt.layers.dcp.kernels import dcp_mask_pack_triton
+        from sglang.srt.layers.dcp import dcp_mask_pack_triton
 
         send_gpu = dcp_mask_pack_triton(o1, lse1, zero, cp_world)
         ref = _mask_pack_ref(o1.cpu(), lse1.cpu(), zero.cpu(), cp_world)
@@ -246,7 +246,7 @@ class TestMaskPackE2EOldVsNew(unittest.TestCase):
             dcp_a2a_lse_reduce,
             dcp_unpack_lse_combine,
         )
-        from sglang.srt.layers.dcp.kernels import dcp_mask_pack_triton
+        from sglang.srt.layers.dcp import dcp_mask_pack_triton
 
         torch.manual_seed(23)
         N, bs, T, H, D = self.N, self.BS, self.T, self.H_FULL, self.D
