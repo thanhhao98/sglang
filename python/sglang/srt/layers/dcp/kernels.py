@@ -360,6 +360,8 @@ def _dcp_lse_combine_kernel(
     out_stride_B,
     out_stride_H,
     out_stride_D,
+    out_lse_stride_B,
+    out_lse_stride_H,
     N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
@@ -431,7 +433,12 @@ def _dcp_lse_combine_kernel(
             global_lse = tl.log(weight_sum) + lse_max
         else:
             global_lse = tl.log2(weight_sum) + lse_max
-        out_lse_offset = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
+        # Store with out_lse's OWN strides. The recv_lse strides used before
+        # only worked because every caller passed a contiguous [N, B, H]
+        # recv_lse whose (B, H) strides coincide with contiguous out_lse's;
+        # a strided recv_lse (the zero-copy packed-tail view of
+        # comm.dcp_unpack_lse_combine) made the store scatter out of bounds.
+        out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
 
@@ -457,11 +464,14 @@ def dcp_lse_combine_triton(
     out = torch.empty(
         (B, H_local, D), device=recv_output.device, dtype=recv_output.dtype
     )
-    out_lse = (
-        torch.empty((B, H_local), device=recv_lse.device, dtype=recv_lse.dtype)
-        if return_lse
-        else recv_lse.new_empty(0)
-    )
+    if return_lse:
+        out_lse = torch.empty(
+            (B, H_local), device=recv_lse.device, dtype=recv_lse.dtype
+        )
+        out_lse_stride_b, out_lse_stride_h = out_lse.stride(0), out_lse.stride(1)
+    else:
+        out_lse = recv_lse.new_empty(0)  # 1-D placeholder, never stored to
+        out_lse_stride_b = out_lse_stride_h = 0
 
     grid = (B, H_local)
     _dcp_lse_combine_kernel[grid](
@@ -479,6 +489,8 @@ def dcp_lse_combine_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        out_lse_stride_b,
+        out_lse_stride_h,
         N=N,
         HEAD_DIM=D,
         IS_BASE_E=is_lse_base_on_e,
