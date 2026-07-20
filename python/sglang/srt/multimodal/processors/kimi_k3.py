@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -29,7 +30,6 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _grid_thw_from_resize_config,
-    _normalize_image,
     navit_resize_config,
 )
 
@@ -101,24 +101,16 @@ def _k3_process_single_image(
     image = _k3_to_cuda_chw(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
-    pad_h, pad_w = config["pad_height"], config["pad_width"]
+    padded_h = new_h + config["pad_height"]
+    padded_w = new_w + config["pad_width"]
 
     x = image.unsqueeze(0).float()
     x = F.interpolate(x, size=(new_h, new_w), mode="bicubic", align_corners=False)
     x = _fill_transparent_bg(x, transparent_bg_config)
 
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, pad_w, 0, pad_h), value=0.0)
-
-    x = _normalize_image(x, image_scale, image_bias)
-
-    _, C, H, W = x.shape
-    T = 1
-    gh, gw = H // patch_size, W // patch_size
-    x = x.view(T, C, gh, patch_size, gw, patch_size)
-    x = x.permute(0, 2, 4, 1, 3, 5).reshape(-1, C, patch_size, patch_size)
-
-    return x
+    return normalize_and_patchify(
+        x, image_scale, image_bias, patch_size, padded_h, padded_w
+    ).squeeze(0)
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):

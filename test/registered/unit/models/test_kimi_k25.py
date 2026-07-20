@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -26,7 +27,6 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiK2_5VLImageProcessor,
     _expand_image_token_ids,
     _grid_thw_from_resize_config,
-    _normalize_image,
     _resize_images_by_source_shape,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -83,8 +83,8 @@ def test_kimi_k3_builds_grid_metadata_on_cpu_from_resize_config():
     assert grid_thw.tolist() == [[1, 16, 24]]
 
 
-def test_kimi_fused_image_normalization_matches_reference():
-    image = torch.linspace(0.0, 255.0, 3 * 8 * 8).reshape(1, 3, 8, 8)
+def test_kimi_normalize_and_patchify_matches_reference_on_cpu():
+    image = torch.linspace(0.0, 255.0, 2 * 3 * 15 * 16).reshape(2, 3, 15, 16)
     image_mean_values = [0.48145466, 0.4578275, 0.40821073]
     image_std_values = [0.26862954, 0.26130258, 0.27577711]
     wrapper = KimiGPUProcessorWrapper(
@@ -103,8 +103,11 @@ def test_kimi_fused_image_normalization_matches_reference():
     image_mean = torch.tensor(image_mean_values).view(1, 3, 1, 1)
     image_std = torch.tensor(image_std_values).view(1, 3, 1, 1)
 
-    actual = _normalize_image(image, image_scale, image_bias)
-    expected = (image / 255.0 - image_mean) / image_std
+    actual = normalize_and_patchify(image, image_scale, image_bias, 14, 28, 28)
+    expected = F.pad(image, (0, 12, 0, 13), value=0.0)
+    expected = (expected / 255.0 - image_mean) / image_std
+    expected = expected.view(2, 3, 2, 14, 2, 14)
+    expected = expected.permute(0, 2, 4, 1, 3, 5).reshape(2, 4, 3, 14, 14)
 
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 

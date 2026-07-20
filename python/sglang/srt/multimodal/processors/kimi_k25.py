@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
@@ -139,12 +140,6 @@ def _grid_thw_from_resize_config(config: dict, patch_size: int) -> tuple[int, in
     return 1, height // patch_size, width // patch_size
 
 
-def _normalize_image(
-    image: torch.Tensor, image_scale: torch.Tensor, image_bias: torch.Tensor
-) -> torch.Tensor:
-    return torch.addcmul(image_bias, image, image_scale)
-
-
 def _process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
@@ -159,23 +154,15 @@ def _process_single_image(
         image = _ensure_chw_rgb(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
-    pad_h, pad_w = config["pad_height"], config["pad_width"]
+    padded_h = new_h + config["pad_height"]
+    padded_w = new_w + config["pad_width"]
 
     x = image.unsqueeze(0).float()
     x = F.interpolate(x, size=(new_h, new_w), mode="bicubic", align_corners=False)
 
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, pad_w, 0, pad_h), value=0.0)
-
-    x = _normalize_image(x, image_scale, image_bias)
-
-    _, C, H, W = x.shape
-    T = 1
-    gh, gw = H // patch_size, W // patch_size
-    x = x.view(T, C, gh, patch_size, gw, patch_size)
-    x = x.permute(0, 2, 4, 1, 3, 5).reshape(-1, C, patch_size, patch_size)
-
-    return x
+    return normalize_and_patchify(
+        x, image_scale, image_bias, patch_size, padded_h, padded_w
+    ).squeeze(0)
 
 
 def _resize_images_by_source_shape(
@@ -277,19 +264,15 @@ def _gpu_preprocess_images(
                 dim=0,
             )
 
-            pad_h = padded_h - target_h
-            pad_w = padded_w - target_w
-            if pad_h > 0 or pad_w > 0:
-                batch = F.pad(batch, (0, pad_w, 0, pad_h), value=0.0)
-
-            batch = _normalize_image(batch, image_scale, image_bias)
-
-            B, C, H, W = batch.shape
             T = 1
-            gh, gw = H // patch_size, W // patch_size
-            batch = batch.view(B, C, gh, patch_size, gw, patch_size)
-            batch = batch.permute(0, 2, 4, 1, 3, 5).reshape(
-                B, -1, C, patch_size, patch_size
+            gh, gw = padded_h // patch_size, padded_w // patch_size
+            batch = normalize_and_patchify(
+                batch,
+                image_scale,
+                image_bias,
+                patch_size,
+                padded_h,
+                padded_w,
             )
 
             grid = (T, gh, gw)
