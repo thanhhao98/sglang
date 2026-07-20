@@ -320,6 +320,21 @@ def _register_for(*architectures: str):
     return decorator
 
 
+@_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
+    if (
+        is_sm100_supported()
+        and get_device_sm() in (100, 103)
+        and server_args.is_attention_backend_not_set()
+    ):
+        logger.info(
+            "Use cutedsl_mla as the default decode attention backend for "
+            "Kimi-K3 on SM100/SM103."
+        )
+        return {"decode_attention_backend": "cutedsl_mla"}
+    return {}
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
