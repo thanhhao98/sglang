@@ -297,6 +297,14 @@ class Envs:
     # to 0 to serialize on the current stream for A/B. Only effective with
     # SGLANG_DCP_FUSED_PACK=1.
     SGLANG_DCP_A2A_OVERLAP = EnvBool(True)
+    # DCP verify cascade pass-1: call the tokenspeed decode kernel WITHOUT the
+    # cp_world/cp_rank/causal_seqs args. Pass-1 is non-causal (causal_mask=
+    # False) and in the tokenspeed fp8 kernel every cp_world / K_causal use
+    # sits inside a `const_expr(is_causal)` branch (the per-token causal
+    # k_bound arithmetic), so under causal_mask=False the cp path is dead code
+    # and the plain variant attends to the identical seq_lens[b]-token local
+    # slice. Set to 0 to revert to the cp_world>1 call for A/B.
+    SGLANG_DCP_PASS1_NO_CP = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

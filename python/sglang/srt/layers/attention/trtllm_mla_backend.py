@@ -241,10 +241,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
 
-        # DCP verify cascade: fused mask+pack / a2a-overlap A/B flags, cached
-        # once (read per layer otherwise). See _forward_verify_dcp.
+        # DCP verify cascade: fused mask+pack / a2a-overlap / pass-1 no-cp
+        # A/B flags, cached once (read per layer otherwise).
+        # See _forward_verify_dcp.
         self._dcp_fused_pack = envs.SGLANG_DCP_FUSED_PACK.get()
         self._dcp_a2a_overlap = envs.SGLANG_DCP_A2A_OVERLAP.get()
+        self._dcp_pass1_no_cp = envs.SGLANG_DCP_PASS1_NO_CP.get()
         # Dedicated side stream (+ fork/join events) for the overlapped verify
         # a2a; created lazily on first use, shared across CUDA graphs.
         self._dcp_comm_stream: Optional[torch.cuda.Stream] = None
@@ -1194,6 +1196,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             local_prefix_max = (
                 int(local_prefix.max().item()) if local_prefix.numel() else 0
             )
+        # Pass-1 is NON-causal, and in the tokenspeed fp8 decode kernel every
+        # cp_world / K_causal(=causal_seqs) use sits inside a
+        # `const_expr(is_causal)` branch (the per-token causal k_bound
+        # arithmetic in mla_decode_fp8.py), so under causal_mask=False the cp
+        # path is dead code: the kernel attends to exactly seq_lens[b] local
+        # tokens either way (block table / seq_lens are already this rank's
+        # LOCAL compacted slice; cp_world never touches KV indexing). Default
+        # drops the cp args to compile the plain non-causal variant;
+        # SGLANG_DCP_PASS1_NO_CP=0 restores the cp_world call for A/B.
+        if self._dcp_pass1_no_cp:
+            pass1_cp_world, pass1_cp_rank, pass1_causal_seqs = 1, 0, None
+        else:
+            pass1_cp_world, pass1_cp_rank, pass1_causal_seqs = (
+                dcp_world,
+                dcp_rank,
+                global_prefix,
+            )
         o1, lse1 = self._run_decode_kernel(
             query=q,
             kv_cache=kv_cache,
@@ -1202,9 +1221,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_seq_len=max(local_prefix_max, 1),
             layer=layer,
             return_lse=True,
-            cp_world=dcp_world,
-            cp_rank=dcp_rank,
-            causal_seqs=global_prefix,
+            cp_world=pass1_cp_world,
+            cp_rank=pass1_cp_rank,
+            causal_seqs=pass1_causal_seqs,
             causal_mask=False,
         )
         # o1 [bs, T, H_full, vd], lse1 [bs, T, H_full]. Mask requests this rank
