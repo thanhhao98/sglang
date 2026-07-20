@@ -336,6 +336,12 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # DCP verify cascade: fuse the zero-owner mask + a2a-send pack into one
+    # Triton kernel (kernels.dcp_mask_pack_triton). Set to 0 to revert to the
+    # torch.where/.contiguous/pack-copy path for A/B (a2a comm backend only;
+    # fi_a2a always uses the old path).
+    SGLANG_DCP_FUSED_PACK = EnvBool(True)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

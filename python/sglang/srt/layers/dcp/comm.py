@@ -46,7 +46,6 @@ def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
         stacklevel=2,
     )
 
-
 # DCP shards only the TARGET's decode/verify. The speculative DRAFT model runs
 # unsharded (dcp_size=1, its own small KV pool); disable DCP for the duration of
 # any draft forward so its (MLA) attention + KV write stay full and match its
@@ -561,6 +560,75 @@ def dcp_a2a_lse_reduce(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
     return (combined, combined_lse) if return_lse else combined
+
+
+# ---------------------------------------------------------------------------
+# Pre-packed a2a entry points (verify-DCP fast path). The send buffer is
+# built by the fused kernels.dcp_mask_pack_triton (mask + pack in one kernel),
+# so these skip dcp_a2a_lse_reduce's own pack. The exchange and the unpack+
+# combine are split so the caller can run the exchange on a side stream and
+# overlap it with independent compute (pass-2 of the verify cascade).
+# dcp_a2a_lse_reduce itself is untouched — the decode path still uses it.
+# ---------------------------------------------------------------------------
+
+
+def dcp_a2a_exchange_packed(
+    send_combined: torch.Tensor,
+    recv_combined: torch.Tensor,
+    cp_group: "GroupCoordinator",
+) -> None:
+    """Cross-rank exchange of a PRE-PACKED [N, B, H_per_rank, D+lpd] buffer.
+
+    Byte-level (uint8) all_to_all for dtype-agnostic transport, identical to
+    the exchange inside dcp_a2a_lse_reduce. Runs on the CURRENT stream — the
+    caller owns any side-stream fork/join and the buffers' lifetimes.
+    """
+    cp_group.all_to_all_single(
+        recv_combined.reshape(-1).view(torch.uint8),
+        send_combined.reshape(-1).view(torch.uint8),
+    )
+
+
+def dcp_unpack_lse_combine(
+    recv_combined: torch.Tensor,
+    D: int,
+    is_lse_base_on_e: bool = True,
+    return_lse: bool = False,
+):
+    """Local LSE combine of a recv buffer in the packed a2a layout.
+
+    Zero-copy unpack: the output partials are the [:D] slice and the fp32 LSE
+    is read through a strided fp32 alias of the [D:] tail (the Triton combine
+    kernel handles both strides), replacing the old staging-copy unpack with
+    no extra kernel. Bit-identical bytes reach the combine either way.
+
+    Returns (out [B, H_per_rank, D], lse [B, H_per_rank] or None).
+    """
+    out_dtype = recv_combined.dtype
+    recv_output = recv_combined[:, :, :, :D]
+    # 4-byte alignment of the LSE slots is guaranteed by dcp_mask_pack_triton
+    # (it asserts at pack time); the fp32 alias below relies on it.
+    lse_f32_idx = (D * out_dtype.itemsize) // 4
+    recv_lse = recv_combined.view(torch.float32)[:, :, :, lse_f32_idx]
+    return dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
+    )
+
+
+def dcp_a2a_lse_reduce_prepacked(
+    send_combined: torch.Tensor,
+    D: int,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+    return_lse: bool = False,
+):
+    """Synchronous pre-packed sibling of dcp_a2a_lse_reduce: exchange + local
+    combine, skipping the pack (already fused into dcp_mask_pack_triton)."""
+    recv_combined = torch.empty_like(send_combined)
+    dcp_a2a_exchange_packed(send_combined, recv_combined, cp_group)
+    return dcp_unpack_lse_combine(
+        recv_combined, D, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
+    )
 
 
 def _dcp_fi_a2a_lse_reduce(

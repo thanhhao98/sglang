@@ -33,6 +33,9 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
 )
 from sglang.srt.layers.dcp.comm import (
+    dcp_a2a_exchange_packed,
+    dcp_a2a_lse_reduce_prepacked,
+    dcp_unpack_lse_combine,
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -48,6 +51,10 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_world_size,
     draft_forward_guard,
     init_fi_a2a_workspace,
+)
+from sglang.kernels.ops.attention.dcp_kernels import (
+    dcp_lse_combine_triton,
+    dcp_mask_pack_triton,
 )
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
@@ -67,7 +74,12 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 __all__ = [
     "draft_forward_guard",
     "DecodeContextParallelMetadata",
+    "dcp_a2a_exchange_packed",
     "dcp_a2a_lse_reduce",
+    "dcp_a2a_lse_reduce_prepacked",
+    "dcp_lse_combine_triton",
+    "dcp_mask_pack_triton",
+    "dcp_unpack_lse_combine",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
