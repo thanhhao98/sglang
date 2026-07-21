@@ -29,6 +29,9 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -409,8 +412,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             use_ragged = (
                 not get_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
-                # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
+                # Captured prefill (tc_piecewise or breakable) must use paged
+                # prefill: it stays compatible with prefix cache, and the ragged
+                # wrapper rejects the absorbed-MLA head dims (qk=576, vo=512).
                 and not is_in_tc_piecewise_cuda_graph()
+                and not is_in_breakable_cuda_graph()
             )
 
             self.indices_updater_prefill.update(
