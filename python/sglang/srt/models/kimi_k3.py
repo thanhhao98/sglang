@@ -37,6 +37,7 @@ from sglang.srt.layers.attn_residual import (
     BaseAttnResidual,
     aggregate_stream,
 )
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_scatter,
@@ -984,7 +985,10 @@ class KimiK3MoE(nn.Module):
         )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-            if self.routed_scaling_factor is not None and self.routed_scaling_factor != 1.0:
+            if (
+                self.routed_scaling_factor is not None
+                and self.routed_scaling_factor != 1.0
+            ):
                 y.mul_(self.routed_scaling_factor)
         return y
 
@@ -2243,9 +2247,7 @@ class KimiK3LinearModel(nn.Module):
         consumer would compute (next layer's attention side; output side
         for the last layer)."""
         if attn_res is None:
-            return (
-                hidden_states if residual is None else hidden_states + residual
-            )
+            return hidden_states if residual is None else hidden_states + residual
         if residual is not None:
             # Materialize a delayed MLP add (mirrors the PP-wire fold).
             hidden_states = residual + hidden_states
@@ -2340,6 +2342,34 @@ class KimiK3LinearForCausalLM(nn.Module):
                 aux_hidden_states,
             )
         return hidden_states
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        return prepare_decode_context_parallel_metadata(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         use_full_rank_gate = bool(
@@ -2679,6 +2709,34 @@ class KimiK3ForConditionalGeneration(nn.Module):
     @property
     def end_layer(self) -> int:
         return self.language_model.model.end_layer
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        return self.language_model.prepare_context_parallel_metadata_for_dcp(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+        )
 
     def forward(
         self,
