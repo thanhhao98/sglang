@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
-    """Kimi-K3 speculative-decoding backend defaults (explicit flags win)."""
+    """Apply speculative backend defaults for Kimi hybrid models."""
     from sglang.srt.utils import is_sm100_supported
 
     if server_args.speculative_algorithm is None:
@@ -23,7 +23,7 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     if server_args.linear_attn_verify_backend is None:
         server_args.linear_attn_verify_backend = "triton"
         logger.info(
-            "Kimi-K3 with speculative decoding: pinning "
+            "Kimi hybrid model with speculative decoding: pinning "
             "--linear-attn-verify-backend to triton (keeps KDA verify on "
             "the triton kernel)."
         )
@@ -37,6 +37,6 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     ):
         server_args.speculative_draft_attention_backend = "trtllm_mha"
         logger.info(
-            "Kimi-K3 DSPARK: defaulting "
+            "Kimi hybrid DSPARK: defaulting "
             "--speculative-draft-attention-backend to trtllm_mha."
         )

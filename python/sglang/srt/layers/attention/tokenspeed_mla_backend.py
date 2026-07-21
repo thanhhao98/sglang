@@ -372,7 +372,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         if get_parallel().dcp_enabled:
             self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(self.max_context_len)
+                self._get_dcp_local_max_seq_len(
+                    self.max_context_len
+                    + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
+                )
             )
 
     def _apply_cuda_graph_metadata(
@@ -384,26 +387,38 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ):
         if not get_parallel().dcp_enabled:
             return super()._apply_cuda_graph_metadata(
-                bs, req_pool_indices, seq_lens, forward_mode
+                bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode,
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_target_verify():
-            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
-            seq_lens = metadata.seq_lens_k
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(
+                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
+            )
+            local_seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
         else:
             seq_lens = seq_lens[:bs]
+            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
 
         self._fill_dcp_block_kv_indices(
             metadata.block_kv_indices,
             req_pool_indices[:bs],
-            self._get_dcp_local_seq_lens(seq_lens),
+            local_seq_lens,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -417,6 +432,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
+            if forward_batch.forward_mode.is_target_verify():
+                metadata = self.forward_decode_metadata
+                metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                    metadata.global_seq_lens_k
+                )
             self.forward_decode_metadata.max_seq_len_k = (
                 self._get_dcp_local_max_seq_len(
                     self.forward_decode_metadata.max_seq_len_k

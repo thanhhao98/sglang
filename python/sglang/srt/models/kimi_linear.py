@@ -61,6 +61,12 @@ def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
     return num_heads // tp_size
 
 
+def _materialize_residual_stream(
+    hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return hidden_states if residual is None else hidden_states + residual
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -528,6 +534,7 @@ class KimiLinearModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -590,7 +597,6 @@ class KimiLinearModel(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-        # TODO: capture aux hidden states
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
@@ -602,6 +608,13 @@ class KimiLinearModel(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                     zero_allocator=zero_allocator,
+                )
+            if (
+                self.dspark_layers_to_capture is not None
+                and i in self.dspark_layers_to_capture
+            ):
+                aux_hidden_states.append(
+                    _materialize_residual_stream(hidden_states, residual)
                 )
 
         if not self.pp_group.is_last_rank:
@@ -618,10 +631,9 @@ class KimiLinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if self.dspark_layers_to_capture is not None:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class KimiLinearForCausalLM(nn.Module):
@@ -649,6 +661,22 @@ class KimiLinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -667,8 +695,15 @@ class KimiLinearForCausalLM(nn.Module):
             pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states

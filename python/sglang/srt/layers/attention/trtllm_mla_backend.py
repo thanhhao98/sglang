@@ -121,6 +121,7 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    global_seq_lens_k: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -354,6 +355,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+            metadata.global_seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=device
+            )
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -395,7 +399,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             # Intentional int64 -> int32 same-kind out= downcast.
-            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(metadata.global_seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
@@ -541,6 +550,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
+                self.forward_decode_metadata.global_seq_lens_k = (
+                    self.forward_decode_metadata.seq_lens_k
+                )
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -929,17 +941,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             if forward_batch.forward_mode.is_target_verify():
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                max_seq_len = metadata.max_seq_len_k + draft_token_num
+                dcp_enabled = get_parallel().dcp_enabled
+                max_seq_len = metadata.max_seq_len_k + (
+                    0 if dcp_enabled else draft_token_num
+                )
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
-                if ragged_layout is None:
-                    # Uniform verify: all sequences carry draft_token_num tokens.
+                if ragged_layout is None or dcp_enabled:
                     q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False
                 else:
-                    # Front-align packed tokens into a zeroed dense [bs, N]
-                    # buffer under uniform seq_lens_k: row j attends exactly to
-                    # seq_i + j, over-length tier-padding rows are clamped, and
-                    # rows past a request's verify len yield discarded output.
                     if ragged_layout.bs != bs:
                         ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                     total_tokens = q.shape[0]
@@ -1009,6 +1019,44 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
+
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and get_parallel().dcp_enabled
+            ):
+                raw_out, lse = self._run_decode_kernel(
+                    query=q,
+                    kv_cache=kv_cache,
+                    block_tables=metadata.block_kv_indices,
+                    seq_lens=metadata.seq_lens_k,
+                    max_seq_len=max_seq_len,
+                    layer=layer,
+                    causal_seqs=metadata.global_seq_lens_k,
+                    cp_world=get_parallel().dcp_size,
+                    cp_rank=get_parallel().dcp_rank,
+                    return_lse=True,
+                )
+                output = raw_out.view(
+                    bs * draft_token_num,
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                )
+                lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
+                dense_q_indptr = torch.arange(
+                    0,
+                    (bs + 1) * draft_token_num,
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                fixup_zero_kv_rows(
+                    output,
+                    lse,
+                    metadata.seq_lens_k,
+                    dense_q_indptr,
+                    draft_token_num,
+                )
+                return output.flatten(1), lse
 
             raw_out = self._run_decode_kernel(
                 query=q,

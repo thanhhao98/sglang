@@ -10,8 +10,11 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 )
 from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
 from sglang.srt.layers.attention import tokenspeed_mla_backend as backend_module
+from sglang.srt.layers.attention import trtllm_mla_backend as trt_backend_module
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
+from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLADecodeMetadata
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -124,6 +127,104 @@ class TestTokenspeedMLADCP(CustomTestCase):
         self.assertEqual(kwargs["cp_rank"], 2)
         self.assertIs(kwargs["causal_seqs"], global_seq_lens)
         self.assertEqual(kwargs["seq_lens"].dtype, torch.int32)
+
+    def test_static_verify_metadata_splits_global_and_local_lengths(self):
+        backend = object.__new__(TokenspeedMLABackend)
+        backend.num_draft_tokens = 8
+        metadata = TRTLLMMLADecodeMetadata(
+            block_kv_indices=torch.full((3, 4), -1, dtype=torch.int32, device="cuda"),
+            seq_lens_k=torch.zeros(3, dtype=torch.int32, device="cuda"),
+            global_seq_lens_k=torch.zeros(3, dtype=torch.int32, device="cuda"),
+        )
+        backend.decode_cuda_graph_metadata = {3: metadata}
+        prefix_lens = torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
+        req_pool_indices = torch.arange(3, dtype=torch.int32, device="cuda")
+        parallel = SimpleNamespace(dcp_enabled=True, dcp_size=4, dcp_rank=2)
+
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(backend, "_fill_dcp_block_kv_indices") as fill,
+        ):
+            backend._apply_cuda_graph_metadata(
+                bs=3,
+                req_pool_indices=req_pool_indices,
+                seq_lens=prefix_lens,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+            )
+
+        expected_global = prefix_lens + 8
+        expected_local = get_dcp_lens(expected_global, 4, 2).to(torch.int32)
+        torch.testing.assert_close(metadata.global_seq_lens_k, expected_global)
+        torch.testing.assert_close(metadata.seq_lens_k, expected_local)
+        fill.assert_called_once()
+        torch.testing.assert_close(fill.call_args.args[2], expected_local)
+
+    def test_non_dcp_ragged_verify_preserves_padding_path(self):
+        backend = object.__new__(TokenspeedMLABackend)
+        backend.forward_prefill_metadata = None
+        backend.data_type = torch.bfloat16
+        backend.q_data_type = torch.bfloat16
+        backend.page_size = 1
+        backend.kv_cache_dim = 2
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: torch.empty(
+                (8, 2), dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        metadata = TRTLLMMLADecodeMetadata(
+            block_kv_indices=torch.zeros((2, 1), dtype=torch.int32, device="cuda"),
+            seq_lens_k=torch.tensor([11, 22], dtype=torch.int32, device="cuda"),
+            max_seq_len_k=32,
+        )
+        layout = SimpleNamespace(
+            bs=2,
+            verify_lens=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+            qo_indptr_device=torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda"),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            decode_trtllm_mla_metadata=metadata,
+            spec_info=SimpleNamespace(draft_token_num=4, ragged_verify_layout=layout),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=1,
+            head_dim=2,
+            v_head_dim=1,
+        )
+        query = torch.empty((3, 2), dtype=torch.bfloat16, device="cuda")
+        padded_query = torch.empty((2, 4, 1, 2), dtype=torch.bfloat16, device="cuda")
+        dense_output = torch.empty((2, 4, 1, 1), dtype=torch.bfloat16, device="cuda")
+        expected = torch.empty((3, 1, 1), dtype=torch.bfloat16, device="cuda")
+
+        with (
+            patch.object(
+                trt_backend_module,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ),
+            patch.object(
+                backend, "pad_draft_extend_query", return_value=padded_query
+            ) as pad,
+            patch.object(backend, "_run_decode_kernel", return_value=dense_output),
+            patch.object(
+                backend, "unpad_draft_extend_output", return_value=expected
+            ) as unpad,
+        ):
+            actual = backend.forward_extend(
+                query,
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+            )
+
+        self.assertEqual(pad.call_count, 1)
+        self.assertEqual(unpad.call_count, 1)
+        self.assertTrue(unpad.call_args.kwargs["zero_uncovered"])
+        torch.testing.assert_close(actual, expected.view(3, 1))
 
     def test_local_page_table_maps_only_rank_owned_physical_pages(self):
         dcp_size = 4

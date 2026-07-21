@@ -15,6 +15,7 @@ gate; is_cuda / is_hip are patched per-test to pin the platform deterministicall
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.server_args import ServerArgs
@@ -96,6 +97,40 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args = self._make_args(dcp_size=8, dcp_comm_backend="ag_rs")
         args._handle_dcp_validation()  # no raise
         self.assertEqual(args.dcp_size, 8)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_linear_tokenspeed_dspark_on_cuda_passes(self, *_):
+        args = self._make_args(dcp_size=4, dcp_comm_backend="a2a")
+        args.speculative_algorithm = "DSPARK"
+        args.attention_backend = "tokenspeed_mla"
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"])
+        )
+        args._handle_dcp_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_dcp_rejects_other_speculative_combinations(self, *_):
+        cases = [
+            ("EAGLE", "tokenspeed_mla", ["KimiLinearForCausalLM"]),
+            ("DSPARK", "trtllm_mla", ["KimiLinearForCausalLM"]),
+            ("DSPARK", "tokenspeed_mla", ["Qwen3ForCausalLM"]),
+        ]
+        for algorithm, backend, architectures in cases:
+            with self.subTest(
+                algorithm=algorithm,
+                backend=backend,
+                architectures=architectures,
+            ):
+                args = self._make_args(dcp_size=4, dcp_comm_backend="a2a")
+                args.speculative_algorithm = algorithm
+                args.attention_backend = backend
+                args.model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=architectures)
+                )
+                with self.assertRaisesRegex(ValueError, "only validated"):
+                    args._handle_dcp_validation()
 
 
 if __name__ == "__main__":
