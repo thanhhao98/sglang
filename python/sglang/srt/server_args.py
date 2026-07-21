@@ -4323,6 +4323,13 @@ class ServerArgs:
         )
         validate_declarations(self, self._resolved_overrides)
 
+        if model_arch == "KimiK3ForConditionalGeneration":
+            from sglang.srt.arg_groups.kimi_k3_hook import (
+                apply_kimi_k3_spec_backend_defaults,
+            )
+
+            apply_kimi_k3_spec_backend_defaults(self)
+
         if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
