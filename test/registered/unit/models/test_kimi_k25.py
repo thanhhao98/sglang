@@ -46,6 +46,17 @@ class _Tokenizer:
         return []
 
 
+def test_kimi_shared_concat_avoids_single_image_copy():
+    first = torch.arange(12).view(3, 4)
+    second = first + 12
+
+    assert kimi_k25.concat_or_single is kimi_k3_vl.concat_or_single
+    assert kimi_k25.concat_or_single([first]) is first
+    torch.testing.assert_close(
+        kimi_k25.concat_or_single([first, second]), torch.cat([first, second])
+    )
+
+
 @pytest.mark.parametrize("frames", [1, 2])
 def test_kimi_tpool_shared_fast_path_matches_temporal_mean(frames):
     grid_thws = torch.tensor([[frames, 4, 6]], dtype=torch.int64)

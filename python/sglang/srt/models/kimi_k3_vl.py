@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_flashinfer_cudnn_vision_attention_metadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
+from sglang.srt.models.kimi_vl_moonvit import concat_or_single, tpool_patch_merger
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import print_info_once
 
@@ -515,9 +515,7 @@ class MoonViT3dEncoder(nn.Module):
         q = packed_qkv[:, 0].contiguous()
         k = packed_qkv[:, 1].contiguous()
         v = packed_qkv[:, 2]
-        cu_seqlens = torch.tensor(
-            [0, num_tokens], dtype=torch.int32, device=device
-        )
+        cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
         metadata = prepare_vision_attention_metadata(cu_seqlens, device=device)
         with torch.inference_mode():
             block.attention_backend_impls["fa4"](
@@ -699,8 +697,8 @@ class KimiK3MultiModalProjector(nn.Module):
         self, image_features: Union[torch.Tensor, List[torch.Tensor]]
     ) -> torch.Tensor:
         if isinstance(image_features, (list, tuple)):
-            x = torch.cat(
-                [item.reshape(item.shape[0], -1) for item in image_features], dim=0
+            x = concat_or_single(
+                [item.reshape(item.shape[0], -1) for item in image_features]
             )
         else:
             x = image_features.reshape(image_features.shape[0], -1)

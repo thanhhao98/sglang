@@ -33,7 +33,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
+from sglang.srt.models.kimi_vl_moonvit import (
+    MLP2,
+    concat_or_single,
+    tpool_patch_merger,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
@@ -607,7 +611,7 @@ def mm_projection_auto(
         return vt_output
 
     num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
+    batched = concat_or_single(vt_output, dim=0)
     proj_out = mm_projector(batched) if mm_projector else batched
     proj_out = proj_out.reshape(-1, proj_out.shape[-1])
     proj_out = torch.split(proj_out, num_embedding_list)
