@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -88,6 +89,8 @@ def _get_tokenspeed_workspace(
 # and there is no performance gap compared to this backend.
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
+
+    supports_dcp_causal_decode: bool = True
 
     def __init__(
         self,
@@ -279,7 +282,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
-    ) -> torch.Tensor:
+        dcp_causal_seqs: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -289,6 +294,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        parallel = get_parallel()
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -300,7 +306,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
+            causal_mask=True,
             enable_pdl=is_arch_support_pdl(),
+            return_lse=return_lse,
+            causal_seqs=dcp_causal_seqs,
+            cp_world=parallel.attn_dcp_size if return_lse else 1,
+            cp_rank=parallel.attn_dcp_rank if return_lse else 0,
         )
 
     def _run_prefill_kernel(

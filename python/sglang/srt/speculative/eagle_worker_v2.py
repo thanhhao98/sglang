@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
+from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -400,9 +401,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            with draft_forward_guard(True):
+                self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -483,9 +485,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            with draft_forward_guard(True):
+                self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -526,7 +529,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        with draft_forward_guard(True), canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -822,7 +825,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with draft_forward_guard(True), canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -936,7 +939,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with draft_forward_guard(True), canary_ctx:
             if can_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch

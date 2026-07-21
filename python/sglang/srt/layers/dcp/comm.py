@@ -21,6 +21,7 @@ PR #25090 vs #14194):
 """
 
 import warnings
+from collections.abc import Iterable
 from typing import Optional
 
 import torch
@@ -371,6 +372,82 @@ def all_gather_kv_cache_for_dcp(
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
+_DCPA2ABufferKey = tuple[int, int, int, torch.dtype, torch.device]
+_DCP_A2A_CUDA_GRAPH_BUFFERS: dict[_DCPA2ABufferKey, dict[str, torch.Tensor]] = {}
+
+
+def init_dcp_a2a_cuda_graph_buffers(
+    *,
+    row_counts: Iterable[int],
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    cp_group: "GroupCoordinator",
+) -> None:
+    """Preallocate one exact-shape A2A scratch set for every captured row count."""
+    if cp_group.world_size == 1:
+        return
+    if num_heads % cp_group.world_size != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by dcp_size "
+            f"({cp_group.world_size})"
+        )
+
+    n = cp_group.world_size
+    heads_per_rank = num_heads // n
+    lse_pack_dim = _lse_pack_dim(dtype)
+    for rows in sorted(set(int(value) for value in row_counts)):
+        if rows <= 0:
+            continue
+        key = (rows, num_heads, head_dim, dtype, torch.device(device))
+        if key in _DCP_A2A_CUDA_GRAPH_BUFFERS:
+            continue
+        _DCP_A2A_CUDA_GRAPH_BUFFERS[key] = {
+            "send_combined": torch.empty(
+                n,
+                rows,
+                heads_per_rank,
+                head_dim + lse_pack_dim,
+                dtype=dtype,
+                device=device,
+            ),
+            "recv_combined": torch.empty(
+                n,
+                rows,
+                heads_per_rank,
+                head_dim + lse_pack_dim,
+                dtype=dtype,
+                device=device,
+            ),
+            "send_lse": torch.empty(
+                n,
+                rows,
+                heads_per_rank,
+                dtype=torch.float32,
+                device=device,
+            ),
+            "recv_lse": torch.empty(
+                n,
+                rows,
+                heads_per_rank,
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+
+
+def get_dcp_a2a_cuda_graph_buffers(
+    rows: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[dict[str, torch.Tensor]]:
+    """Return preallocated scratch for this exact graph shape, if registered."""
+    return _DCP_A2A_CUDA_GRAPH_BUFFERS.get(
+        (int(rows), int(num_heads), int(head_dim), dtype, torch.device(device))
+    )
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:

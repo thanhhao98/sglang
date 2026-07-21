@@ -102,6 +102,32 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
+
+def _allocator_id_limit(allocator: BaseTokenToKVPoolAllocator) -> int:
+    return int(allocator.size) + int(allocator.page_size)
+
+
+def _draft_pool_size_for_allocator(
+    configured_size: int,
+    allocator: BaseTokenToKVPoolAllocator,
+    pool_page_size: int,
+) -> int:
+    required_size = _allocator_id_limit(allocator) - int(pool_page_size)
+    return max(int(configured_size), required_size)
+
+
+def _assert_pool_covers_allocator(
+    pool: KVCache, allocator: BaseTokenToKVPoolAllocator
+) -> None:
+    allocator_limit = _allocator_id_limit(allocator)
+    pool_limit = int(pool.size) + int(pool.page_size)
+    assert pool_limit >= allocator_limit, (
+        "Replicated draft KV pool does not cover the shared DCP virtual allocator "
+        f"id range: pool accepts ids < {pool_limit}, but allocator can issue ids "
+        f"< {allocator_limit}."
+    )
+
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -215,6 +241,16 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        if (
+            self.is_draft_worker
+            and self.server_args.dcp_size > 1
+            and pools.token_to_kv_pool is not None
+            and pools.token_to_kv_pool_allocator is not None
+        ):
+            _assert_pool_covers_allocator(
+                pools.token_to_kv_pool, pools.token_to_kv_pool_allocator
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -234,6 +270,24 @@ class KVCacheConfigurator:
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
+        if (
+            self.is_draft_worker
+            and self.server_args.dcp_size > 1
+            and self.token_to_kv_pool_allocator is not None
+        ):
+            widened_size = _draft_pool_size_for_allocator(
+                max_total_num_tokens,
+                self.token_to_kv_pool_allocator,
+                self.page_size,
+            )
+            if widened_size != max_total_num_tokens:
+                logger.info(
+                    "DCP draft worker: widening draft KV pool %d -> %d tokens "
+                    "to cover the shared virtual allocator id space.",
+                    max_total_num_tokens,
+                    widened_size,
+                )
+                max_total_num_tokens = widened_size
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None

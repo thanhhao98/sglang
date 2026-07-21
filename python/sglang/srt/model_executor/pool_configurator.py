@@ -140,6 +140,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            dcp_size = max(int(kvc.server_args.dcp_size), 1)
+            if eagle_draft_num_layers is None and dcp_size > 1:
+                eagle_draft_num_layers = 1
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -147,7 +150,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 self._cell_size = int(
                     self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    * (1 + dcp_size * int(eagle_draft_num_layers) / int(num_layers))
                 )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
@@ -334,8 +337,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            dcp_size = max(int(kvc.server_args.dcp_size), 1)
+            if draft_layers is None and dcp_size > 1:
+                draft_layers = 1
             if draft_layers is not None and int(draft_layers) > 0:
-                self._draft_full_layers_num = int(draft_layers)
+                self._draft_full_layers_num = int(draft_layers) * dcp_size
 
         # Bytes per token of max_total_num_tokens.
         #

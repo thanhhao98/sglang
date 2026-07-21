@@ -834,8 +834,44 @@ class ModelRunner:
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
 
-        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+        if (
+            not self.is_draft_worker
+            and self.server_args.dcp_size > 1
+            and self.server_args.dcp_replicate_q_proj
+        ):
             self._prepare_replicated_q_proj()
+
+        self._prepare_dcp_a2a_cuda_graph_buffers()
+
+    def _prepare_dcp_a2a_cuda_graph_buffers(self) -> None:
+        if (
+            self.is_draft_worker
+            or self.server_args.dcp_size <= 1
+            or self.server_args.dcp_comm_backend != "a2a"
+            or self.decode_attention_backend_str != "tokenspeed_mla"
+        ):
+            return
+
+        from sglang.srt.distributed.parallel_state import get_dcp_group
+        from sglang.srt.layers.dcp import init_dcp_a2a_cuda_graph_buffers
+
+        verify_width = self.decode_num_tokens_per_req()
+        capture_bs, _ = get_batch_sizes_to_capture(self, verify_width)
+        row_counts = [bs for bs in capture_bs]
+        row_counts.extend(bs * verify_width for bs in capture_bs)
+        num_heads = (
+            self.model_config.num_attention_heads
+            * self.server_args.dcp_size
+            // self.ps.tp_size
+        )
+        init_dcp_a2a_cuda_graph_buffers(
+            row_counts=row_counts,
+            num_heads=num_heads,
+            head_dim=self.model_config.kv_lora_rank,
+            dtype=self.dtype,
+            device=self.device,
+            cp_group=get_dcp_group(),
+        )
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
@@ -1308,8 +1344,10 @@ class ModelRunner:
             if not self.is_draft_worker and ((c := self.canary_manager) is not None)
             else contextlib.nullcontext()
         )
+        from sglang.srt.layers.dcp.draft import draft_forward_guard
 
         with (
+            draft_forward_guard(self.is_draft_worker),
             canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(

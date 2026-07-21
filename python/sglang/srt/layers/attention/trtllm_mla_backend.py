@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -121,6 +122,8 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    dcp_global_seq_lens: Optional[torch.Tensor] = None
+    dcp_zero_mask: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -133,6 +136,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # Ragged verify: the packed query is front-aligned into the dense
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
+    supports_dcp_causal_decode: bool = False
 
     def __init__(
         self,
@@ -370,11 +374,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
+        dcp_active = self.supports_dcp_causal_decode and get_parallel().dcp_enabled
+        if dcp_active:
+            metadata.seq_lens_k = torch.ones((bs,), dtype=torch.int32, device=device)
+            metadata.dcp_global_seq_lens = torch.ones(
+                (bs,), dtype=torch.int32, device=device
+            )
+            metadata.dcp_zero_mask = torch.zeros((bs,), dtype=torch.bool, device=device)
+
         # Capture with full width so future longer sequences are safe during replay.
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
         metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
+        metadata.max_seq_len_k = (
+            max(
+                (
+                    self.max_context_len
+                    + (self.num_draft_tokens or 1)
+                    + get_parallel().attn_dcp_size
+                    - 1
+                )
+                // get_parallel().attn_dcp_size,
+                1,
+            )
+            if dcp_active
+            else self.max_context_len
+        )
 
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
@@ -392,24 +417,50 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         the non-decode-family modes to the FlashInferMLA parent).
         """
         metadata = self.decode_cuda_graph_metadata[bs]
+        dcp_active = self.supports_dcp_causal_decode and get_parallel().dcp_enabled
 
         if forward_mode.is_target_verify():
-            # Intentional int64 -> int32 same-kind out= downcast.
-            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
-            seq_lens = metadata.seq_lens_k
+            if dcp_active:
+                torch.add(
+                    seq_lens[:bs],
+                    self.num_draft_tokens,
+                    out=metadata.dcp_global_seq_lens,
+                )
+                seq_lens = metadata.dcp_global_seq_lens
+            else:
+                # Intentional int64 -> int32 same-kind out= downcast.
+                torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+                seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+        elif dcp_active:
+            metadata.dcp_global_seq_lens.copy_(seq_lens[:bs])
+            seq_lens = metadata.dcp_global_seq_lens
+
+        if dcp_active:
+            local_seq_lens = get_dcp_lens(
+                seq_lens,
+                get_parallel().attn_dcp_size,
+                get_parallel().attn_dcp_rank,
+            ).to(torch.int32)
+            torch.eq(local_seq_lens, 0, out=metadata.dcp_zero_mask)
+            metadata.seq_lens_k.copy_(local_seq_lens.clamp(min=1))
 
         # Update block indices for new sequences.
+        paged_size = (
+            self.page_size * get_parallel().attn_dcp_size
+            if dcp_active
+            else self.page_size
+        )
         create_flashmla_kv_indices_triton[
             (
                 bs,
                 get_num_kv_index_blocks_flashmla(
-                    metadata.block_kv_indices.shape[1], self.page_size
+                    metadata.block_kv_indices.shape[1], paged_size
                 ),
             )
         ](
@@ -420,7 +471,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices,
             self.req_to_token.stride(0),
             metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
+            PAGED_SIZE=paged_size,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -520,6 +571,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             bs = forward_batch.batch_size
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata()
+            dcp_active = self.supports_dcp_causal_decode and get_parallel().dcp_enabled
             # This is necessary because the backend instance persists across forward passes,
             # and forward_prefill_metadata from a previous regular extend call could still be set.
             if (
@@ -540,7 +592,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if forward_batch.forward_mode.is_target_verify():
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
-                self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
+                if not dcp_active:
+                    self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -559,17 +612,60 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.seq_lens_q = forward_batch.extend_seq_lens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
 
-            max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            block_kv_indices = self._create_block_kv_indices(
-                bs,
-                max_seqlen_pad,
-                forward_batch.req_pool_indices,
-                seq_lens,
-                seq_lens.device,
-            )
+            if dcp_active:
+                parallel = get_parallel()
+                effective_page = self.page_size * parallel.attn_dcp_size
+                max_seqlen_pad = self._calc_padded_blocks(max_seq)
+                block_kv_indices = torch.full(
+                    (bs, max_seqlen_pad),
+                    -1,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                create_flashmla_kv_indices_triton[
+                    (
+                        bs,
+                        get_num_kv_index_blocks_flashmla(
+                            max_seqlen_pad, effective_page
+                        ),
+                    )
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    seq_lens,
+                    None,
+                    block_kv_indices,
+                    self.req_to_token.stride(0),
+                    max_seqlen_pad,
+                    PAGED_SIZE=effective_page,
+                )
+                global_seq_lens = seq_lens.to(torch.int32)
+                local_seq_lens = get_dcp_lens(
+                    global_seq_lens,
+                    parallel.attn_dcp_size,
+                    parallel.attn_dcp_rank,
+                ).to(torch.int32)
+                self.forward_decode_metadata.dcp_global_seq_lens = global_seq_lens
+                self.forward_decode_metadata.dcp_zero_mask = local_seq_lens == 0
+                self.forward_decode_metadata.seq_lens_k = local_seq_lens.clamp(min=1)
+                max_seq_len_k = max(
+                    (int(max_seq) + parallel.attn_dcp_size - 1)
+                    // parallel.attn_dcp_size,
+                    1,
+                )
+            else:
+                max_seqlen_pad = self._calc_padded_blocks(max_seq)
+                block_kv_indices = self._create_block_kv_indices(
+                    bs,
+                    max_seqlen_pad,
+                    forward_batch.req_pool_indices,
+                    seq_lens,
+                    seq_lens.device,
+                )
+                max_seq_len_k = int(max_seq)
 
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
-            self.forward_decode_metadata.max_seq_len_k = int(max_seq)
+            self.forward_decode_metadata.max_seq_len_k = max_seq_len_k
             self.forward_decode_metadata.batch_size = bs
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
@@ -654,8 +750,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
-    ) -> torch.Tensor:
+        dcp_causal_seqs: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Hook for subclasses to swap the decode/spec-verify kernel."""
+        assert dcp_causal_seqs is None and not return_lse, (
+            "The trtllm-gen MLA kernel does not support CP-aware causal masking "
+            "or LSE output."
+        )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
@@ -819,10 +921,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query=query,
             kv_cache=kv_cache,
             block_tables=metadata.block_kv_indices,
-            seq_lens=forward_batch.seq_lens,
+            seq_lens=(
+                metadata.seq_lens_k
+                if self.supports_dcp_causal_decode and get_parallel().dcp_enabled
+                else forward_batch.seq_lens
+            ),
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
+            dcp_causal_seqs=metadata.dcp_global_seq_lens,
+            return_lse=(self.supports_dcp_causal_decode and get_parallel().dcp_enabled),
         )
+
+        if isinstance(raw_out, tuple):
+            raw_out, lse = raw_out
+            if metadata.dcp_zero_mask is not None:
+                raw_out.masked_fill_(metadata.dcp_zero_mask[:, None, None, None], 0.0)
+                lse.masked_fill_(metadata.dcp_zero_mask[:, None, None], -float("inf"))
+            return (
+                raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim),
+                lse.view(-1, layer.tp_q_head_num),
+            )
 
         # Reshape output directly without slicing
         output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -1010,16 +1128,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
+            dcp_active = (
+                self.supports_dcp_causal_decode
+                and get_parallel().dcp_enabled
+                and forward_batch.forward_mode.is_target_verify()
+            )
             raw_out = self._run_decode_kernel(
                 query=q,
                 kv_cache=kv_cache,
                 block_tables=metadata.block_kv_indices,
                 seq_lens=metadata.seq_lens_k,
-                max_seq_len=max_seq_len,
+                max_seq_len=metadata.max_seq_len_k if dcp_active else max_seq_len,
                 layer=layer,
+                dcp_causal_seqs=(metadata.dcp_global_seq_lens if dcp_active else None),
+                return_lse=dcp_active,
             )
 
+            lse = None
+            if isinstance(raw_out, tuple):
+                raw_out, lse = raw_out
+                if metadata.dcp_zero_mask is not None:
+                    raw_out.masked_fill_(
+                        metadata.dcp_zero_mask[:, None, None, None], 0.0
+                    )
+                    lse.masked_fill_(
+                        metadata.dcp_zero_mask[:, None, None], -float("inf")
+                    )
+
             if needs_unpad:
+                assert lse is None, "DCP causal verify supports uniform chains only."
                 # Unpad the output for draft_extend mode with varying lengths
                 # Use the actual values computed during padding, not from metadata
                 output = self.unpad_draft_extend_output(
@@ -1032,6 +1169,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 output = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             else:
                 output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if lse is not None:
+                return output, lse.view(-1, layer.tp_q_head_num)
             return output
 
         if k_rope is not None:

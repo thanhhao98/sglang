@@ -3128,9 +3128,7 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # CUDA speculative DCP is restricted to the allowlist below.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
@@ -3167,13 +3165,68 @@ class ServerArgs:
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                speculative_algorithm = self.speculative_algorithm.upper()
+                if speculative_algorithm not in ("EAGLE", "EAGLE3"):
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 supports "
+                        "only EAGLE or EAGLE3, but got speculative_algorithm="
+                        f"{self.speculative_algorithm!r}."
+                    )
+                if self.speculative_eagle_topk != 1:
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 requires "
+                        "a chain draft (--speculative-eagle-topk=1), but got "
+                        f"speculative_eagle_topk={self.speculative_eagle_topk!r}."
+                    )
+                if (
+                    self.speculative_num_draft_tokens is None
+                    or self.speculative_num_draft_tokens > 4
+                ):
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 requires "
+                        "--speculative-num-draft-tokens <= 4, but got "
+                        "speculative_num_draft_tokens="
+                        f"{self.speculative_num_draft_tokens!r}."
+                    )
+
+                target_decode_backend = (
+                    self.decode_attention_backend or self.attention_backend
                 )
+                if target_decode_backend != "tokenspeed_mla":
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 requires "
+                        "tokenspeed_mla as the target decode attention backend, "
+                        f"but got target_decode_backend={target_decode_backend!r}."
+                    )
+                if self.kv_cache_dtype != "fp8_e4m3":
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 requires "
+                        "--kv-cache-dtype=fp8_e4m3, but got kv_cache_dtype="
+                        f"{self.kv_cache_dtype!r}."
+                    )
+                if (
+                    self.page_size is not None
+                    and self.speculative_num_draft_tokens > self.page_size
+                ):
+                    raise ValueError(
+                        "--speculative-num-draft-tokens must be <= --page-size "
+                        "for CUDA speculative decoding with --dcp-size > 1, but "
+                        f"got speculative_num_draft_tokens="
+                        f"{self.speculative_num_draft_tokens} and page_size="
+                        f"{self.page_size}."
+                    )
+                if self.page_size not in (32, 64):
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 requires "
+                        "--page-size in {32, 64}, but got "
+                        f"page_size={self.page_size!r}."
+                    )
+                if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+                    raise ValueError(
+                        "CUDA speculative decoding with --dcp-size > 1 requires "
+                        "--dcp-comm-backend a2a or fi_a2a, but got "
+                        f"dcp_comm_backend={self.dcp_comm_backend!r}."
+                    )
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
