@@ -328,10 +328,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         and server_args.is_attention_backend_not_set()
     ):
         logger.info(
-            "Use cutedsl_mla as the default decode attention backend for "
+            "Use trtllm_mla as the default decode attention backend for "
             "Kimi-K3 on SM100/SM103."
         )
-        return {"decode_attention_backend": "cutedsl_mla"}
+        return {"decode_attention_backend": "trtllm_mla"}
     return {}
 
 
