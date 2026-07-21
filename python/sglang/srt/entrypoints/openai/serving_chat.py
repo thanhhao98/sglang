@@ -315,12 +315,16 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_data: list,
     ) -> Dict[str, Any]:
         parts = []
+        previous_part_was_image = False
         for chunk in msg["content"]:
             if not isinstance(chunk, dict):
                 continue
             chunk_type = chunk.get("type")
             if chunk_type in ("text", "input_text"):
-                parts.append(chunk["text"])
+                text = chunk["text"]
+                parts.append(text)
+                if text:
+                    previous_part_was_image = False
             elif chunk_type in ("image_url", "input_image"):
                 image_obj = chunk.get("image_url") or {}
                 if isinstance(image_obj, str):
@@ -332,11 +336,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         max_dynamic_patch=image_obj.get("max_dynamic_patch"),
                     )
                 )
+                if previous_part_was_image:
+                    parts.append("\n")
                 parts.append("<|media_pad|>")
+                previous_part_was_image = True
             elif chunk_type == "video_url":
                 video_data.append(chunk["video_url"]["url"])
+                previous_part_was_image = False
             elif chunk_type == "audio_url":
                 audio_data.append(chunk["audio_url"]["url"])
+                previous_part_was_image = False
         new_msg = {k: v for k, v in msg.items() if v is not None and k != "content"}
         new_msg["content"] = "".join(parts)
         return new_msg

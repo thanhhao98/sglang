@@ -199,6 +199,25 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         conv_mock.assert_not_called()
 
+    def test_kimi_k3_separates_adjacent_image_placeholders(self):
+        image_data = []
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "image-1"}},
+                {"type": "image_url", "image_url": {"url": "image-2"}},
+                {"type": "text", "text": "Compare them."},
+            ],
+        }
+
+        flattened = self.chat._flatten_kimi_k3_content(message, image_data, [], [])
+
+        self.assertEqual(
+            flattened["content"],
+            "<|media_pad|>\n<|media_pad|>Compare them.",
+        )
+        self.assertEqual([item.url for item in image_data], ["image-1", "image-2"])
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True

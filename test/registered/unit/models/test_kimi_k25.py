@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import torch
@@ -277,6 +277,23 @@ def test_kimi_expands_pre_tokenized_image_placeholders(input_ids):
 def test_kimi_rejects_mismatched_pre_tokenized_image_placeholders():
     with pytest.raises(ValueError, match="Expected 2 image placeholder"):
         _expand_image_token_ids([1, 99, 2], 99, [3, 2])
+
+
+def test_kimi_k3_rejects_silently_dropped_images():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = Mock()
+    processor.load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(images=[object()])
+    )
+
+    with pytest.raises(ValueError, match="expected 2, loaded 1"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=["image-1", "image-2"],
+                input_text="<|media_pad|><|media_pad|>",
+                request_obj=Mock(),
+            )
+        )
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
