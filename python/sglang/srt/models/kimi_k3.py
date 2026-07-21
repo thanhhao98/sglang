@@ -22,6 +22,7 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
+    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -30,7 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers import k3_ar_fusion, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import (
     AttnResidual,
@@ -732,7 +733,7 @@ class KimiK3MoE(nn.Module):
         )
 
         # Gate — fp32 output so routing (sigmoid, bias add, top-k) runs in
-        # full precision (matches GateLinear in mke).
+        # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
@@ -857,6 +858,18 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
+
+        # Static eligibility for fusing the fused-front latent all-reduce with
+        # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
+        # [latent | shared] buffer as [3N, NORM_DIM] rows and norms the first N,
+        # so it requires latent width == NORM_DIM and shared width == 2*NORM_DIM
+        # (K3: 3584 / 7168). Decided once here so the hot path only reads a bool
+        # and never re-validates dims per forward.
+        self.fuse_ar_norm = (
+            self.routed_expert_norm is not None
+            and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
+            and hidden_size == 2 * k3_ar_fusion.NORM_DIM
+        )
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1101,10 +1114,16 @@ class KimiK3MoE(nn.Module):
         )
         topk_output = self.topk(hidden_states, router_logits)
         latent_numel = num_tokens * self.moe_hidden_size
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+        if k3_ar_fusion.enabled():
+            # fused MNNVL AR: the buffer lives in the torch symm pool so the
+            # NVLS 2shot can reduce it in place (small sizes take the push)
+            with k3_ar_fusion.symm_alloc():
+                buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+        else:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
@@ -1124,12 +1143,26 @@ class KimiK3MoE(nn.Module):
 
         # Re-derive both views from the returned tensor: all_reduce is NOT
         # guaranteed in-place (custom-AR / pymscclpp paths return a new
-        # tensor; only the symmetric-mempool pynccl path reduces in place).
-        buf = tensor_model_parallel_all_reduce(buf)
+        # tensor; only the symmetric-mempool pynccl path and the K3 fused
+        # MNNVL path reduce in place).
+        fused_norm = False
+        if k3_ar_fusion.enabled():
+            if self.fuse_ar_norm:
+                fused_norm = True
+                norm = self.routed_expert_norm
+                assert norm is not None
+                k3_ar_fusion.all_reduce_norm(buf, norm.weight, norm.variance_epsilon)
+            else:
+                k3_ar_fusion.all_reduce(buf)
+        else:
+            buf = tensor_model_parallel_all_reduce(buf)
+
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        # up_proj is replicated, so the routed output is now fully reduced.
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        if not fused_norm:
+            latent = self._latent_norm(latent)
+        out, _ = self.routed_expert_up_proj(latent)
+
         # prefetch_bc: b (shared_output) was produced by the all-reduce and
         # c (prefix_sum) even earlier; the AR is a plain launch (full
         # barrier), so both are complete once the norm / up_proj GEMM chain
@@ -1186,9 +1219,11 @@ class KimiK3DeltaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
+        all_reduce_fusion: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
+        self.all_reduce_fusion = all_reduce_fusion
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: all head-sharded params must follow the
         # attention-TP group (= tp under plain TP, = 1 under DP attention),
@@ -1211,7 +1246,6 @@ class KimiK3DeltaAttention(nn.Module):
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
-
         self.use_full_rank_gate = config.linear_attn_config.get(
             "use_full_rank_gate", False
         )
@@ -1423,17 +1457,28 @@ class KimiK3DeltaAttention(nn.Module):
             projection_size,
             self.hidden_size,
             bias=False,
+            # SGLANG_K3_AR_FUSION: keep the o_proj output TP-partial and
+            # complete the reduce at the decoder layer via the fused MNNVL
+            # all-reduce (which can fold the attn-res prefix add in). Only
+            # valid when the attn TP group is the full TP group (the fused
+            # comm lives there).
+            reduce_results=not self.all_reduce_fusion,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             # Reduce within the attn-TP group: the default reduce path uses
             # the full-TP collective, which at attn_tp>1 is both the wrong
             # group (sums across DP groups) and asymmetric vs idle DP ranks
-            # (deadlocks the per-layer DP gather).
-            use_dp_attention_reduce=True,
+            # (deadlocks the per-layer DP gather). Off under all_reduce_fusion:
+            # the fused AR does the reduce itself (reduce_results=False) and the
+            # forward wraps o_proj in k3 symm_alloc — leaving this True would
+            # nest use_symmetric_memory(attn_tp) inside symm_alloc and misroute
+            # the GEMM output away from the k3 pool (rendezvous miss). At the
+            # fusion config attn_tp==tp so the fused full-TP reduce is the same
+            # group anyway.
+            use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
-
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -1613,7 +1658,10 @@ class KimiK3DeltaAttention(nn.Module):
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
-
+        if self.all_reduce_fusion:
+            with k3_ar_fusion.symm_alloc():
+                partial, _ = self.o_proj(core_attn_out)
+            return partial
         return self.o_proj(core_attn_out)[0]
 
 
@@ -1625,7 +1673,15 @@ class KimiK3DeltaAttention(nn.Module):
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
-    def __init__(self, config, layer_idx, quant_config=None, prefix=""):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        all_reduce_fusion: bool = False,
+        prefix: str = "",
+    ) -> None:
+        self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         super().__init__(
             layer_id=layer_idx,
@@ -1640,12 +1696,36 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
             skip_rope=True,
+            reduce_results=not self.all_reduce_fusion,
         )
-        # K3 has no LayerCommunicator, so o_proj (reduce_results=True by
-        # default here, unlike deepseek's communicator flow) must reduce
-        # within the attn-TP group itself — the default full-TP collective is
-        # the wrong group at attn_tp>1 and deadlocks against idle DP ranks.
-        self.o_proj.use_dp_attention_reduce = True
+        if self.all_reduce_fusion:
+            # reduce_results=False was passed through super().__init__ above;
+            # the fused all-reduce does the reduce itself and needs the o_proj
+            # output in the k3 symm pool, so install the symm-pool wrap and do
+            # NOT set use_dp_attention_reduce (its inner attn_tp symm_ctx would
+            # nest inside symm_alloc and misroute the GEMM output away from the
+            # k3 pool → rendezvous miss). At the fusion config (attn_tp==tp) the
+            # fused full-TP reduce is the same group as the attn_tp reduce.
+            # The wrap is installed before the output-gate wrap below so the
+            # gate multiply stays outside the pool and only the o_proj GEMM
+            # output lands in it. NOTE: the captured name must differ from the
+            # gate block's `_orig_o_proj_forward` — closures capture the
+            # __init__ local by reference, and reusing the name would rebind it
+            # to this wrapper (infinite recursion + nested pool enter).
+            _symm_inner_o_proj_forward = self.o_proj.forward
+
+            def _symm_o_proj_forward(x, *args, **kwargs):
+                with k3_ar_fusion.symm_alloc():
+                    return _symm_inner_o_proj_forward(x, *args, **kwargs)
+
+            self.o_proj.forward = _symm_o_proj_forward
+        else:
+            # K3 has no LayerCommunicator, so o_proj (reduce_results=True by
+            # default here, unlike deepseek's communicator flow) must reduce
+            # within the attn-TP group itself — the default full-TP collective
+            # is the wrong group at attn_tp>1 and deadlocks against idle DP
+            # ranks.
+            self.o_proj.use_dp_attention_reduce = True
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -1722,6 +1802,19 @@ class KimiK3DecoderLayer(nn.Module):
         # attn_tp multiples; attention must then run on the real rows only.
         self._trim_padded_attn = require_mlp_sync(get_server_args())
 
+        # The fused all-reduce only serves the attn-res clean path (the
+        # production path: attn_res is config-static and the clean/legacy
+        # choice is env-static), so the legacy and standard paths stay
+        # byte-for-byte untouched and always see a reduced attention output.
+        attn_tp_size = get_parallel().attn_tp_size
+        self.all_reduce_fusion = (
+            attn_tp_size > 1
+            and attn_tp_size == get_tensor_model_parallel_world_size()
+            and config.attn_res_block_size is not None
+            and _K3_ATTN_RES_MODE != "legacy"
+            and k3_ar_fusion.enabled()
+        )
+
         # Attention
         if config.is_kda_layer(layer_idx):
             self.self_attn = KimiK3DeltaAttention(
@@ -1730,6 +1823,7 @@ class KimiK3DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                all_reduce_fusion=self.all_reduce_fusion,
             )
         else:
             self.self_attn = KimiK3MLAAttention(
@@ -1737,6 +1831,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                all_reduce_fusion=self.all_reduce_fusion,
             )
 
         # MLP / MoE
@@ -1941,6 +2036,13 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
         # ---- Aggregation 2: MLP side ----
+        if self.all_reduce_fusion:
+            # Complete the o_proj reduce here, folding the pending prefix add
+            # into the fused all-reduce; attn_res then takes the pre-added
+            # tensor through its prefix_sum=None branch (same semantics:
+            # (normed, new_prefix) with new_prefix = prefix + attn_out).
+            hidden_states = k3_ar_fusion.all_reduce(hidden_states, prefix_sum)
+            prefix_sum = None
         hidden_states, prefix_sum = attn_res.forward(
             hidden_states,
             prefix_sum,

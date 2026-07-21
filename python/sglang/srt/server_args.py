@@ -6510,9 +6510,15 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
-        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
-        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
+        # intra-node only. Force-disable on multi-node so the dispatch falls back
+        # to the legacy CustomAllreduce path, unless the MNNVL opt-in is set (the
+        # eager pull path works across nodes via the symm-mem workspace).
+        if (
+            self.nnodes > 1
+            and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get()
+            and not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
+        ):
             if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
                 logger.warning(
                     "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "

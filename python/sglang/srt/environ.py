@@ -741,6 +741,12 @@ class Envs:
     )
     # MLA output gate x * sigmoid(g) fused into one kernel.
     SGLANG_K3_FUSE_O_GATE = EnvBool(True)
+    # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
+    # small messages and in-place NVLS 2shot on symmetric-memory tensors for
+    # large ones, with an optional fused residual add. Covers the KDA o_proj
+    # output and the latent|shared MoE reduce; everything else falls back to
+    # the regular all-reduce path. See srt/layers/k3_ar_fusion.py.
+    SGLANG_K3_AR_FUSION = EnvBool(False)
     # AttnRes aggregation backend:
     # fast (optimized CUDA, SM100+/H=7168 only) | fused (triton) | jit (CUDA)
     # | torch | legacy
@@ -787,6 +793,14 @@ class Envs:
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
+    SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
+    SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Experimental: allow CustomAllReduceV2 on a process group that spans
+    # nodes (MNNVL fabric). Requires torch symmetric memory to rendezvous
+    # across nodes (fabric handles + IMEX). Graph zero-copy input
+    # registration is not supported in this mode and is disabled; all-reduce
+    # inside CUDA graphs falls back to eager pull from the symm workspace.
+    SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
