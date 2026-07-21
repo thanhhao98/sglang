@@ -10,28 +10,21 @@ logger = logging.getLogger(__name__)
 
 
 def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
-    """Kimi-K3 speculative-decoding backend defaults (explicit flags win).
-
-    Must run before _handle_linear_attn_backend so the triton fill preempts
-    its SM100+ bf16-ssm switch of KDA decode to flashinfer.
-    """
+    """Kimi-K3 speculative-decoding backend defaults (explicit flags win)."""
     from sglang.srt.utils import is_sm100_supported
 
     if server_args.speculative_algorithm is None:
         return
 
-    # Keep KDA target-verify on triton: the KDA dispatcher routes verify with
-    # decode, and the flashinfer verify kernel is slower on all measured
-    # shapes and cannot run ragged/compact layouts (uniform [N,T] signature).
-    # Fill only when base is the triton default so an explicit base inherits.
-    if (
-        server_args.linear_attn_decode_backend is None
-        and server_args.linear_attn_backend == "triton"
-    ):
-        server_args.linear_attn_decode_backend = "triton"
+    # Keep KDA target-verify on triton: flashinfer recurrent_kda verify is slower on
+    # all measured shapes and can't run ragged/compact layouts (uniform [N,T]).
+    # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
+    # target only verifies under spec); the verify backend is pinned directly.
+    if server_args.linear_attn_verify_backend is None:
+        server_args.linear_attn_verify_backend = "triton"
         logger.info(
             "Kimi-K3 with speculative decoding: pinning "
-            "--linear-attn-decode-backend to triton (keeps KDA verify on "
+            "--linear-attn-verify-backend to triton (keeps KDA verify on "
             "the triton kernel)."
         )
 
