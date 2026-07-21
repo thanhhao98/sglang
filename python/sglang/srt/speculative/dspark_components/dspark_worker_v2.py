@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Optional
 
@@ -277,10 +277,25 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    def _draft_dcp_off(self):
+        """The DSpark draft is a separate dense model whose KV pool is
+        replicated, NOT dcp-interleaved. Backend/pool code that branches on
+        ambient dcp_enabled (dcp-local lens, dcp page tables, sharded MLA
+        cache writes) must see DCP off at every draft-side call site,
+        otherwise draft metadata gets sharded against an unsharded pool.
+        Today this is safe by accident (the trtllm_mha draft backend has no
+        DCP branches); this override pins the contract."""
+        return get_parallel().override(dcp_enabled=False, dcp_size=1, dcp_rank=0)
+
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        dp_ctx = (
+            draft_tp_context(get_parallel().attn_tp_group)
+            if self._draft_dp_context_enabled
+            else nullcontext()
+        )
+        with dp_ctx, self._draft_dcp_off():
+            yield
 
     def alloc_memory_pool(
         self,
@@ -424,11 +439,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
-            positions=positions,
-        )
+        # Draft-pool write: the _inject_mla variant reaches set_mla_kv_buffer,
+        # whose ambient-dcp branch shard-writes — wrong for the replicated
+        # draft pool. Narrow override (the dp/tp-group context is unneeded).
+        with self._draft_dcp_off():
+            self._kv_injector.inject_target_hidden(
+                target_hidden=logits_output.hidden_states,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+            )
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
@@ -500,7 +519,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    # Real draft forward (idle) — same DCP-off contract as
+                    # propose(); narrow override, dp/tp context unchanged.
+                    with self._draft_dcp_off():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
