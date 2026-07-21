@@ -306,6 +306,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
+    # Read by decide_needs_cpu_seq_lens. Decode/verify metadata is GPU-only
+    # (graph replay already passes seq_lens_cpu=None), extend reads
+    # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
+    # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
