@@ -3174,17 +3174,23 @@ class ServerArgs:
             if self.speculative_algorithm is not None:
                 model_arches = self.get_model_config().hf_config.architectures
                 decode_backend = self.decode_attention_backend or self.attention_backend
-                kimi_linear_dspark = (
+                # Kimi K3 shares Kimi Linear's DCP + DSPARK-static path (same
+                # deepseek_common MLA target-verify + LSE-merge, same aux hidden
+                # capture); both hybrid archs on tokenspeed_mla are validated.
+                kimi_hybrid_dspark = (
                     self.speculative_algorithm == "DSPARK"
-                    and "KimiLinearForCausalLM" in model_arches
+                    and (
+                        "KimiLinearForCausalLM" in model_arches
+                        or "KimiK3ForConditionalGeneration" in model_arches
+                    )
                     and decode_backend == "tokenspeed_mla"
                 )
-                if not kimi_linear_dspark:
+                if not kimi_hybrid_dspark:
                     raise ValueError(
                         "Decode context parallel (--dcp-size / "
                         "--decode-context-parallel-size > 1) with speculative "
-                        "decoding on CUDA is only validated for Kimi Linear + "
-                        "DSPARK + tokenspeed_mla, but got "
+                        "decoding on CUDA is only validated for Kimi Linear / "
+                        "Kimi K3 + DSPARK + tokenspeed_mla, but got "
                         f"architectures={model_arches}, "
                         f"speculative_algorithm={self.speculative_algorithm!r}, "
                         f"decode_attention_backend={decode_backend!r}."

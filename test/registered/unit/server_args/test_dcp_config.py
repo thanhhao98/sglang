@@ -111,6 +111,21 @@ class TestDCPCommBackendValidation(CustomTestCase):
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_k3_tokenspeed_dspark_on_cuda_passes(self, *_):
+        # Kimi K3 shares Kimi Linear's DCP + DSPARK-static path, so the gate
+        # must accept it under the same DSPARK + tokenspeed_mla combo.
+        args = self._make_args(dcp_size=4, dcp_comm_backend="a2a")
+        args.speculative_algorithm = "DSPARK"
+        args.attention_backend = "tokenspeed_mla"
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiK3ForConditionalGeneration"]
+            )
+        )
+        args._handle_dcp_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_dcp_rejects_other_speculative_combinations(self, *_):
         cases = [
             ("EAGLE", "tokenspeed_mla", ["KimiLinearForCausalLM"]),
