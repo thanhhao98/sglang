@@ -1460,8 +1460,14 @@ class KimiK3DeltaAttention(nn.Module):
             # Reduce within the attn-TP group: the default reduce path uses
             # the full-TP collective, which at attn_tp>1 is both the wrong
             # group (sums across DP groups) and asymmetric vs idle DP ranks
-            # (deadlocks the per-layer DP gather).
-            use_dp_attention_reduce=True,
+            # (deadlocks the per-layer DP gather). Off under all_reduce_fusion:
+            # the fused AR does the reduce itself (reduce_results=False) and the
+            # forward wraps o_proj in k3 symm_alloc — leaving this True would
+            # nest use_symmetric_memory(attn_tp) inside symm_alloc and misroute
+            # the GEMM output away from the k3 pool (rendezvous miss). At the
+            # fusion config attn_tp==tp so the fused full-TP reduce is the same
+            # group anyway.
+            use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
         # SGLANG_K3_AR_FUSION: keep the o_proj output TP-partial and complete
