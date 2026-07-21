@@ -11,7 +11,10 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
 from sglang.srt.layers.attention import tokenspeed_mla_backend as backend_module
 from sglang.srt.layers.attention import trtllm_mla_backend as trt_backend_module
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
+from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+    TokenspeedMLABackend,
+    _get_tokenspeed_workspace,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLADecodeMetadata
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -45,6 +48,42 @@ def _make_interleaved_req_to_token(lengths, dcp_size, physical_page_size):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
 class TestTokenspeedMLADCP(CustomTestCase):
+    def test_workspace_accounts_for_dcp_gathered_heads(self):
+        device = torch.device("cuda")
+        expected_size = 148 * (4 * 8) * 8 * (512 + 1) * 4
+        allocated = SimpleNamespace()
+        resources = SimpleNamespace(buffers={})
+
+        with (
+            patch.object(
+                backend_module,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=8),
+            ),
+            patch.object(
+                backend_module.tokenspeed_mla, "get_num_sm", return_value=148
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_resources", return_value=resources
+            ),
+            patch.object(
+                backend_module.torch, "empty", return_value=allocated
+            ) as empty,
+        ):
+            actual = _get_tokenspeed_workspace(
+                device,
+                num_heads=4,
+                kv_lora_rank=512,
+                max_q_len=8,
+            )
+
+        self.assertIs(actual, allocated)
+        empty.assert_called_once_with(
+            expected_size,
+            dtype=torch.int8,
+            device=device,
+        )
+
     def test_prefill_normalizes_strided_mla_values(self):
         backend = object.__new__(TokenspeedMLABackend)
         query = torch.empty((4, 2, 192), dtype=torch.bfloat16, device="cuda")
