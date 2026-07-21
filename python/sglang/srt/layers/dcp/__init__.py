@@ -48,7 +48,6 @@ from sglang.srt.layers.dcp.comm import (
     init_dcp_a2a_cuda_graph_buffers,
     init_fi_a2a_workspace,
 )
-from sglang.srt.layers.dcp.draft import draft_forward_guard
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
     get_dcp_lens,
@@ -66,7 +65,6 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
-    "draft_forward_guard",
     "dcp_a2a_lse_reduce",
     "get_dcp_a2a_cuda_graph_buffers",
     "init_dcp_a2a_cuda_graph_buffers",

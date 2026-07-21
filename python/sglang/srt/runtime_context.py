@@ -18,8 +18,10 @@ moe / attn size and rank, plus the process-group handles — each delegate live 
 the canonical getter in ``distributed.parallel_state`` / ``layers.dp_attention``.
 Returned values are exactly what those getters return; this is a read-through
 wrapper, not a cache. It gives call-sites one import and one naming scheme in
-place of a dozen free functions, plus a test-only ``override()`` hook to force a
-topology without monkeypatching the underlying getters.
+place of a dozen free functions, plus an ``override()`` hook to force a topology
+without monkeypatching the underlying getters — primarily for tests, with one
+blessed production use in ``draft_forward_guard`` (DCP isolation for replicated
+speculative draft-model forwards).
 
 ``get_server_args()`` returns the process-wide ``ServerArgs`` (the config
 tier). The context owns the storage: publishing goes through
@@ -124,6 +126,19 @@ class ParallelContext:
             yield self
         finally:
             self._overrides = saved
+
+    @contextmanager
+    def draft_forward_guard(self, is_draft: bool):
+        """Disable DCP for replicated speculative draft-model forwards.
+
+        The draft model runs TP-replicated with an unsharded KV cache, so its
+        forwards must not take the DCP all-gather / LSE-merge path. This is the
+        one blessed production use of ``override`` (see module docstring)."""
+        if not is_draft:
+            yield self
+            return
+        with self.override(dcp_enabled=False):
+            yield self
 
     @property
     def world_size(self) -> int:

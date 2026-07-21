@@ -160,7 +160,7 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -1344,10 +1344,8 @@ class ModelRunner:
             if not self.is_draft_worker and ((c := self.canary_manager) is not None)
             else contextlib.nullcontext()
         )
-        from sglang.srt.layers.dcp.draft import draft_forward_guard
-
         with (
-            draft_forward_guard(self.is_draft_worker),
+            get_parallel().draft_forward_guard(self.is_draft_worker),
             canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(

@@ -4,7 +4,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.mem_cache.kv_cache_configurator import (
     _assert_pool_covers_allocator,
     _draft_pool_size_for_allocator,
@@ -26,7 +25,7 @@ class TestDraftForwardGuard(unittest.TestCase):
         ):
             self.assertEqual(parallel.attn_dcp_size, 8)
             self.assertEqual(parallel.attn_dcp_rank, 3)
-            with draft_forward_guard(True):
+            with parallel.draft_forward_guard(True):
                 self.assertFalse(parallel.dcp_enabled)
                 self.assertEqual(parallel.attn_dcp_size, 1)
                 self.assertEqual(parallel.attn_dcp_rank, 0)
@@ -37,7 +36,7 @@ class TestDraftForwardGuard(unittest.TestCase):
     def test_non_draft_is_noop(self):
         parallel = get_parallel()
         with parallel.override(dcp_enabled=True, dcp_size=4, dcp_rank=2):
-            with draft_forward_guard(False):
+            with parallel.draft_forward_guard(False):
                 self.assertTrue(parallel.dcp_enabled)
                 self.assertEqual(parallel.attn_dcp_size, 4)
 
