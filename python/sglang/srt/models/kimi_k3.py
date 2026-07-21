@@ -620,14 +620,20 @@ class KimiK3MLP(nn.Module):
         prefix: str = "",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        _tp_kwargs = (
+            dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
+        )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            **_tp_kwargs,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -636,6 +642,7 @@ class KimiK3MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            **_tp_kwargs,
         )
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
@@ -817,7 +824,20 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # Shared experts (operate in original hidden_size space)
+        # EP a2a backends (megamoe / DeepEP) move each row to its experts
+        # directly, so the MoE region can consume whatever rows this rank
+        # holds — an SP-MoE token shard (attn_tp > 1) or the DP-local batch
+        # (DP attention) — with every global token dispatched exactly once.
+        # No DP gather and no TP reduce is needed anywhere in the region.
+        _a2a_backend = get_moe_a2a_backend()
+        self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
+
+        # Shared experts (operate in original hidden_size space).
+        # Replicate the shared-expert weights (tp1, DSv2 convention) under EP
+        # a2a: the block runs on partial batches (shard / DP-local rows), and
+        # a TP-sharded partial sum could never be reduced across ranks that
+        # hold different tokens.
+        self._shared_experts_tp1 = self._ep_a2a
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiK3MLP(
@@ -829,6 +849,7 @@ class KimiK3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
+                **(dict(tp_rank=0, tp_size=1) if self._shared_experts_tp1 else {}),
             )
         else:
             self.shared_experts = None
@@ -937,6 +958,11 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
 
+        # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
+        # output) the incoming rows are already this rank's token shard, so
+        # the fused a2a below dispatches each token exactly once. On the
+        # non-scattered fallback path the rows are the full batch (redundant
+        # across ranks but correct).
         num_tokens = routed_input.shape[0]
         num_max_tokens_per_rank = (
             envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -945,7 +971,7 @@ class KimiK3MoE(nn.Module):
             f"mega MoE: num_tokens={num_tokens} exceeds "
             f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
             f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
-            f"the env var to cover the per-rank prefill chunk"
+            f"the env var to cover the per-rank rows"
         )
         buf = _get_mega_moe_symm_buffer(
             get_moe_ep_group().device_group,
@@ -1082,7 +1108,9 @@ class KimiK3MoE(nn.Module):
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(latent)
         if shared_output is not None:
-            if self.tp_size > 1:
+            # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
+            # ones need the partial-sum reduction.
+            if self.tp_size > 1 and not self._shared_experts_tp1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
@@ -1180,13 +1208,21 @@ class KimiK3MoE(nn.Module):
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
         either way).
 
-        Under DP attention (forward_batch given) the experts run on the
-        DP-gathered global batch — the internal reduces stay over the full TP
-        group, which is exactly right in gathered space — while prefix_sum
-        stays in local token space, added after the scatter back."""
+        Under DP attention with TP-sharded experts (a2a none, forward_batch
+        given) the experts run on the DP-gathered global batch — the internal
+        reduces stay over the full TP group, which is exactly right in
+        gathered space — while prefix_sum stays in local token space, added
+        after the scatter back. EP a2a backends skip the gather entirely:
+        dispatching the DP-local rows (or the SP-MoE shard of them the
+        decoder layer already produced) covers every global token exactly
+        once, and prefix_sum is consumed in the tail add like the non-DP
+        path — gathering first would just replicate the whole batch onto
+        every rank (tp-fold redundant compute + a2a traffic)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        use_dp = self._dp_attention and forward_batch is not None
+        use_dp = (
+            self._dp_attention and forward_batch is not None and not self._ep_a2a
+        )
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
@@ -1801,14 +1837,52 @@ class KimiK3DecoderLayer(nn.Module):
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
         self._trim_padded_attn = require_mlp_sync(get_server_args())
+        # A layer runs MoE (vs a plain dense MLP) iff it is past the dense
+        # prefix and on the MoE cadence — same predicate the mlp construction
+        # below uses.
+        self._is_moe_layer = (
+            self.is_moe
+            and config.num_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        )
+        # SP-MoE (EP a2a backend — megamoe or DeepEP): o_proj defers its
+        # attention-TP reduction; this layer completes it as a reduce-scatter
+        # so the whole MoE region (agg2, norms, gate, latent projs, tp1
+        # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
+        # then all-gathers rows back after the MoE tail add. RS+AG moves the
+        # same bytes the o_proj all-reduce did, the shared-expert all-reduce
+        # disappears via tp1 weights, and each rank dispatches only its shard
+        # through the a2a (kills the attn_tp-fold dispatch redundancy) —
+        # strictly less communication + MoE-front compute /attn_tp. Works the
+        # same under DP attention: the attn_tp group is then the
+        # within-replica subgroup, rows are the DP-local batch, and
+        # KimiK3MoE skips the DP gather under EP a2a so the shard flows
+        # straight into the a2a. With attn_tp == 1 (full DP attention) there
+        # is no attention reduce to convert — the MoE-side gather skip alone
+        # removes the replication. Dense layers are excluded: their
+        # column-parallel MLP has no per-token decomposition that survives a
+        # token shard.
+        _a2a_backend = get_moe_a2a_backend()
+        self._sp_moe = (
+            (_a2a_backend.is_megamoe() or _a2a_backend.is_deepep())
+            and self._is_moe_layer
+            and get_parallel().attn_tp_group.world_size > 1
+        )
 
         # The fused all-reduce only serves the attn-res clean path (the
         # production path: attn_res is config-static and the clean/legacy
         # choice is env-static), so the legacy and standard paths stay
         # byte-for-byte untouched and always see a reduced attention output.
+        # Mutually exclusive with SP-MoE: both complete o_proj's deferred
+        # reduction, but SP-MoE reduce-scatters to a shard whereas the fusion
+        # produces the full batch in a symm buffer — an SP-MoE layer builds
+        # o_proj in the plain deferred-reduce config (reduce_results forced off
+        # below) and reduce-scatters instead.
         attn_tp_size = get_parallel().attn_tp_size
         self.all_reduce_fusion = (
-            attn_tp_size > 1
+            not self._sp_moe
+            and attn_tp_size > 1
             and attn_tp_size == get_tensor_model_parallel_world_size()
             and config.attn_res_block_size is not None
             and _K3_ATTN_RES_MODE != "legacy"
@@ -1835,12 +1909,7 @@ class KimiK3DecoderLayer(nn.Module):
             )
 
         # MLP / MoE
-        if (
-            self.is_moe
-            and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        ):
+        if self._is_moe_layer:
             self.mlp = KimiK3MoE(
                 config=config,
                 quant_config=quant_config,
@@ -1895,6 +1964,36 @@ class KimiK3DecoderLayer(nn.Module):
             if _K3_ATTN_RES_MODE == "legacy"
             else self._forward_attn_residual_clean
         )
+
+        if self._sp_moe:
+            # o_proj emits TP-partial sums; _finish_attn_reduce completes the
+            # reduction (RS on the clean attn-res path, AR on fallbacks).
+            o_proj = getattr(self.self_attn, "o_proj", None)
+            assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
+            o_proj.reduce_results = False
+
+    def _finish_attn_reduce(
+        self, attn_out: torch.Tensor, allow_scatter: bool
+    ) -> tuple[torch.Tensor, int]:
+        """Complete o_proj's deferred TP reduction under SP-MoE.
+
+        Returns (reduced tensor, shard row offset); offset is -1 when the
+        result covers the full batch (non-SP mode, or fallback all-reduce for
+        row counts not divisible by attn_tp)."""
+        if not self._sp_moe:
+            return attn_out, -1
+        group = get_parallel().attn_tp_group
+        num_tokens = attn_out.shape[0]
+        if allow_scatter and num_tokens > 0 and num_tokens % group.world_size == 0:
+            shard = num_tokens // group.world_size
+            out = torch.empty(
+                (shard, attn_out.shape[1]),
+                dtype=attn_out.dtype,
+                device=attn_out.device,
+            )
+            group.reduce_scatter_tensor(out, attn_out)
+            return out, group.rank_in_group * shard
+        return group.all_reduce(attn_out), -1
 
     def _run_self_attn(
         self,
@@ -1998,6 +2097,9 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
+        # standard path returns a full-size residual to the next layer, so
+        # complete the deferred o_proj reduction as a plain all-reduce
+        hidden_states, _ = self._finish_attn_reduce(hidden_states, allow_scatter=False)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
@@ -2035,28 +2137,52 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, positions, forward_batch, zero_allocator
         )
 
-        # ---- Aggregation 2: MLP side ----
-        if self.all_reduce_fusion:
+        # ---- Complete o_proj's deferred reduction ----
+        # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
+        # otherwise the fused all-reduce when enabled; otherwise o_proj already
+        # reduced itself (use_dp_attention_reduce, on when neither is active).
+        rows = None
+        shard_lo = -1
+        if self._sp_moe:
+            hidden_states, shard_lo = self._finish_attn_reduce(
+                hidden_states, allow_scatter=True
+            )
+            if shard_lo >= 0:
+                rows = slice(shard_lo, shard_lo + hidden_states.shape[0])
+                if prefix_sum is not None:
+                    prefix_sum = prefix_sum[rows]
+        elif self.all_reduce_fusion:
             # Complete the o_proj reduce here, folding the pending prefix add
             # into the fused all-reduce; attn_res then takes the pre-added
             # tensor through its prefix_sum=None branch (same semantics:
             # (normed, new_prefix) with new_prefix = prefix + attn_out).
             hidden_states = k3_ar_fusion.all_reduce(hidden_states, prefix_sum)
             prefix_sum = None
+
+        # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
         hidden_states, prefix_sum = attn_res.forward(
             hidden_states,
             prefix_sum,
             self.mlp_res_proj,
             self.mlp_res_norm,
             self.post_attention_layernorm,
+            rows=rows,
         )
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        return (
-            self.mlp(hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch),
-            None,
-        )
+        out = self.mlp(hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch)
+        if shard_lo >= 0:
+            # reassemble the batch: contiguous shards concatenate in rank order
+            group = get_parallel().attn_tp_group
+            full = torch.empty(
+                (out.shape[0] * group.world_size, out.shape[1]),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            group.all_gather_into_tensor(full, out.contiguous())
+            out = full
+        return out, None
 
     def _forward_attn_residual_legacy(
         self,
@@ -2120,6 +2246,9 @@ class KimiK3DecoderLayer(nn.Module):
         attn_out = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
+        # legacy path updates full-batch prefix/snapshots post-attention:
+        # complete the deferred o_proj reduction as a plain all-reduce
+        attn_out, _ = self._finish_attn_reduce(attn_out, allow_scatter=False)
 
         if use_shared_scores:
             # Residual update + only the updated-prefix score (frozen-row

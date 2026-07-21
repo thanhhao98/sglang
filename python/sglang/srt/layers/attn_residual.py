@@ -462,6 +462,7 @@ class AttnResidual:
         score_proj: ReplicatedLinear,
         score_norm: RMSNorm,
         out_norm: RMSNorm,
+        rows: Optional[slice] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
@@ -469,12 +470,19 @@ class AttnResidual:
             assert prefix_sum is None
             return out_norm(hidden_states), hidden_states
 
+        # SP-MoE: the caller holds only its token shard; align the banked
+        # residual rows to it (dim-0 slice of a contiguous buffer stays
+        # contiguous for the jit kernels).
+        block_residual = (
+            self.block_residual if rows is None else self.block_residual[rows]
+        )
+
         if prefix_sum is None:
             # hidden_states already is the whole head (PP entry or a
             # block-boundary restart).
             normed = _aggregate(
                 hidden_states,
-                self.block_residual,
+                block_residual,
                 nvb,
                 score_proj,
                 score_norm,
@@ -487,7 +495,7 @@ class AttnResidual:
         return _aggregate_fused_add(
             prefix_sum,
             hidden_states,
-            self.block_residual,
+            block_residual,
             nvb,
             score_proj,
             score_norm,
