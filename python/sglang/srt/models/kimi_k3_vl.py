@@ -34,7 +34,6 @@ from sglang.srt.models.kimi_vl_moonvit import concat_or_single, tpool_patch_merg
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import print_info_once
 
-_FUSED_ROPE_MIN_TOKENS = 2048
 _SM103_TRITON_MAX_SEQLEN = 1536
 _SM103_FA4_MIN_ATTENTION_WORK = 3_000_000
 
@@ -95,8 +94,6 @@ def apply_rope(
 
 
 def _can_use_fused_rope(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> bool:
-    if hidden_states.shape[0] < _FUSED_ROPE_MIN_TOKENS:
-        return False
     if not (
         hidden_states.is_cuda
         and freqs_cis.is_cuda
@@ -115,6 +112,13 @@ def sdpa_varlen_attention(
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
+    if cu_seqlens.numel() == 2:
+        out = F.scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+        )
+        return out.squeeze(0).transpose(0, 1).flatten(start_dim=-2)
     outputs = []
     bounds = cu_seqlens.tolist()
     for start, end in zip(bounds[:-1], bounds[1:]):
