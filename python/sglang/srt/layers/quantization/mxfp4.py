@@ -40,7 +40,6 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -1199,6 +1198,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         return self.runner.run(dispatch_output, quant_info)
 
+    def _apply_marlin(self, layer, dispatch_output):
+        """MXFP4 x BF16 MoE via the Marlin runner. The quant_info (incl. the
+        dispatcher's EP mapping) is shared with
+        :class:`~sglang.srt.layers.quantization.mxfp4_marlin_moe.Mxfp4MarlinMoEMethod`;
+        only the input padding is local (``hidden_size`` is pre-rounded to the
+        Marlin-padded width at create_weights)."""
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            build_marlin_moe_quant_info,
+        )
+
+        x = dispatch_output.hidden_states
+        if x.shape[-1] == self.hidden_size:
+            x_padded = x
+        else:
+            x_padded = torch.nn.functional.pad(
+                x, (0, self.hidden_pad), mode="constant", value=0.0
+            )
+        quant_info = build_marlin_moe_quant_info(layer)
+        return self.runner.run(
+            dispatch_output._replace(hidden_states=x_padded), quant_info
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1268,33 +1289,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
-            if x.shape[-1] == self.hidden_size:
-                x_padded = x
-            else:
-                x_padded = torch.nn.functional.pad(
-                    x, (0, self.hidden_pad), mode="constant", value=0.0
-                )
-            expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
-            global_num_experts = (
-                layer.dispatcher.num_experts if expert_map is not None else -1
-            )
-            quant_info = MarlinMoeQuantInfo(
-                w13_qweight=layer.w13_weight,
-                w2_qweight=layer.w2_weight,
-                w13_scales=layer.w13_weight_scale,
-                w2_scales=layer.w2_weight_scale,
-                w13_g_idx_sort_indices=None,
-                w2_g_idx_sort_indices=None,
-                weight_bits=4,
-                is_k_full=True,
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
-                expert_map=expert_map,
-                global_num_experts=global_num_experts,
-            )
-            return self.runner.run(
-                dispatch_output._replace(hidden_states=x_padded), quant_info
-            )
+            return self._apply_marlin(layer, dispatch_output)
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)

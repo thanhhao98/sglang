@@ -7,7 +7,7 @@ dispatch), but backed by torch symmetric memory:
 * :func:`symm_alloc` — allocation context that routes tensor allocations into
   the torch symm-mem pool (with the pause-the-graph-pool dance under CUDA
   graph capture, same as ``pynccl_allocator.SymmetricMemoryContext``).
-* :func:`fused_all_reduce` — in-place ``x = allreduce(x) [+ residual]``:
+* :func:`all_reduce` — in-place ``x = allreduce(x) [+ residual]``:
   small messages take the 1shot multicast-push (any tensor; reuses the
   group's CustomAllReduceV2 workspace), large ones take the in-place NVLS
   2shot on ``x``'s multicast address (rendezvous cached per segment).
@@ -144,7 +144,7 @@ def _find_mc_ptr(state: _State, x: torch.Tensor) -> int:
 
     hdl = torch_symm_mem.rendezvous(x, state.group_name)
     assert hdl is not None and hdl.multicast_ptr != 0, (
-        "fused_all_reduce input above the push threshold is not a "
+        "all_reduce input above the push threshold is not a "
         "symm-pool tensor (allocate it under k3_ar_fusion.symm_alloc())"
     )
     offset = x.data_ptr() - hdl.buffer_ptrs[state.comm.rank]
