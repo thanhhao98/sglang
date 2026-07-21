@@ -100,6 +100,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
     rank0_log,
+    require_mlp_sync,
     set_weight_attrs,
 )
 
@@ -148,6 +149,13 @@ def _resolve_moe_reduce_mode() -> str:
 #   moe_front: shared gate_up + router gate + latent down_proj -> one GEMM
 #   kda_bfa:   KDA b_proj + f_a_proj -> one GEMV
 _K3_FUSE_MOE_FRONT = envs.SGLANG_K3_FUSE_MOE_FRONT.get()
+
+# MegaMoE SiTU sentinel: the patched deep_gemm mega kernel selects the K3 SiTU
+# activation when activation_clamp == 0.03125 (2^-5: exactly representable and
+# unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
+# negative sentinel is impossible). beta=4.0 / linear_beta=25.0 are baked into
+# the kernel patch — see p0-wideep/scripts/v2/apply_deepgemm_situ_patch.py.
+_K3_MEGA_SITU_SENTINEL_CLAMP = 0.03125
 
 
 def _k3_bf16_gemm(
@@ -780,9 +788,32 @@ class KimiK3MoE(nn.Module):
                     config.hidden_act == "situ"
                     and get_moe_runner_backend().is_flashinfer_mxfp4()
                 )
+                # mega pre-dispatch consumes raw topk_ids/topk_weights
+                or get_moe_a2a_backend().is_megamoe()
                 else None
             ),
         )
+
+        # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer): a drop-in
+        # replacement for the routed experts call below. K3 routes ALL batches
+        # through it when enabled — the megamoe backend's non-mega fallback is
+        # a StandardDispatcher without a2a, which is wrong for scattered
+        # tokens — so SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK must
+        # cover the per-rank prefill chunk. SiTU is selected inside the patched
+        # mega kernel via a sentinel activation_clamp with the K3 constants
+        # baked in (see p0-wideep scripts/v2/apply_deepgemm_situ_patch.py).
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._mega_intermediate_size = moe_intermediate_size
+        self._mega_top_k = config.num_experts_per_token
+        if self._use_mega_moe:
+            assert self.use_latent_moe and config.hidden_act == "situ"
+            assert (
+                config.activation_situ_beta,
+                config.activation_situ_linear_beta,
+            ) == (4.0, 25.0), (
+                "mega SiTU kernel patch bakes beta=4.0/linear_beta=25.0; "
+                "got a checkpoint with different constants"
+            )
 
         # Shared experts (operate in original hidden_size space)
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
@@ -877,6 +908,86 @@ class KimiK3MoE(nn.Module):
             in (torch.bfloat16, torch.float16)
         )
 
+    def _forward_mega_experts(
+        self, routed_input: torch.Tensor, topk_output
+    ) -> torch.Tensor:
+        """Routed experts via deep_gemm MegaMoE: fused a2a dispatch + grouped
+        GEMMs + SiTU + combine over the EP-group symmetric buffer. Semantically
+        equivalent to `self.experts(routed_input, topk_output)` on an a2a
+        backend (combine returns fully-summed rows; `_reduce_latent` then only
+        applies the norm)."""
+        import deep_gemm
+
+        from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+
+        num_tokens = routed_input.shape[0]
+        num_max_tokens_per_rank = (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        )
+        assert num_tokens <= num_max_tokens_per_rank, (
+            f"mega MoE: num_tokens={num_tokens} exceeds "
+            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
+            f"the env var to cover the per-rank prefill chunk"
+        )
+        buf = _get_mega_moe_symm_buffer(
+            get_moe_ep_group().device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=self._mega_top_k,
+            hidden=self.moe_hidden_size,
+            intermediate_hidden=self._mega_intermediate_size,
+        )
+
+        if num_tokens > 0:
+            topk_ids_in = topk_output.topk_ids.to(torch.int32)
+            topk_weights_in = topk_output.topk_weights.to(torch.float32)
+        else:
+            topk_ids_in = routed_input.new_empty(
+                (0, self._mega_top_k), dtype=torch.int32
+            )
+            topk_weights_in = routed_input.new_empty(
+                (0, self._mega_top_k), dtype=torch.float32
+            )
+
+        mega_moe_pre_dispatch(
+            routed_input,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            quant_group_size=32,
+        )
+        # At least one row so the tvm-ffi binding sees a non-null data_ptr.
+        y = torch.empty(
+            (max(num_tokens, 1), self.moe_hidden_size),
+            dtype=torch.bfloat16,
+            device=routed_input.device,
+        )
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            self.experts.mega_l1_weights,
+            self.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            # sentinel: selects the K3 SiTU branch in the patched mega kernel
+            # (beta=4.0 / linear_beta=25.0 baked in); see
+            # p0-wideep/scripts/v2/apply_deepgemm_situ_patch.py
+            activation_clamp=_K3_MEGA_SITU_SENTINEL_CLAMP,
+            fast_math=True,
+        )
+        y = y[:num_tokens]
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if self.routed_scaling_factor is not None and self.routed_scaling_factor != 1.0:
+                y.mul_(self.routed_scaling_factor)
+        return y
+
     def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
         if self.routed_expert_norm is None:
             return latent
@@ -945,7 +1056,12 @@ class KimiK3MoE(nn.Module):
             )
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        latent = self._reduce_latent(self.experts(routed_input, topk_output))
+        expert_output = (
+            self._forward_mega_experts(routed_input, topk_output)
+            if self._use_mega_moe
+            else self.experts(routed_input, topk_output)
+        )
+        latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(latent)
         if shared_output is not None:
@@ -1598,6 +1714,9 @@ class KimiK3DecoderLayer(nn.Module):
         self.is_moe = config.is_moe
         self.layer_idx = layer_idx
         self._dp_attention = is_dp_attention_enabled()
+        # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
+        # attn_tp multiples; attention must then run on the real rows only.
+        self._trim_padded_attn = require_mlp_sync(get_server_args())
 
         # Attention
         if config.is_kda_layer(layer_idx):
@@ -1691,15 +1810,18 @@ class KimiK3DecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        # DP attention pads extend batches to a multiple of attn_tp_size
+        # mlp-sync (DP attention OR MoE a2a/EP — require_mlp_sync) pads
+        # extend batches to a multiple of attn_tp_size
         # (prepare_mlp_sync_batch ceil_align), but the attention metadata
         # (qo_indptr / query_start_loc) covers only the real tokens — the
-        # flashinfer ragged prefill rejects the row mismatch. Run attention
-        # on the real rows and zero-pad the output back; padded rows are
-        # discarded downstream.
+        # flashinfer ragged prefill rejects the row mismatch, and silent
+        # paths write the padded rows' garbage KV through the zero-padded
+        # out_cache_loc entries (clobbering pool slot 0 → cross-request
+        # corruption). Run attention on the real rows and zero-pad the
+        # output back; padded rows are discarded downstream.
         num_padded = hidden_states.shape[0]
         num_real = num_padded
-        if self._dp_attention and forward_batch.forward_mode.is_extend():
+        if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
             extend_lens = forward_batch.extend_seq_lens_cpu
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)
@@ -1947,6 +2069,7 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
+        self._trim_padded_attn = require_mlp_sync(get_server_args())
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -2015,12 +2138,13 @@ class KimiK3LinearModel(nn.Module):
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
 
-        # DP attention pads extend batches to a multiple of attn_tp_size;
-        # attention layers run on the real rows only (_run_self_attn trims),
-        # so the KV write locations must match the trimmed length. positions
-        # and hidden_states keep the padded length for the DP gather/scatter.
+        # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to a
+        # multiple of attn_tp_size; attention layers run on the real rows
+        # only (_run_self_attn trims), so the KV write locations must match
+        # the trimmed length. positions and hidden_states keep the padded
+        # length for the DP gather/scatter and the MoE.
         if (
-            self._dp_attention
+            self._trim_padded_attn
             and forward_batch.forward_mode.is_extend()
             and forward_batch.out_cache_loc is not None
             and forward_batch.extend_seq_lens_cpu is not None
@@ -2270,9 +2394,18 @@ class KimiK3LinearForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+
+            # Skip weights of layers outside a truncated config (e.g.
+            # num_hidden_layers override for fast testing); the checkpoint may
+            # carry more layers than the instantiated model.
+            if ".layers." in name:
+                _lid = name.split(".layers.")[1].split(".")[0]
+                if _lid.isdigit() and int(_lid) >= num_hidden_layers:
+                    continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
             if "weight_packed" in name:
@@ -2334,6 +2467,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # Skip experts of layers outside a truncated config (e.g.
+                    # num_hidden_layers override), mirroring the non-expert
+                    # `name not in params_dict` guard below.
+                    if name not in params_dict:
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

@@ -577,6 +577,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_groups=num_experts,
                     disable_ue8m0_cast=False,
                 )
+            if get_moe_a2a_backend().is_megamoe():
+                # MegaMoE consumes the same transformed sf, plus its own
+                # interleaved/UTCCP weight layout. K3 routes EVERY batch
+                # through mega (the megamoe backend has no a2a fallback), so
+                # the contig-layout originals are dead weight — repoint the
+                # params at the mega tensors to reclaim ~1.9GB/layer/rank
+                # (keeping both layouts OOMs: 92 layers double the experts).
+                from deep_gemm import transform_weights_for_mega_moe
+
+                l1_pair, l2_pair = transform_weights_for_mega_moe(
+                    (layer.w13_weight.data, layer.w13_weight_scale.data),
+                    (layer.w2_weight.data, layer.w2_weight_scale.data),
+                )
+                layer.mega_l1_weights = l1_pair
+                layer.mega_l2_weights = l2_pair
+                layer.w13_weight.data = l1_pair[0]
+                layer.w13_weight_scale.data = l1_pair[1]
+                layer.w2_weight.data = l2_pair[0]
+                layer.w2_weight_scale.data = l2_pair[1]
+                layer._mega_moe_weights_built = True
             layer._mxfp4_backend = "deep_gemm"
             return
 
