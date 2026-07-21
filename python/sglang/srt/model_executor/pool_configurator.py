@@ -140,9 +140,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            dcp_size = max(int(kvc.server_args.dcp_size), 1)
-            if eagle_draft_num_layers is None and dcp_size > 1:
-                eagle_draft_num_layers = 1
+            dcp_size = kvc.server_args.dcp_size
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -337,9 +335,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            dcp_size = max(int(kvc.server_args.dcp_size), 1)
-            if draft_layers is None and dcp_size > 1:
-                draft_layers = 1
+            dcp_size = kvc.server_args.dcp_size
             if draft_layers is not None and int(draft_layers) > 0:
                 self._draft_full_layers_num = int(draft_layers) * dcp_size
 

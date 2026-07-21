@@ -73,36 +73,6 @@ class TestDraftPoolSizing(unittest.TestCase):
 
         self.assertEqual(configurator._cell_size, 6400)
 
-    def test_eagle_budget_uses_one_layer_floor_when_depth_unknown(self):
-        spec_algorithm = SimpleNamespace(
-            is_eagle=lambda: True,
-            is_standalone=lambda: False,
-            is_dflash_family=lambda: False,
-        )
-        kvc = SimpleNamespace(
-            model_config=SimpleNamespace(),
-            layer_info=SimpleNamespace(num_effective_layers=32),
-            spec_algorithm=spec_algorithm,
-            is_draft_worker=False,
-            spec_aux_config=SimpleNamespace(eagle_draft_num_layers=None),
-            server_args=SimpleNamespace(dcp_size=8),
-        )
-
-        with (
-            patch(
-                "sglang.srt.model_executor.pool_configurator.mambaish_config",
-                return_value=None,
-            ),
-            patch.object(
-                DefaultPoolConfigurator,
-                "_compute_cell_size",
-                return_value=3200,
-            ),
-        ):
-            configurator = DefaultPoolConfigurator(kvc)
-
-        self.assertEqual(configurator._cell_size, 4000)
-
     def test_widening_covers_allocator_padding_page(self):
         allocator = SimpleNamespace(size=800, page_size=8)
         widened = _draft_pool_size_for_allocator(
