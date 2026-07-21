@@ -1793,6 +1793,7 @@ class ServerArgs:
         Arg(
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             choices=["prefill", "decode"],
+            resolvable=True,
         ),
     ] = "prefill"
     speculative_draft_attention_backend: A[

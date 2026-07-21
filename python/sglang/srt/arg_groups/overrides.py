@@ -322,17 +322,40 @@ def _register_for(*architectures: str):
 
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
-    if (
+    if not (
         is_sm100_supported()
         and get_device_sm() in (100, 103)
         and server_args.is_attention_backend_not_set()
     ):
+        return {}
+    if server_args.speculative_algorithm != "DSPARK":
         logger.info(
             "Use trtllm_mla as the default decode attention backend for "
             "Kimi-K3 on SM100/SM103."
         )
         return {"decode_attention_backend": "trtllm_mla"}
-    return {}
+    # DSPARK: verify runs on the decode backend (mode=decode), so this picks the
+    # verify kernel. cutedsl rejects verify q_len > 4, mode=prefill flashinfer
+    # verify is slow, and plain decode is cold under dspark. tokenspeed verify is
+    # fastest on fp8 KV but hard-requires fp8_e4m3 and caps q_len <= 8.
+    q_len = server_args.speculative_num_draft_tokens or (
+        server_args.speculative_dspark_block_size + 1
+        if server_args.speculative_dspark_block_size is not None
+        # Checkpoint auto-infer happens after overrides; K3 draft uses block 7.
+        else 8
+    )
+    if server_args.kv_cache_dtype == "fp8_e4m3" and q_len <= 8:
+        backend = "tokenspeed_mla"
+    else:
+        backend = "trtllm_mla"
+    logger.info(
+        "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
+        f"{backend} (speculative_attention_mode=decode)."
+    )
+    return {
+        "decode_attention_backend": backend,
+        "speculative_attention_mode": "decode",
+    }
 
 
 @_register_for(
