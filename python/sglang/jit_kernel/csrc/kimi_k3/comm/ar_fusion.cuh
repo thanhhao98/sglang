@@ -576,7 +576,7 @@ struct AllReduceFusionKernel {
         .enable_pdl(kUsePDL)(all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL>, params);
   }
 
-  static void pull_norm(CommunicatorRef ref, TensorView input, TensorView weight, double eps, int64_t input_mc_ptr) {
+  static void pull_norm(CommunicatorRef ref, TensorView input, TensorView weight, float eps, int64_t input_mc_ptr) {
     constexpr uint32_t kDefaultBlocks = 64;
     const auto& data = *ref.get();
     auto params = make_params_norm(data, input, weight, eps);

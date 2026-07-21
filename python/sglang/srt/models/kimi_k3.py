@@ -997,7 +997,10 @@ class KimiK3MoE(nn.Module):
         )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-            if self.routed_scaling_factor is not None and self.routed_scaling_factor != 1.0:
+            if (
+                self.routed_scaling_factor is not None
+                and self.routed_scaling_factor != 1.0
+            ):
                 y.mul_(self.routed_scaling_factor)
         return y
 
@@ -1453,6 +1456,11 @@ class KimiK3DeltaAttention(nn.Module):
             projection_size,
             self.hidden_size,
             bias=False,
+            # SGLANG_K3_AR_FUSION: keep the o_proj output TP-partial and
+            # complete the reduce at the decoder layer via the fused MNNVL
+            # all-reduce (which can fold the attn-res prefix add in). Only
+            # valid when the attn TP group is the full TP group (the fused
+            # comm lives there).
             reduce_results=not self.all_reduce_fusion,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
@@ -1470,10 +1478,6 @@ class KimiK3DeltaAttention(nn.Module):
             use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
-        # SGLANG_K3_AR_FUSION: keep the o_proj output TP-partial and complete
-        # the reduce at the decoder layer via the fused MNNVL all-reduce
-        # (which can fold the attn-res prefix add in). Only valid when the
-        # attn TP group is the full TP group (the fused comm lives there).
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2344,9 +2348,7 @@ class KimiK3LinearModel(nn.Module):
         consumer would compute (next layer's attention side; output side
         for the last layer)."""
         if attn_res is None:
-            return (
-                hidden_states if residual is None else hidden_states + residual
-            )
+            return hidden_states if residual is None else hidden_states + residual
         if residual is not None:
             # Materialize a delayed MLP add (mirrors the PP-wire fold).
             hidden_states = residual + hidden_states

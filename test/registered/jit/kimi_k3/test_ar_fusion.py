@@ -6,7 +6,7 @@ CUDA-graph capture/replay pass and a mixed stress loop.
 
 Usage::
 
-    python tests/test_ar_fusion.py            # relaunches under torchrun (8 GPUs)
+    python test/registered/jit/kimi_k3/test_ar_fusion.py   # relaunches under torchrun (8 GPUs)
 """
 
 from __future__ import annotations
