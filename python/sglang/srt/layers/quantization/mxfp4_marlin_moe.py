@@ -162,10 +162,6 @@ class Mxfp4MarlinMoEMethod:
                 value=0.0,
             )
 
-        expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
-        global_num_experts = (
-            layer.dispatcher.num_experts if expert_map is not None else -1
-        )
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_weight,
             w2_qweight=layer.w2_weight,
@@ -177,8 +173,6 @@ class Mxfp4MarlinMoEMethod:
             is_k_full=True,
             w13_bias=getattr(layer, "w13_weight_bias", None),
             w2_bias=getattr(layer, "w2_weight_bias", None),
-            expert_map=expert_map,
-            global_num_experts=global_num_experts,
         )
         runner_output = self.runner.run(
             dispatch_output._replace(hidden_states=hidden_states_padded),
