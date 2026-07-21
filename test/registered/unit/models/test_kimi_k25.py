@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models import kimi_k3_vl, kimi_k25
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.kimi_k3 import (
@@ -43,6 +44,25 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _Tokenizer:
     def encode(self, _text):
         return []
+
+
+@pytest.mark.parametrize("frames", [1, 2])
+def test_kimi_tpool_shared_fast_path_matches_temporal_mean(frames):
+    grid_thws = torch.tensor([[frames, 4, 6]], dtype=torch.int64)
+    hidden_states = torch.arange(frames * 4 * 6 * 3, dtype=torch.float32).view(-1, 3)
+
+    reference = hidden_states.view(frames, 2, 2, 3, 2, 3)
+    reference = reference.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+    reference = reference.view(6, 4, 3)
+
+    assert kimi_k25.tpool_patch_merger is kimi_k3_vl.tpool_patch_merger
+    actual = kimi_k25.tpool_patch_merger(hidden_states, grid_thws)
+    explicit_metadata = kimi_k25.tpool_patch_merger(
+        hidden_states, grid_thws, grid_thw_list=grid_thws.tolist()
+    )
+    assert len(actual) == len(explicit_metadata) == 1
+    torch.testing.assert_close(actual[0], reference, rtol=0, atol=0)
+    torch.testing.assert_close(explicit_metadata[0], reference, rtol=0, atol=0)
 
 
 class _HFProcessor:

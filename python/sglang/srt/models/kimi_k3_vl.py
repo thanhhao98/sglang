@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_flashinfer_cudnn_vision_attention_metadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import print_info_once
 
@@ -575,31 +576,6 @@ class MoonViT3dEncoder(nn.Module):
             )
 
         return self.final_layernorm(hidden_states)
-
-
-def tpool_patch_merger(
-    x: torch.Tensor,
-    grid_thws: torch.Tensor,
-    merge_kernel_size: Tuple[int, int] = (2, 2),
-) -> List[torch.Tensor]:
-    d_model = x.size(-1)
-
-    outputs = []
-    pre_sum = 0
-    for t, h, w in grid_thws.tolist():
-        seq = x[pre_sum : pre_sum + t * h * w]
-        kernel_height, kernel_width = merge_kernel_size
-        new_height, new_width = h // kernel_height, w // kernel_width
-        reshaped_seq = seq.view(
-            t, new_height, kernel_height, new_width, kernel_width, d_model
-        )
-        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
-        outputs.append(
-            reshaped_seq.view(new_height * new_width, kernel_height * kernel_width, -1)
-        )
-        pre_sum += t * h * w
-
-    return outputs
 
 
 class KimiK3VisionTower(nn.Module):

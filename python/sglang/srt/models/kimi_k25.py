@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import MLP2
+from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
@@ -66,36 +66,6 @@ def apply_rope(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def tpool_patch_merger(
-    x: torch.Tensor,
-    grid_thws: torch.Tensor,
-    merge_kernel_size: tuple[int, int] = (2, 2),
-) -> list[torch.Tensor]:
-    d_model = x.size(-1)
-
-    outputs = []
-    pre_sum = 0
-    for t, h, w in grid_thws.tolist():
-        # Get the current sequence
-        seq = x[pre_sum : pre_sum + t * h * w]
-        # Reshape along self.merge_kernel_size and concat to the last dimension
-        kernel_height, kernel_width = merge_kernel_size
-        new_height, new_width = h // kernel_height, w // kernel_width
-        reshaped_seq = seq.view(
-            t, new_height, kernel_height, new_width, kernel_width, d_model
-        )
-        reshaped_seq = (
-            reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
-        )  # temporal pooling
-        padded_seq = reshaped_seq.view(
-            new_height * new_width, kernel_height * kernel_width, -1
-        )
-        outputs.append(padded_seq)
-        pre_sum += t * h * w
-
-    return outputs
 
 
 class MoonViTEncoderLayer(nn.Module):
