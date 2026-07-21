@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
+    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -40,6 +41,7 @@ class KDAKernelDispatcher:
         self,
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
+        verify_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonKDAKernel()
 
@@ -69,15 +71,37 @@ class KDAKernelDispatcher:
                 "KDA supports 'triton', 'cutedsl', or 'flashinfer'."
             )
 
-        # target_verify (MTP / speculative decode) kernel: each decode backend
-        # verifies with its own kernel. FlashInfer decode uses recurrent_kda (SM100,
-        # chain only); Triton -- and CuTe DSL, which has no verify of its own -- use
-        # the Triton fused KDA verify, which handles chain + tree
-        # (retrieve_parent_token) and per-step checkpointing and is the reference the
-        # KDA backend correctness tests assert against.
-        self.verify_kernel = (
-            self.decode_kernel if decode_backend.is_flashinfer() else triton_kernel
-        )
+        # target_verify kernel, selected via --linear-attn-verify-backend (defaults
+        # to follow decode: flashinfer -> recurrent_kda, else triton).
+        #   triton: fused chain + tree (retrieve_parent_token) verify; the reference
+        #     the KDA correctness tests assert against.
+        #   flashinfer: recurrent_kda (SM100, chain only); reuses the decode kernel
+        #     when decode is also flashinfer.
+        if verify_backend.is_triton():
+            self.verify_kernel = triton_kernel
+        elif verify_backend.is_flashinfer():
+            if decode_backend.is_flashinfer():
+                self.verify_kernel = self.decode_kernel
+            else:
+                if not is_cuda():
+                    raise ValueError("KDA FlashInfer verify backend requires CUDA")
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                    FlashInferKDAKernel,
+                )
+
+                self.verify_kernel = FlashInferKDAKernel()
+        elif verify_backend.is_custom():
+            # Future custom KDA verify kernel plugs in here.
+            raise NotImplementedError(
+                "--linear-attn-verify-backend custom: no custom KDA verify kernel "
+                "is registered yet."
+            )
+        else:
+            raise ValueError(
+                f"Unsupported KDA verify backend: {verify_backend}. "
+                "KDA verify supports 'triton' or 'flashinfer' "
+                "(CuTe DSL has no verify kernel)."
+            )
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
@@ -295,18 +319,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
-        # KDA FlashInfer speculative decode (target_verify) is linear-chain only --
-        # recurrent_kda has no tree-ancestor traversal. Reject EAGLE tree verify
-        # (topk > 1) early at setup instead of deep in the per-step verify call.
-        # (The kernel keeps a per-call retrieve_parent_token guard as a backstop; it
-        # also covers ngram tree, which this topk field does not.)
+        verify_backend = get_linear_attn_verify_backend()
+        # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
+        # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
+        # verify backend (not decode). The kernel keeps a per-call
+        # retrieve_parent_token backstop that also covers ngram tree.
         speculative_topk = model_runner.server_args.speculative_eagle_topk or 1
-        if decode_backend.is_flashinfer() and speculative_topk > 1:
+        if verify_backend.is_flashinfer() and speculative_topk > 1:
             raise ValueError(
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self.kernel_dispatcher = KDAKernelDispatcher(
+            decode_backend, prefill_backend, verify_backend
+        )
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend).
         self.verify_intermediate_state_indices = torch.arange(

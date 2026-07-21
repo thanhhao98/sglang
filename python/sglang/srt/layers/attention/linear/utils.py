@@ -41,11 +41,13 @@ class LinearAttnKernelBackend(Enum):
 
 LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
 LINEAR_ATTN_PREFILL_BACKEND: Optional[LinearAttnKernelBackend] = None
+LINEAR_ATTN_VERIFY_BACKEND: Optional[LinearAttnKernelBackend] = None
 
 
 def initialize_linear_attn_config(server_args: ServerArgs):
     global LINEAR_ATTN_DECODE_BACKEND
     global LINEAR_ATTN_PREFILL_BACKEND
+    global LINEAR_ATTN_VERIFY_BACKEND
 
     base = server_args.linear_attn_backend
     decode = server_args.linear_attn_decode_backend or base
@@ -54,7 +56,17 @@ def initialize_linear_attn_config(server_args: ServerArgs):
     LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
     LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)
 
-    rank0_log(f"Linear attention kernel backend: decode={decode}, prefill={prefill}")
+    # Verify backend. Unset -> follow decode (flashinfer -> its recurrent kernel,
+    # else triton), preserving historical behavior.
+    verify = server_args.linear_attn_verify_backend
+    if verify is None:
+        verify = decode if LINEAR_ATTN_DECODE_BACKEND.is_flashinfer() else "triton"
+    LINEAR_ATTN_VERIFY_BACKEND = LinearAttnKernelBackend(verify)
+
+    rank0_log(
+        f"Linear attention kernel backend: decode={decode}, prefill={prefill}, "
+        f"verify={verify}"
+    )
 
 
 def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:
@@ -75,3 +87,13 @@ def get_linear_attn_prefill_backend() -> LinearAttnKernelBackend:
         )
         LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend.TRITON
     return LINEAR_ATTN_PREFILL_BACKEND
+
+
+def get_linear_attn_verify_backend() -> LinearAttnKernelBackend:
+    global LINEAR_ATTN_VERIFY_BACKEND
+    if LINEAR_ATTN_VERIFY_BACKEND is None:
+        logger.warning(
+            "LINEAR_ATTN_VERIFY_BACKEND is not initialized, using triton backend"
+        )
+        LINEAR_ATTN_VERIFY_BACKEND = LinearAttnKernelBackend.TRITON
+    return LINEAR_ATTN_VERIFY_BACKEND

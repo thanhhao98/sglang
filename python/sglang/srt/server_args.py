@@ -2157,6 +2157,13 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
+    linear_attn_verify_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). Currently consumed by the KDA backend.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+    ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
