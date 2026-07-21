@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-b200")
 
 
 def _make_interleaved_req_to_token(lengths, dcp_size, physical_page_size):
@@ -60,12 +60,8 @@ class TestTokenspeedMLADCP(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=8),
             ),
-            patch.object(
-                backend_module.tokenspeed_mla, "get_num_sm", return_value=148
-            ),
-            patch(
-                "sglang.srt.runtime_context.get_resources", return_value=resources
-            ),
+            patch.object(backend_module.tokenspeed_mla, "get_num_sm", return_value=148),
+            patch("sglang.srt.runtime_context.get_resources", return_value=resources),
             patch.object(
                 backend_module.torch, "empty", return_value=allocated
             ) as empty,
@@ -338,6 +334,114 @@ class TestTokenspeedMLADCP(CustomTestCase):
             self.assertEqual(kv_buffer.shape[0] * dcp_size, global_tokens)
             torch.testing.assert_close(kv_buffer[:, 0, 0], expected)
             torch.testing.assert_close(kv_buffer[:, 0, 1], -expected)
+
+
+class TestDcpVerifyDenseQIndptr(CustomTestCase):
+    """The uniform verify q_indptr is built once per forward/capture in
+    metadata and reused by every MLA layer (was: one torch.arange per layer
+    per verify step)."""
+
+    def _graph_metadata(self, dcp_enabled):
+        backend = object.__new__(TokenspeedMLABackend)
+        backend.decode_cuda_graph_metadata = {}
+        backend.decode_cuda_graph_kv_indices = torch.zeros(
+            (4, 16), dtype=torch.int32, device="cuda"
+        )
+        backend.max_context_len = 256
+        backend.num_draft_tokens = 8
+        parallel = SimpleNamespace(dcp_enabled=dcp_enabled, dcp_size=4, dcp_rank=2)
+        with (
+            patch.object(trt_backend_module, "get_parallel", return_value=parallel),
+            patch.object(backend, "_calc_padded_blocks", return_value=8),
+        ):
+            backend._init_cuda_graph_metadata(
+                bs=3,
+                num_tokens=24,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                seq_lens=torch.zeros(3, dtype=torch.int32, device="cuda"),
+                device=torch.device("cuda"),
+            )
+        return backend.decode_cuda_graph_metadata[3]
+
+    def test_cuda_graph_verify_metadata_hoists_dense_q_indptr(self):
+        metadata = self._graph_metadata(dcp_enabled=True)
+        torch.testing.assert_close(
+            metadata.dense_q_indptr,
+            torch.arange(0, 32, 8, dtype=torch.int32, device="cuda"),
+        )
+
+    def test_non_dcp_verify_metadata_has_no_dense_q_indptr(self):
+        metadata = self._graph_metadata(dcp_enabled=False)
+        self.assertIsNone(metadata.dense_q_indptr)
+
+    def _run_dcp_verify(self, dense_q_indptr):
+        backend = object.__new__(TokenspeedMLABackend)
+        backend.forward_prefill_metadata = None
+        backend.data_type = torch.bfloat16
+        backend.q_data_type = torch.bfloat16
+        backend.page_size = 1
+        backend.kv_cache_dim = 2
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: torch.empty(
+                (8, 2), dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        metadata = TRTLLMMLADecodeMetadata(
+            block_kv_indices=torch.zeros((2, 1), dtype=torch.int32, device="cuda"),
+            seq_lens_k=torch.tensor([3, 6], dtype=torch.int32, device="cuda"),
+            global_seq_lens_k=torch.tensor([12, 22], dtype=torch.int32, device="cuda"),
+            max_seq_len_k=32,
+            dense_q_indptr=dense_q_indptr,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            decode_trtllm_mla_metadata=metadata,
+            spec_info=SimpleNamespace(draft_token_num=4, ragged_verify_layout=None),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=1,
+            head_dim=2,
+            v_head_dim=1,
+        )
+        query = torch.zeros((8, 2), dtype=torch.bfloat16, device="cuda")
+        raw_out = torch.zeros((2, 4, 1, 1), dtype=torch.bfloat16, device="cuda")
+        lse = torch.zeros((2, 4, 1), dtype=torch.float32, device="cuda")
+        parallel = SimpleNamespace(dcp_enabled=True, dcp_size=4, dcp_rank=2)
+        with (
+            patch.object(trt_backend_module, "get_parallel", return_value=parallel),
+            patch.object(
+                backend, "_run_decode_kernel", return_value=(raw_out, lse)
+            ) as kernel,
+            patch.object(trt_backend_module, "fixup_zero_kv_rows") as fixup,
+        ):
+            backend.forward_extend(
+                query,
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+            )
+        return metadata, kernel, fixup
+
+    def test_dcp_verify_branch_reuses_hoisted_indptr(self):
+        preset = torch.arange(0, 12, 4, dtype=torch.int32, device="cuda")
+        metadata, kernel, fixup = self._run_dcp_verify(preset)
+        fixup.assert_called_once()
+        self.assertIs(fixup.call_args.args[3], metadata.dense_q_indptr)
+        self.assertIs(
+            kernel.call_args.kwargs["causal_seqs"], metadata.global_seq_lens_k
+        )
+
+    def test_dcp_verify_branch_fallback_builds_indptr(self):
+        _, _, fixup = self._run_dcp_verify(None)
+        fixup.assert_called_once()
+        torch.testing.assert_close(
+            fixup.call_args.args[3],
+            torch.arange(0, 12, 4, dtype=torch.int32, device="cuda"),
+        )
 
 
 if __name__ == "__main__":

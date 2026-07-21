@@ -122,6 +122,11 @@ class TRTLLMMLADecodeMetadata:
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
     global_seq_lens_k: Optional[torch.Tensor] = None
+    # DCP target verify: uniform q_indptr over the dense [bs, draft_token_num]
+    # layout, consumed by fixup_zero_kv_rows. Depends only on bs and
+    # draft_token_num (static per forward / per capture) — built once here
+    # instead of per MLA layer.
+    dense_q_indptr: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -358,6 +363,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.global_seq_lens_k = torch.zeros(
                 (bs,), dtype=torch.int32, device=device
             )
+            if get_parallel().dcp_enabled:
+                metadata.dense_q_indptr = torch.arange(
+                    0,
+                    (bs + 1) * self.num_draft_tokens,
+                    self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -553,6 +566,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.global_seq_lens_k = (
                     self.forward_decode_metadata.seq_lens_k
                 )
+                if get_parallel().dcp_enabled:
+                    bs = seq_lens.shape[0]
+                    self.forward_decode_metadata.dense_q_indptr = torch.arange(
+                        0,
+                        (bs + 1) * self.num_draft_tokens,
+                        self.num_draft_tokens,
+                        dtype=torch.int32,
+                        device=seq_lens.device,
+                    )
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -1042,13 +1064,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     layer.v_head_dim,
                 )
                 lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
-                dense_q_indptr = torch.arange(
-                    0,
-                    (bs + 1) * draft_token_num,
-                    draft_token_num,
-                    dtype=torch.int32,
-                    device=q.device,
-                )
+                # Hoisted to metadata (built once per forward / per capture,
+                # reused by every MLA layer); depends only on bs and
+                # draft_token_num — the same invariant global_seq_lens_k
+                # (built from self.num_draft_tokens) already relies on.
+                dense_q_indptr = metadata.dense_q_indptr
+                if dense_q_indptr is None:
+                    dense_q_indptr = torch.arange(
+                        0,
+                        (bs + 1) * draft_token_num,
+                        draft_token_num,
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
                 fixup_zero_kv_rows(
                     output,
                     lse,
