@@ -89,30 +89,7 @@ class MlaBmmFusionPlan:
 
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
-
-    # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
-    # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
-    # torch.cuda.current_blas_handle() (which returns a non-Tensor).
-    @register_custom_op(mutates_args=["out"])
-    def _bmm_fp8_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8(A, B, A_scale, B_scale, out.dtype, out)
-
-    def bmm_fp8(A, B, A_scale, B_scale, dtype, out=None):
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_op(A, B, out, A_scale, B_scale)
-        return out
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 
 if _use_aiter:
@@ -273,19 +250,18 @@ class DeepseekMLAForwardMixin:
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
-        # --dcp-replicate-q-proj: rank holds full-head q_b_proj/w_kc (gathered
-        # pre-capture) -> projects full-head Q locally, skips the Q all-gather.
-        # bf16 decode absorb path only; else fall back to all-gather.
+        # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
+        # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_server_args().dcp_replicate_q_proj
             and get_parallel().dcp_enabled
             and forward_batch.forward_mode.is_decode()
-            and not getattr(self, "use_deep_gemm_bmm", False)
-            and getattr(self, "w_kc_qrep", None) is not None
-            and getattr(self, "q_b_proj_qrep_weight", None) is not None
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
         )
         if q_replicate_active:
-            # force the standard (non-fused) absorb so the full-head w_kc bmm runs
+            # force standard absorb so the full-head w_kc bmm runs
             fuse_bmm_attention = False
         q_lora = None
         topk_indices = None
@@ -463,8 +439,7 @@ class DeepseekMLAForwardMixin:
 
         _kvb_q = None
         if q_replicate_active:
-            # full-head absorb with the pre-gathered w_kc (standard bf16 bmm);
-            # q_nope is already full-head, so the Q all-gather below is skipped.
+            # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
@@ -890,11 +865,8 @@ class DeepseekMLAForwardMixin:
             )
             dcp_comm_backend = get_server_args().dcp_comm_backend
             if dcp_comm_backend in ("a2a", "fi_a2a"):
-                # A2A exchange of per-rank head partials + LSE followed by a
-                # local Triton LSE-weighted combine. MLA decode LSE is base-2
-                # (FlashInfer-MLA / FlashMLA), matching cp_lse_ag_out_rs_mla's
-                # log2/exp2 convention, so is_lse_base_on_e=False. Returns
-                # [B, H_local, D] directly (no reduce-scatter transpose).
+                # A2A exchange of head partials + LSE, then local Triton combine.
+                # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
                 attn_output = dcp_a2a_lse_reduce(
                     attn_output.contiguous(),
                     lse.contiguous(),
@@ -1106,7 +1078,8 @@ class DeepseekMLAForwardMixin:
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
-            self.current_attention_backend
+            self.rotary_emb is not None
+            and self.current_attention_backend
             in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
