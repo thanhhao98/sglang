@@ -1539,7 +1539,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
-            plan_deps_event=self.plan_deps_event,
+            # A/B ARM ONLY -- do not merge. Forcing None takes the coarse
+            # fallback, plan_stream.wait_stream(fwd_stream), which at this
+            # point is *post*-draft: the #21940 design that #25917 reverted.
+            plan_deps_event=None,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
