@@ -69,6 +69,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +451,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         return self._verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # No-op: nothing this backend plans for target verify depends on the
+        # draft output, so there is nothing to redo after the plan-stream join.
+        #
+        # - No mask is consumed. `_verify_mask` is created with `is_read=False`
+        #   (init_cuda_graph_state above): the trtllm-gen / cute-dsl kernel takes
+        #   no mask argument, and target verify is excluded from every super()
+        #   dispatch that would reach the FlashInfer-MLA parent's masked plan.
+        #   The buffer exists only as a write-only sink for the tree kernel.
+        # - The verify metadata built in `_apply_cuda_graph_metadata`
+        #   (block_kv_indices, seq_lens_k, and under DCP global_seq_lens_k) is a
+        #   function of seq_lens, req_pool_indices, req_to_token and the
+        #   config-time `num_draft_tokens` constant -- never of the sampled
+        #   draft tokens.
+        #
+        # Needed because `run_eagle_verify` calls this unconditionally under
+        # SGLANG_ENABLE_OVERLAP_PLAN_STREAM, so without an override the base
+        # class raises NotImplementedError on the first EAGLE/EAGLE3 verify
+        # batch. Same no-op as trtllm_mha and triton. CuteDslMLABackend and
+        # TokenspeedMLABackend inherit it: their `_apply_cuda_graph_metadata`
+        # overrides derive from the same draft-independent inputs.
+        pass
 
     def _init_cuda_graph_metadata(
         self,
