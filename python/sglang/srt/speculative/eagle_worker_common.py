@@ -473,6 +473,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    plan_deps_event: Any = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -485,6 +486,9 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+
+    ``plan_deps_event`` is the caller's plan-stream entry fence, recorded on the
+    compute stream before this step's draft was enqueued. See the wait below.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -495,6 +499,30 @@ def run_eagle_verify(
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
+        if plan_stream is not None:
+            # Entry fence. Without it the plan stream is ordered after nothing:
+            # it *reads* req_to_token / seq_lens / req_pool_indices written on
+            # the schedule stream, and it *writes* the captured verify metadata
+            # and graph static buffers that the previous iteration's verify
+            # replay may still be reading (WAR).
+            #
+            # `plan_deps_event` was recorded on the compute stream *before* this
+            # step's draft was enqueued, so it covers both hazards -- the
+            # forward stream already waited on the schedule stream, and the
+            # previous iteration's replays are behind it -- while leaving the
+            # plan kernels free to run concurrently with the draft. That is the
+            # overlap the plan stream exists for; waiting on the draft itself
+            # would serialize it away.
+            #
+            # The coarse fallback is correct but does serialize: a torch Event
+            # that is never recorded makes wait_event a silent no-op, so a
+            # caller that does not hand one in must not fail open. Note
+            # `fwd_stream` is captured above, outside this context -- inside it
+            # current_stream() is the plan stream and the wait is a no-op.
+            if plan_deps_event is not None:
+                plan_stream.wait_event(plan_deps_event)
+            else:
+                plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -504,6 +532,18 @@ def run_eagle_verify(
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
+
+    if not batch.forward_mode.is_idle():
+        # Moved out of eagle_prepare_for_verify: on the compute stream
+        # `batch.input_ids` is the real draft_token (same-stream ordered after
+        # draft()), whereas the plan stream reaches that body before the draft
+        # has written it. Probing there reported pre-draft memory.
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "v2 prepare_for_verify input_ids",
+        )
 
     # Correct some buffers due to the overlap plan
     if plan_stream:

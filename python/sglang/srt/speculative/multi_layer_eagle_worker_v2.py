@@ -177,7 +177,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
 
     @property
     def draft_runners(self) -> List[ModelRunner]:
@@ -272,8 +274,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _compute_boundary_kv_locs_positions(self, batch):
+        # No per-call ready event: the draft-extend plan region now takes a full
+        # caller-stream wait, which subsumes it (and also covers next_token_ids,
+        # seq_lens and req_to_token, which the event never did).
         if self.draft_extend_num_front_tokens == 0 or batch.forward_mode.is_idle():
-            return None, None, None
+            return None, None
         locs, positions = compute_widened_draft_extend_locs_positions(
             batch.seq_lens,
             batch.req_pool_indices,
@@ -283,11 +288,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_extend_num_front_tokens,
             self.draft_extend_num_warmup_tokens,
         )
-        ready_event = None
-        if self.plan_stream:
-            ready_event = torch.get_device_module(self.device).Event()
-            ready_event.record()
-        return locs, positions, ready_event
+        return locs, positions
 
     def _seed_boundary_kv_stash(self, forward_batch, target_hidden_states):
         if (
@@ -715,13 +716,27 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
-        boundary_kv_locs, boundary_kv_positions, boundary_kv_ready_event = (
+        boundary_kv_locs, boundary_kv_positions = (
             self._compute_boundary_kv_locs_positions(batch)
         )
 
+        # Capture before entering the context: inside it current_stream() is the
+        # plan stream, so the wait below would be a self-wait no-op.
+        caller_stream = (
+            torch.get_device_module(self.device).current_stream()
+            if self.plan_stream
+            else None
+        )
+
         with self.plan_stream_ctx:
-            if boundary_kv_ready_event is not None:
-                self.plan_stream.wait_event(boundary_kv_ready_event)
+            if caller_stream is not None:
+                # Entry fence. This body depends on this step's compute-stream
+                # output (next_token_ids, the boundary-KV locs just computed
+                # above), so the full stream wait is the right edge; it replaces
+                # the narrower boundary-KV-only event, which left seq_lens and
+                # req_to_token unordered. Sibling of the verify entry fence in
+                # run_eagle_verify.
+                self.plan_stream.wait_stream(caller_stream)
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
@@ -945,7 +960,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -1006,6 +1023,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )
+            if self.plan_deps_event is not None:
+                # Plan-stream entry fence; see run_eagle_verify and the sibling
+                # record in EAGLEWorkerV2.forward_batch_generation.
+                self.plan_deps_event.record()
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
@@ -1031,4 +1052,5 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=False,
             grammar_barrier=grammar_barrier,
+            plan_deps_event=self.plan_deps_event,
         )

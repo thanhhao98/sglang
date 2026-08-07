@@ -507,12 +507,9 @@ def eagle_prepare_for_verify(
         # Assign cache locations
         bs = len(batch.req_pool_indices)
         batch.input_ids = verify_input.draft_token
-        maybe_detect_oob(
-            batch.input_ids,
-            0,
-            batch.model_config.vocab_size,
-            "v2 prepare_for_verify input_ids",
-        )
+        # The input_ids OOB probe lives in run_eagle_verify, after the plan-stream
+        # join: this body may run on the plan stream, which is ordered before the
+        # draft that writes draft_token, so probing here reads pre-draft memory.
         device = batch.device
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
