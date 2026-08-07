@@ -16,12 +16,17 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=340, stage="base-c", runner_config="4-gpu-b200")
+# The overlap-plan-stream arm below doubles the FP4 load window, so it runs
+# nightly rather than on every PR.
+register_cuda_ci(est_time=340, suite="nightly-4-gpu-b200", nightly=True)
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
 
 class TestDeepseekV3FP4MTP(CustomTestCase):
+    extra_env = {}
+
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
@@ -50,6 +55,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
         ]
         env = {
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            **cls.extra_env,
         }
         cls.process = popen_launch_server(
             cls.model,
@@ -111,6 +117,19 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
 
         self.assertGreater(acc_length, 2.65)
         self.assertGreater(speed, 150)
+
+
+class TestDeepseekV3FP4MTPOverlapPlanStream(TestDeepseekV3FP4MTP):
+    """Same config with the overlap plan stream on.
+
+    EAGLE + SGLANG_ENABLE_OVERLAP_PLAN_STREAM on a trtllm_mla target used to die
+    on the first verify batch (the backend had no post-draft verify fixup hook),
+    and once that was added, on an async illegal memory access from the
+    unfenced plan-stream entry. Both accept length and the GSM8K score above are
+    the detectors.
+    """
+
+    extra_env = {"SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1"}
 
 
 if __name__ == "__main__":
