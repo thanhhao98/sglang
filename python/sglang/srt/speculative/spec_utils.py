@@ -1044,10 +1044,20 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
 
 def get_plan_stream(
     device: str,
-) -> Tuple[Any, contextlib.AbstractContextManager]:
+) -> Tuple[Any, contextlib.AbstractContextManager, Any]:
+    """The plan stream, its context manager, and a reusable entry-fence event.
+
+    Every plan stream needs an entry fence: it reads state produced on other
+    streams and writes buffers those streams may still be reading. Handing the
+    event out here keeps that invariant next to the stream instead of leaving
+    each worker to remember it. The event is allocated once and re-recorded per
+    step -- a fresh Event() per iteration is a cudaEventCreate on the launch
+    critical path.
+    """
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
-        return plan_stream, plan_stream_ctx
+        device_module = torch.get_device_module(device)
+        plan_stream = device_module.Stream()
+        plan_stream_ctx = device_module.stream(plan_stream)
+        return plan_stream, plan_stream_ctx, device_module.Event()
     else:
-        return None, contextlib.nullcontext()
+        return None, contextlib.nullcontext(), None

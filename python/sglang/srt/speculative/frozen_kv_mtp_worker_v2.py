@@ -719,7 +719,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -770,6 +772,10 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
             if batch.spec_info is None:
                 batch.spec_info = self.draft_worker._idle_seed()
+            if self.plan_deps_event is not None:
+                # Plan-stream entry fence; see run_eagle_verify and the sibling
+                # record in EAGLEWorkerV2.forward_batch_generation.
+                self.plan_deps_event.record()
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group

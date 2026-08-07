@@ -85,7 +85,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
         # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
         self.index_share_for_mtp_iteration = (
             getattr(
@@ -182,7 +184,9 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
 
         # TODO: Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None

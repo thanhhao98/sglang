@@ -184,7 +184,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
 
     def alloc_memory_pool(
         self,
@@ -876,8 +878,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # synchronization issues with .to() inside the plan stream context.
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
+        # Capture before entering the context: inside it current_stream() is the
+        # plan stream, so the wait below would be a self-wait no-op.
+        caller_stream = (
+            torch.get_device_module(self.device).current_stream()
+            if self.plan_stream
+            else None
+        )
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
+            if caller_stream is not None:
+                # Entry fence. Unlike the verify prepare, this body genuinely
+                # depends on this step's compute-stream output -- next_token_ids
+                # and accept_lens come out of verify sampling -- so there is no
+                # earlier point to wait on and the full stream wait is the right
+                # edge. It costs little: the compute stream must finish verify
+                # before the draft-extend graph runs anyway. Same contract as
+                # DFlashDraftInputV2.prepare_for_decode.
+                self.plan_stream.wait_stream(caller_stream)
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
@@ -1046,7 +1065,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx, self.plan_deps_event = get_plan_stream(
+            self.device
+        )
 
     @property
     def war_fastpath_runner(self):
@@ -1155,6 +1176,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+            if self.plan_deps_event is not None:
+                # Plan-stream entry fence, recorded on the compute stream before
+                # the draft is enqueued. It covers everything already queued
+                # here: the schedule stream's req_to_token / seq_lens /
+                # req_pool_indices writes (the forward stream waited on the
+                # schedule stream in the scheduler), and the previous
+                # iteration's verify / draft-extend replays, which read the
+                # captured buffers the plan stream is about to overwrite.
+                # Recorded before the branch so the trivial-verify path is
+                # covered too. See run_eagle_verify.
+                self.plan_deps_event.record()
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
@@ -1503,6 +1535,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            plan_deps_event=self.plan_deps_event,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
