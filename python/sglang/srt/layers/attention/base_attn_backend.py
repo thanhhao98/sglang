@@ -180,11 +180,25 @@ class AttentionBackend(ABC):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        """
-        Update the buffers returned by get_verify_fill_after_draft_buffers if needed.
+        """Post-join fixup for metadata the overlap plan stream built too early.
 
-        Here, we need to redo the computation of all metadata of the attention backend
-        that depends on tree mask and position buffers.
+        Under ``SGLANG_ENABLE_OVERLAP_PLAN_STREAM`` the verify metadata is planned
+        on a side stream before the draft has produced its tokens, so anything
+        derived from the tree mask (:attr:`verify_mask`) or from
+        ``spec_info.positions`` is wrong by construction. ``run_eagle_verify``
+        calls this after joining the plan stream so it can be recomputed.
+
+        There are exactly two correct answers for a backend:
+
+        * Recompute here (see ``MambaAttnBackendBase``, which re-copies the
+          draft-produced tree links into its captured per-bs buffers).
+        * Override with ``pass`` **only if** the target-verify plan reads no
+          draft-produced tensor at all -- no mask, no positions-derived metadata
+          (see ``TRTLLMMLABackend``, ``TRTLLMHAAttnBackend``, ``TritonAttnBackend``).
+
+        Otherwise leave this ``NotImplementedError`` in place: failing loudly at
+        the first verify batch is preferable to planning a backend against
+        pre-draft data.
         """
         raise NotImplementedError()
 
