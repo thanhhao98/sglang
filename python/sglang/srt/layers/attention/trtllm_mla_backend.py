@@ -596,6 +596,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         bs = forward_batch.batch_size
         if in_capture:
+            # Clear stale prefill metadata, mirroring the eager-path clear in
+            # init_forward_metadata: a captured prefill graph (tc_piecewise or
+            # breakable) leaves forward_prefill_metadata with
+            # fallback_to_flashinfer_impl=True, and prefill graphs are captured
+            # before the decode/verify graphs. forward_extend's mode guard
+            # already refuses that fallback for target-verify / draft-extend
+            # (#32288); clearing it here removes the stale state at the source
+            # so no future consumer can pick it up mid-capture.
+            self.forward_prefill_metadata = None
             num_tokens = forward_batch.positions.numel()
             self._init_cuda_graph_metadata(
                 bs,
