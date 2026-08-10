@@ -463,7 +463,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.war_read_done_event
             )
         else:
-            read_done = self.device_module.Event()
+            read_done = self.model_runner.war_read_done_events.next()
             read_done.record()
             self.model_runner.war_fastpath_read_done_event = read_done
 

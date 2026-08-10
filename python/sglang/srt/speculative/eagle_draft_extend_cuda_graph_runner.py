@@ -47,6 +47,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
 
+_is_hip = is_hip()
+
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
@@ -591,7 +593,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
+        read_done = self.model_runner.war_read_done_events.next()
         read_done.record()
         self.model_runner.war_fastpath_read_done_event = read_done
 

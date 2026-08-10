@@ -53,6 +53,6 @@ def maybe_publish_prefill_war_read_done(
         "Prefill WAR read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,
     )
-    read_done = device_module.Event()
+    read_done = model_runner.war_read_done_events.next()
     read_done.record()
     model_runner.war_fastpath_read_done_event = read_done
