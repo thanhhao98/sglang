@@ -930,6 +930,15 @@ class Envs:
     # copy of the 1st and is always rejected). Set to 0 to revert for A/B.
     SGLANG_DCP_DRAFT_CHAIN_GUARD = EnvBool(True)
 
+    # Build the a2a send payload with one fused Triton kernel instead of a
+    # permute + contiguous + two strided copies, and read the received LSE
+    # through a zero-copy fp32 view instead of unstaging it with a fourth copy.
+    # Four elementwise kernels per MLA layer collapse to one; nsys attributed
+    # +244 launches and ~1.54 ms per decode step to those copies at cc16 on a
+    # 61-layer model -- more than the a2a exchange they feed. Default off until
+    # the same-node same-commit A/B lands; set to 1 to enable.
+    SGLANG_DCP_FUSED_PACK = EnvBool(False)
+
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)

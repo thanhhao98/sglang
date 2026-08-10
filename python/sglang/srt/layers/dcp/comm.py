@@ -30,12 +30,15 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
     _lse_pack_dim,
     correct_attn_out,
+    dcp_a2a_lse_view,
+    dcp_a2a_pack_triton,
     dcp_lse_combine_triton,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -517,6 +520,23 @@ def dcp_a2a_lse_reduce(
             recv_combined[:, :, :, D:]
         )
         recv_lse = recv_lse_stg[:, :B, :]
+    elif envs.SGLANG_DCP_FUSED_PACK.get():
+        # Fused pack: one Triton kernel writes the whole [N, B, H_per_rank, D+lpd]
+        # payload, replacing the permute+contiguous+two strided copies below. The
+        # received LSE is then read through a zero-copy fp32 view of the recv
+        # buffer instead of being unstaged by a fourth copy. Four elementwise
+        # kernels per MLA layer -> one. Bit-exactness vs the unfused path is
+        # covered by test_dcp_a2a_pack.py.
+        send_combined, _ = dcp_a2a_pack_triton(cp_attn_out, cp_attn_lse, N)
+        recv_combined = torch.empty_like(send_combined)
+
+        cp_group.all_to_all_single(
+            recv_combined.reshape(-1).view(torch.uint8),
+            send_combined.reshape(-1).view(torch.uint8),
+        )
+
+        recv_output = recv_combined[:, :, :, :D]
+        recv_lse = dcp_a2a_lse_view(recv_combined)
     else:
         send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
         send_combined = torch.empty(

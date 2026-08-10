@@ -525,6 +525,143 @@ def dcp_lse_combine_triton(
     return out, (out_lse if return_lse else None)
 
 
+# ---------------------------------------------------------------------------
+# A2A send-buffer pack (fused).
+#
+# The unfused path builds the [N, B, H_local, D + LPD] a2a payload with a
+# permute + contiguous + two strided copies, i.e. FOUR elementwise kernels per
+# MLA layer (three here, plus one to unstage the received LSE). On a 61-layer
+# model at cc16 that measured +244 kernel launches and ~1.54 ms per decode step
+# -- more than the a2a exchange it feeds. This kernel writes the payload in one
+# pass, and the receive side unstages via a zero-copy strided view, so the four
+# kernels collapse to one.
+#
+# The LSE is carried in the D..D+LPD tail columns as raw fp32 bytes reinterpreted
+# as output-dtype elements (LPD = 4 // itemsize). Rather than bit-twiddle that
+# reinterpretation in Triton, we address the same allocation through a second
+# fp32 pointer: element offset `row * (D + LPD) + D` is divisible by LPD whenever
+# D is (asserted by the caller), so the fp32 index is exactly that offset / LPD.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dcp_a2a_pack_kernel(
+    out_ptr,  # cp_attn_out  [B, H, D], output dtype
+    lse_ptr,  # cp_attn_lse  [B, H],    fp32
+    send_ptr,  # send_combined flat, output dtype
+    send_f32_ptr,  # send_combined flat, viewed fp32 (same allocation)
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    lse_stride_B,
+    lse_stride_H,
+    B,
+    H_PER_RANK: tl.constexpr,
+    D: tl.constexpr,
+    LPD: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # grid = (N * B, H_PER_RANK); program_id(0) encodes the (rank, batch) pair as
+    # r * B + b, matching the [N, B, H_local, ...] layout the a2a expects.
+    pid = tl.program_id(0)
+    h = tl.program_id(1)
+    r = pid // B
+    b = pid - r * B
+    src_h = r * H_PER_RANK + h
+
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < D
+    vals = tl.load(
+        out_ptr + b * out_stride_B + src_h * out_stride_H + offs * out_stride_D,
+        mask=mask,
+        other=0,
+    )
+
+    row = (pid * H_PER_RANK + h) * (D + LPD)
+    tl.store(send_ptr + row + offs, vals, mask=mask)
+
+    lse = tl.load(lse_ptr + b * lse_stride_B + src_h * lse_stride_H)
+    tl.store(send_f32_ptr + (row + D) // LPD, lse)
+
+
+def dcp_a2a_pack_triton(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    N: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build the packed a2a send buffer in one kernel.
+
+    Args:
+        cp_attn_out: [B, H, D] local attention partials (H divisible by N).
+        cp_attn_lse: [B, H] fp32 log-sum-exp.
+        N:           DCP world size.
+
+    Returns:
+        (send_combined [N, B, H_local, D + LPD] output-dtype contiguous,
+         lse_view_of_send [N, B, H_local] fp32 strided view into it)
+
+    The second return exists so callers can assert the fp32 aliasing is right;
+    the receive side builds the same view over its own buffer.
+    """
+    B, H, D = cp_attn_out.shape
+    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
+    H_local = H // N
+    lpd = _lse_pack_dim(cp_attn_out.dtype)
+    assert D % lpd == 0, (
+        f"fused a2a pack needs head_dim ({D}) divisible by the LSE pack width "
+        f"({lpd}) so the fp32 alias stays aligned"
+    )
+    assert cp_attn_lse.dtype == torch.float32, "LSE must be fp32"
+
+    send_combined = torch.empty(
+        (N, B, H_local, D + lpd), dtype=cp_attn_out.dtype, device=cp_attn_out.device
+    )
+    send_flat = send_combined.view(-1)
+    send_f32 = send_flat.view(torch.float32)
+
+    grid = (N * B, H_local)
+    _dcp_a2a_pack_kernel[grid](
+        cp_attn_out,
+        cp_attn_lse,
+        send_flat,
+        send_f32,
+        cp_attn_out.stride(0),
+        cp_attn_out.stride(1),
+        cp_attn_out.stride(2),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        B,
+        H_PER_RANK=H_local,
+        D=D,
+        LPD=lpd,
+        BLOCK_D=triton.next_power_of_2(D),
+    )
+    return send_combined, dcp_a2a_lse_view(send_combined)
+
+
+def dcp_a2a_lse_view(combined: torch.Tensor) -> torch.Tensor:
+    """Zero-copy fp32 [N, B, H_local] view of the LSE tail of a packed buffer.
+
+    Replaces the staging tensor + copy the unfused receive path used. `combined`
+    must be contiguous [N, B, H_local, D + LPD] in the output dtype.
+    """
+    assert combined.is_contiguous(), "packed a2a buffer must be contiguous to alias"
+    N, B, H_local, DL = combined.shape
+    lpd = _lse_pack_dim(combined.dtype)
+    D = DL - lpd
+    assert D % lpd == 0, "head_dim must be divisible by the LSE pack width"
+    row_f32 = DL // lpd  # fp32 elements per (b, h) row
+    return (
+        combined.view(-1)
+        .view(torch.float32)
+        .as_strided(
+            (N, B, H_local),
+            (B * H_local * row_f32, H_local * row_f32, row_f32),
+            D // lpd,
+        )
+    )
+
+
 def _lse_weighted_combine_cpu(
     partial_outputs: torch.Tensor,
     partial_lses: torch.Tensor,
