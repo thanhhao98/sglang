@@ -15,9 +15,21 @@
 """Pure index math for decode context parallel (DCP): per-rank lengths and
 the owner-rule local-index filter."""
 
+import os
+
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+
+# Audit instrumentation (PR #33926 review). Zero-cost unless SGLANG_DCP_AUDIT
+# is set in the environment at import time.
+_DCP_AUDIT = bool(os.environ.get("SGLANG_DCP_AUDIT"))
+_dcp_audit_get_dcp_lens_calls = 0
+
+
+def get_dcp_audit_lens_call_count() -> int:
+    """[DCP_AUDIT] Total get_dcp_lens invocations (finding6 counter)."""
+    return _dcp_audit_get_dcp_lens_calls
 
 
 def get_dcp_lens(
@@ -31,6 +43,9 @@ def get_dcp_lens(
     Superset implementation (PR #25090): supports both start=None and a per-request
     `start` offset. update_local_kv_lens_for_dcp is the start=None special case.
     """
+    if _DCP_AUDIT:
+        global _dcp_audit_get_dcp_lens_calls
+        _dcp_audit_get_dcp_lens_calls += 1
     if dcp_size == 1:
         return lens
     if start is None:

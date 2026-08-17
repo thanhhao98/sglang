@@ -30,6 +30,7 @@ merge.
 """
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -65,6 +66,11 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 logger = logging.getLogger(__name__)
+
+# Audit instrumentation (PR #33926 review). Zero-cost unless SGLANG_DCP_AUDIT
+# is set in the environment at import time.
+_DCP_AUDIT = bool(os.environ.get("SGLANG_DCP_AUDIT"))
+_dcp_audit_finding1_control_logged = False
 
 
 # Workspace upper bound for tokenspeed_mla_decode:
@@ -357,6 +363,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # attention only inside that explicitly scoped dummy pass.  Real
         # requests and CUDA graph capture continue through TokenSpeed below.
         if parallel.dcp_enabled and get_in_autotune_dummy_run():
+            global _dcp_audit_finding1_control_logged
+            if _DCP_AUDIT and not _dcp_audit_finding1_control_logged:
+                _dcp_audit_finding1_control_logged = True
+                logger.warning("[DCP_AUDIT] finding1-control: tokenspeed guard fired")
             output = torch.zeros(
                 (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
                 dtype=self.q_data_type,

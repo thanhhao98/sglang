@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -52,7 +53,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 )
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_audit_lens_call_count, get_dcp_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -76,6 +77,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# Audit instrumentation (PR #33926 review). Zero-cost unless SGLANG_DCP_AUDIT
+# is set in the environment at import time; "strict" additionally turns the
+# finding2 draft-extend-under-DCP kernel launch into a loud RuntimeError.
+_DCP_AUDIT = bool(os.environ.get("SGLANG_DCP_AUDIT"))
+_DCP_AUDIT_STRICT = os.environ.get("SGLANG_DCP_AUDIT") == "strict"
+_dcp_audit_finding1_logged = False
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
@@ -787,6 +795,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        if _DCP_AUDIT:
+            dcp_audit_lens_calls_entry = get_dcp_audit_lens_call_count()
         # Eager path: no capture-stable dense write loc; the pool's _full_translate
         # hook translates the write loc (safe out of a cuda graph).
         self._decode_dense_loc = None
@@ -894,6 +904,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if get_parallel().dcp_enabled:
                 metadata = self.forward_decode_metadata
                 if (
+                    _DCP_AUDIT
+                    and (
+                        forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_decode_or_idle()
+                    )
+                    and metadata.seq_lens_k is None
+                ):
+                    logger.warning(
+                        "[DCP_AUDIT] finding8: supposedly-dead branch EXECUTED at "
+                        "init_forward_metadata seq_lens_k-is-None guard (mode=%s)",
+                        forward_batch.forward_mode.name,
+                    )
+                if (
                     forward_batch.forward_mode.is_target_verify()
                     or forward_batch.forward_mode.is_decode_or_idle()
                 ) and metadata.seq_lens_k is not None:
@@ -907,6 +930,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
                     metadata.max_seq_len_k
+                )
+
+            if _DCP_AUDIT and get_parallel().dcp_enabled:
+                dcp_audit_lens_calls_total = get_dcp_audit_lens_call_count()
+                logger.info(
+                    "[DCP_AUDIT] finding6: get_dcp_lens calls this "
+                    "init_forward_metadata=%d total=%d mode=%s",
+                    dcp_audit_lens_calls_total - dcp_audit_lens_calls_entry,
+                    dcp_audit_lens_calls_total,
+                    forward_batch.forward_mode.name,
                 )
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
@@ -1383,10 +1416,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         (``deepseek_common/attention_forward_methods/forward_mla.py``), so this
         returns the rank-local attention state rather than a final output.
         """
+        global _dcp_audit_finding1_logged
+        if _DCP_AUDIT and not _dcp_audit_finding1_logged:
+            from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+
+            if get_in_autotune_dummy_run():
+                _dcp_audit_finding1_logged = True
+                logger.warning(
+                    "[DCP_AUDIT] finding1: unguarded trtllm-gen DCP decode kernel "
+                    "invoked during autotune dummy run; q shape=%s, "
+                    "seq_lens_k max=%s",
+                    tuple(query.shape),
+                    (
+                        int(metadata.seq_lens_k.max().item())
+                        if metadata.seq_lens_k is not None
+                        else "None"
+                    ),
+                )
         bs = forward_batch.batch_size
         if metadata.seq_lens_k is not None:
             local_seq_lens = metadata.seq_lens_k[:bs]
         else:
+            if _DCP_AUDIT:
+                logger.warning(
+                    "[DCP_AUDIT] finding8: supposedly-dead branch EXECUTED at "
+                    "_forward_decode_dcp seq_lens_k-is-None fallback (mode=%s)",
+                    forward_batch.forward_mode.name,
+                )
             local_seq_lens = self._get_dcp_local_seq_lens(forward_batch.seq_lens[:bs])
         raw_out, lse = self._run_decode_kernel(
             query=query,
@@ -1642,6 +1698,61 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     draft_token_num,
                 )
                 return output.flatten(1), lse
+
+            if (
+                _DCP_AUDIT
+                and bs > 0
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and get_parallel().dcp_enabled
+            ):
+                parallel = get_parallel()
+                if q.is_cuda and torch.cuda.is_current_stream_capturing():
+                    # .item() would abort the capture; only record reachability.
+                    audit_detail = "in-cuda-graph-capture, tensors unread"
+                    logger.warning(
+                        "[DCP_AUDIT] finding2: draft-extend under DCP reached "
+                        "during cuda-graph capture (mode=%s page_size=%d); "
+                        "skipping tensor reads",
+                        forward_batch.forward_mode.name,
+                        self.page_size,
+                    )
+                else:
+                    audit_seq_lens_k = metadata.seq_lens_k[:bs]
+                    audit_global_max = int(audit_seq_lens_k.max().item())
+                    audit_global_pages = -(-audit_global_max // self.page_size)
+                    audit_row = int(audit_seq_lens_k.argmax().item())
+                    audit_local_valid_pages = int(
+                        (metadata.block_kv_indices[audit_row] != -1).sum().item()
+                    )
+                    audit_local_len = audit_global_max // parallel.dcp_size + int(
+                        parallel.dcp_rank < audit_global_max % parallel.dcp_size
+                    )
+                    audit_overrun = audit_global_pages > audit_local_valid_pages
+                    audit_detail = (
+                        f"global_pages={audit_global_pages}, "
+                        f"local_valid_pages={audit_local_valid_pages}, "
+                        f"OVERRUN={audit_overrun}"
+                    )
+                    logger.warning(
+                        "[DCP_AUDIT] finding2: draft-extend under DCP: "
+                        "global_pages=%d local_valid_pages=%d OVERRUN=%s "
+                        "(mode=%s global_seq_lens_k_max=%d dcp_local_len=%d "
+                        "page_size=%d)",
+                        audit_global_pages,
+                        audit_local_valid_pages,
+                        audit_overrun,
+                        forward_batch.forward_mode.name,
+                        audit_global_max,
+                        audit_local_len,
+                        self.page_size,
+                    )
+                if _DCP_AUDIT_STRICT:
+                    raise RuntimeError(
+                        "[DCP_AUDIT] finding2 strict: refusing to launch the "
+                        f"draft-extend decode kernel under DCP ({audit_detail}); "
+                        "the rank-local page table would be walked with global "
+                        "seq lens."
+                    )
 
             raw_out = self._run_decode_kernel(
                 query=q,
