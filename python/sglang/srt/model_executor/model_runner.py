@@ -216,6 +216,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -406,6 +407,12 @@ class ModelRunner:
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+        # Events publishers record into the mailbox above. Depth 2: the barrier
+        # drains the mailbox once per step, so at most one record can still be
+        # awaited when a slot comes around again.
+        self.war_read_done_events = ReusableEventRing(
+            torch.get_device_module(self.device).Event, depth=2
+        )
         # Graph runners record this persistent event after shared-state reads.
         self.war_read_done_event = make_war_read_done_event(
             torch.get_device_module(self.device)
