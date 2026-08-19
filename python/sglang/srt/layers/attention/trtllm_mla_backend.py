@@ -72,6 +72,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         return self._verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # No-op: verify metadata here depends only on the draft token count,
+        # not on the sampled tokens (same as trtllm_mha / triton).
+        pass
 
     def _init_cuda_graph_metadata(
         self,
