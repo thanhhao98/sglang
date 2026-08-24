@@ -2422,9 +2422,21 @@ def initialize_model_parallel(
             f"decode_context_parallel_size ({decode_context_parallel_size}) "
             "on a non-HIP or non-CUDA platform."
         )
-    if tensor_model_parallel_size % decode_context_parallel_size != 0:
+    # Containment: DCP groups are contiguous slices of each TP group and must
+    # nest inside one attention-TP group (attn_tp = tp // attn_cp // attn_dp);
+    # a group spanning attention-DP replicas would merge KV of different data.
+    # This subsumes the old tp_size % dcp_size check (tp = attn_tp * cp * dp).
+    _attn_tp_for_dcp = (
+        tensor_model_parallel_size
+        // attention_context_model_parallel_size
+        // attention_data_parallel_size
+    )
+    if _attn_tp_for_dcp % decode_context_parallel_size != 0:
         raise RuntimeError(
-            f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
+            f"attn_tp_size ({_attn_tp_for_dcp} = tensor_model_parallel_size "
+            f"{tensor_model_parallel_size} // attn_cp "
+            f"{attention_context_model_parallel_size} // attn_dp "
+            f"{attention_data_parallel_size}) must be divisible by "
             f"decode_context_parallel_size ({decode_context_parallel_size})"
         )
 

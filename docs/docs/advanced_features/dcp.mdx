@@ -28,9 +28,7 @@ attn_tp_size % dcp_size == 0
 
 For example, `TP=64, DP=4, DCP=16` creates four valid 16-rank attention replicas. `DCP=32` would cross replica boundaries and is invalid.
 
-<Warning>
-Startup currently checks only `tp_size % dcp_size == 0`, not the stronger condition above. Until that check is fixed, DPA+DCP deployments must enforce containment when choosing the topology.
-</Warning>
+Startup enforces containment: server-args validation and `initialize_model_parallel` both reject `attn_tp_size % dcp_size != 0`, and each rank asserts post-init that its DCP group rank matches the `attn_tp_rank % dcp_size` derivation.
 
 MLA decode on DeepSeek-V3.1 with DCP 8 inside TP 8:
 

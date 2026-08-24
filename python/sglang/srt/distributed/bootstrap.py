@@ -112,6 +112,16 @@ def init_torch_distributed(
             dcp_size=ps.attn_dcp_size,
         )
 
+        # The per-worker arithmetic derivation (attn_tp_rank % dcp) and the
+        # live NCCL group's rank must agree; they do exactly when the DCP
+        # group nests in one attention-TP group (validated at startup).
+        if get_parallel().dcp_enabled:
+            assert get_parallel().attn_dcp_rank == ps.attn_dcp_rank, (
+                f"DCP group rank ({get_parallel().attn_dcp_rank}) disagrees "
+                f"with ps.attn_dcp_rank ({ps.attn_dcp_rank}); the DCP group "
+                "does not nest inside this rank's attention-TP group"
+            )
+
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
         if get_exec().comm.pre_warm_nccl and (
