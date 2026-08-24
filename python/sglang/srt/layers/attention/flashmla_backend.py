@@ -108,9 +108,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # get dcp info
-        self.dcp_world_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # Per-runner DCP topology (a draft runner's ps is DCP-flat).
+        self.dcp_world_size = model_runner.ps.attn_dcp_size
+        self.dcp_rank = model_runner.ps.attn_dcp_rank
 
     def init_forward_metadata_out_graph(
         self,
@@ -476,7 +476,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # TODO uniform output for forward_decode and forward_extend to
             # return tuple instead of single output
             # decode context parallel needs lse to correct attn_output via online softmax
-            if get_parallel().dcp_enabled:
+            if self.dcp_world_size > 1:
                 return o, lse
             return o
 

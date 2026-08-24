@@ -965,7 +965,9 @@ class ModelRunner:
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
 
-        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
+        # Gate on this runner's DCP view: a draft runner (DCP-flat ps) must not
+        # all-gather its q_b_proj/w_kc — its Q is never DCP-gathered at decode.
+        if self.ps.attn_dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:

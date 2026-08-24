@@ -234,6 +234,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        # Per-runner DCP topology: a draft runner's ps is DCP-flat (drafts are
+        # TP-sharded and never split the token dim), the target's mirrors the group.
+        self.dcp_size = model_runner.ps.attn_dcp_size
+        self.dcp_rank = model_runner.ps.attn_dcp_rank
+        self.dcp_enabled = self.dcp_size > 1
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -734,7 +739,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
             return_lse=(
-                forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
+                forward_batch.forward_mode.is_decode() and self.dcp_enabled
             ),
         )
         if isinstance(o, tuple):
@@ -747,10 +752,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
+        # Per-runner DCP topology (DCP-flat for drafts): DCP decode gathers Q to
+        # the full head count, so size for the gathered launch shape.
+        self.dcp_enabled = model_runner.ps.attn_dcp_size > 1
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size
-            * get_parallel().attn_dcp_size
+            * model_runner.ps.attn_dcp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -840,7 +848,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 valid = kv_indices[:paged_kernel_lens_sum]
                 valid.copy_(self._translate_kv_loc_dense(valid))
 
-            if get_parallel().dcp_enabled:
+            if self.dcp_enabled:
                 plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,
