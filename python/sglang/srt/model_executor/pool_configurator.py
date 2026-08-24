@@ -848,7 +848,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
-            draft_layers = 1
+            # The 1-layer MTP draft pool is replicated across DCP ranks while
+            # the target's is sharded, so the draft term carries the scale.
+            draft_layers = 1 * replicated_draft_pool_scale()
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 
