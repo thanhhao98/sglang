@@ -1403,10 +1403,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and self.dcp_enabled
-            ):
+            if forward_batch.forward_mode.is_target_verify() and self.dcp_enabled:
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,

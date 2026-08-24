@@ -27,8 +27,12 @@ def _mode(decode=False, target_verify=False, extend=False):
 class TestDraftParallelState(CustomTestCase):
     def test_dcp_flat_flattens_only_dcp(self):
         ps = ParallelState.trivial(
-            tp_rank=5, tp_size=8, attn_tp_rank=5, attn_tp_size=8,
-            attn_dcp_rank=3, attn_dcp_size=8,
+            tp_rank=5,
+            tp_size=8,
+            attn_tp_rank=5,
+            attn_tp_size=8,
+            attn_dcp_rank=3,
+            attn_dcp_size=8,
         )
         flat = ps.dcp_flat()
         self.assertEqual(flat.attn_dcp_size, 1)

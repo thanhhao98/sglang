@@ -1048,8 +1048,7 @@ class TestEagleDraftDcpBudget(CustomTestCase):
                 self.assertEqual(cfg._draft_swa_layers_num, 1)
                 self.assertEqual(
                     cfg._cell_size,
-                    full_pt * (2 + 1 * dcp_size)
-                    + ratio * swa_pt * (2 + 1 * dcp_size),
+                    full_pt * (2 + 1 * dcp_size) + ratio * swa_pt * (2 + 1 * dcp_size),
                 )
 
     def test_budget_and_allocation_read_one_symbol(self):
