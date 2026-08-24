@@ -32,7 +32,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    replicated_draft_pool_scale,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
@@ -84,37 +87,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
-    """Effective EAGLE/STANDALONE draft layer count for KV budgeting, 0 if none.
-
-    The draft pool spans the widened loc space, so the draft term is replicated
-    across DCP ranks (same rule as _dflash_draft_cell_size).
-    """
-    if kvc.is_draft_worker or not (
-        kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-    ):
-        return 0
-    draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
-    if draft_layers is None or int(draft_layers) <= 0:
-        return 0
-    return int(draft_layers) * get_parallel().attn_dcp_size
-
-
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
-    Unlike an EAGLE draft, which reuses the target's attention config and is
-    therefore priced by layer count, a DFLASH draft has its own geometry and is
-    a flat additive term. Under DCP, the target pool is sharded while the draft
-    pool spans the allocator's widened virtual location space, so the draft
-    term is replicated across DCP ranks.
+    The draft pool spans the allocator's widened virtual location space
+    (kv_cache_configurator.loc_space_scale), so the term carries the same
+    replication factor the allocation side reads.
     """
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size) * get_parallel().attn_dcp_size
+    return int(cell_size) * replicated_draft_pool_scale()
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -195,10 +180,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            eagle_draft_layers = _eagle_draft_layers(kvc)
-            if eagle_draft_layers > 0 and int(num_layers) > 0:
+            draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                draft_num_layers = int(draft_num_layers)
+                # Draft pool spans the widened loc space: replicated per DCP rank.
+                scale = replicated_draft_pool_scale()
+                draft_cell = kvc.spec_aux_config.eagle_draft_cell_size_per_token
                 if is_deepseek_dsa(kvc.model_config.hf_config):
-                    draft_num_layers = int(kvc.spec_aux_config.eagle_draft_num_layers)
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -219,13 +211,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # Draft pool spans the widened loc space: replicated per DCP rank.
-                    self._cell_size += (
-                        draft_kv_size + draft_indexer_size
-                    ) * get_parallel().attn_dcp_size
+                    self._cell_size += (draft_kv_size + draft_indexer_size) * scale
+                elif draft_cell is not None and int(draft_cell) > 0:
+                    # Absolute term from the draft's own geometry (the DFLASH
+                    # rule): prices GQA drafts at their real attn-tp head shard.
+                    self._cell_size += int(draft_cell) * scale
                 else:
+                    # Layer-ratio fallback. MLA per-layer bytes are DCP-invariant,
+                    # so the replicated draft costs scale x the ratio. A GQA
+                    # target's per-layer bytes already carry the DCP factor (KV
+                    # heads regroup by attn_tp/dcp) while the draft's do not, so
+                    # the factors cancel: no scale.
+                    ratio_scale = scale if kvc.use_mla_backend else 1
                     self._cell_size = int(
-                        self._cell_size * (1 + eagle_draft_layers / int(num_layers))
+                        self._cell_size
+                        * (1 + ratio_scale * draft_num_layers / int(num_layers))
                     )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
@@ -244,7 +244,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
+                    * replicated_draft_pool_scale(),
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
@@ -522,10 +522,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
-        # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
+        # Draft KV tensors use full, SWA, or full-capacity SWA geometry. The
+        # counts stay pure layer counts; the DCP replication of the draft pool
+        # is applied where they are consumed, via _draft_pool_scale.
         self._draft_full_layers_num = 0
         self._draft_swa_layers_num = 0
         self._draft_swa_full_layers_num = 0
+        self._draft_pool_scale = replicated_draft_pool_scale()
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -556,11 +559,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
-                # The draft pool spans the widened loc space: replicated per DCP rank.
-                dcp = get_parallel().attn_dcp_size
-                self._draft_full_layers_num *= dcp
-                self._draft_swa_layers_num *= dcp
-                self._draft_swa_full_layers_num *= dcp
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
@@ -573,22 +571,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # is meaningless here -- there is no full pool to relate to, and every
         # token beyond the sliding window can be evicted. So cell_size = S*ns,
         # with no ratio factor applied.
+        # Draft terms carry _draft_pool_scale: the replicated draft pool spans
+        # the allocator's widened loc space (_dflash_draft_cell_size already
+        # carries the same factor internally).
+        s = self._draft_pool_scale
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
-                + self._full_per_token * self._draft_full_layers_num
-                + self._swa_per_token * self._draft_swa_layers_num
-                + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._full_per_token * self._draft_full_layers_num * s
+                + self._swa_per_token * self._draft_swa_layers_num * s
+                + self._swa_per_token * self._draft_swa_full_layers_num * s
                 + self._draft_cell_size
             )
         else:
             self._cell_size = (
                 self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
-                + self._swa_per_token * self._draft_swa_full_layers_num
+                * (self._full_layers_num + self._draft_full_layers_num * s)
+                + self._swa_per_token * self._draft_swa_full_layers_num * s
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
-                * (self._swa_layers_num + self._draft_swa_layers_num)
+                * (self._swa_layers_num + self._draft_swa_layers_num * s)
                 + self._draft_cell_size
             )
 
@@ -724,14 +726,16 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
+        s = self._draft_pool_scale
         fixed_swa_bytes = (
             swa_tokens
             * self._swa_per_token
-            * (self._swa_layers_num + self._draft_swa_layers_num)
+            * (self._swa_layers_num + self._draft_swa_layers_num * s)
         )
         full_cell_size = (
-            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
-            + self._swa_per_token * self._draft_swa_full_layers_num
+            self._full_per_token
+            * (self._full_layers_num + self._draft_full_layers_num * s)
+            + self._swa_per_token * self._draft_swa_full_layers_num * s
         )
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size

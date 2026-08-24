@@ -14,6 +14,18 @@ def get_alloc_page_size() -> int:
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
+def replicated_draft_pool_scale() -> int:
+    """Factor by which a replicated draft KV pool outgrows the target's per-rank budget.
+
+    The shared allocator hands out virtual locs in [0, max_total * attn_dcp_size).
+    The DCP-sharded target translates locs to per-rank slots, so its budget is
+    unscaled; a draft pool is replicated and indexes that space raw, so BOTH its
+    allocated span (kv_cache_configurator.loc_space_scale) and its byte budget
+    (pool_configurator's draft terms) scale by this one factor. 1 when DCP is off.
+    """
+    return get_parallel().attn_dcp_size
+
+
 def get_alloc_len_per_decode() -> int:
     """KV length one request may allocate in a single decode step.
 

@@ -166,6 +166,7 @@ def _make_model_runner(
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
+        eagle_draft_cell_size_per_token=None,
         dflash_draft_num_layers=None,
     )
 
@@ -905,6 +906,168 @@ class TestFactory(CustomTestCase):
 
         self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+
+
+class TestEagleDraftDcpBudget(CustomTestCase):
+    """EAGLE draft budget under DCP: one replication symbol, arch-correct scaling.
+
+    The replicated draft pool spans the allocator's widened loc space, so its
+    budget term scales with replicated_draft_pool_scale() — except the GQA
+    layer-ratio fallback, where the target's per-layer bytes already carry the
+    DCP head-regroup factor and the two cancel.
+    """
+
+    def _eagle_mr(self, **kwargs):
+        mr = _make_model_runner(self, **kwargs)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        return mr
+
+    def _cell_size(self, mr, dcp_size, tp_size=8, kv_size=KV_SIZE):
+        with (
+            mock_cpu_env(kv_size=kv_size, tp_size=tp_size),
+            get_parallel().override(attn_dcp_size=dcp_size),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return create_memory_pool_configurator(mr)._cell_size
+
+    def test_absolute_draft_term_scales_with_dcp(self):
+        """Absolute bytes/token (draft's own geometry) x replication scale."""
+        draft_cell = 3_072
+        target_cell = 4 * (64 + 64) * 32 * KV_SIZE
+        mr = self._eagle_mr()
+        mr.spec_aux_config.eagle_draft_num_layers = 2
+        mr.spec_aux_config.eagle_draft_cell_size_per_token = draft_cell
+        for dcp_size in (1, 2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                self.assertEqual(
+                    self._cell_size(mr, dcp_size),
+                    target_cell + draft_cell * dcp_size,
+                )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_mla_fallback_ratio_scales_with_dcp(self, _mock_dim):
+        """MLA per-layer bytes are DCP-invariant: replicated draft costs dcp x ratio."""
+        num_layers = 32
+        mr = self._eagle_mr(num_layers=num_layers, use_mla_backend=True)
+        mr.spec_aux_config.eagle_draft_num_layers = 2
+        base = 576 * num_layers
+        for dcp_size in (1, 4, 8):
+            with self.subTest(dcp_size=dcp_size):
+                self.assertEqual(
+                    self._cell_size(mr, dcp_size, kv_size=1),
+                    int(base * (1 + dcp_size * 2 / num_layers)),
+                )
+
+    def test_gqa_fallback_ratio_has_no_dcp_factor(self):
+        """A GQA target's per-layer bytes already carry the DCP head-regroup
+        factor while the (TP-sharded) draft's do not — the factors cancel, so
+        the ratio fallback must NOT scale with dcp."""
+        num_layers = 32
+        heads_at_kv_tp = 4
+
+        def _mr(dcp_size):
+            mr = self._eagle_mr(num_layers=num_layers)
+            # get_num_kv_heads(tp, dcp) regroups heads by tp // dcp.
+            mr.model_config.get_num_kv_heads = (
+                lambda tp_size, dcp_size=1: heads_at_kv_tp * dcp_size
+            )
+            mr.spec_aux_config.eagle_draft_num_layers = 2
+            return mr
+
+        for dcp_size in (1, 8):
+            with self.subTest(dcp_size=dcp_size):
+                target_cell = (
+                    heads_at_kv_tp * dcp_size * (64 + 64) * num_layers * KV_SIZE
+                )
+                self.assertEqual(
+                    self._cell_size(_mr(dcp_size), dcp_size),
+                    int(target_cell * (1 + 2 / num_layers)),
+                )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_dsa_additive_draft_term_scales_with_dcp(self, _mock_dim):
+        """The DSA arm prices draft KV + full index-K, replicated per DCP rank."""
+        num_layers = 78
+        mr = self._eagle_mr(num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        indexer_bytes, active_indexer_layers = 132, 21
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                self.assertEqual(
+                    self._cell_size(mr, dcp_size, kv_size=1),
+                    576 * num_layers
+                    + indexer_bytes * active_indexer_layers
+                    + (576 + indexer_bytes) * 1 * dcp_size,
+                )
+
+    def test_hybrid_swa_draft_terms_scale_with_dcp(self):
+        """Hybrid draft layer counts stay pure; the scale rides the cell formula,
+        preserving the swa_full_tokens_ratio asymmetry."""
+        ratio = 0.25
+        mr = self._eagle_mr(
+            num_kv_heads=8,
+            num_layers=4,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+            swa_num_kv_heads=2,
+            swa_head_dim=32,
+            swa_v_head_dim=32,
+            swa_full_tokens_ratio=ratio,
+        )
+        mr.spec_aux_config.eagle_draft_num_layers = 2
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+        full_pt = 8 * (64 + 64) * KV_SIZE
+        swa_pt = 2 * (32 + 32) * KV_SIZE
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                with (
+                    mock_cpu_env(tp_size=8),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+                # Counts stay pure layer counts.
+                self.assertEqual(cfg._draft_full_layers_num, 1)
+                self.assertEqual(cfg._draft_swa_layers_num, 1)
+                self.assertEqual(
+                    cfg._cell_size,
+                    full_pt * (2 + 1 * dcp_size)
+                    + ratio * swa_pt * (2 + 1 * dcp_size),
+                )
+
+    def test_budget_and_allocation_read_one_symbol(self):
+        """loc_space_scale (allocation) and the budget terms must agree by
+        construction: both read replicated_draft_pool_scale()."""
+        from sglang.srt.mem_cache.allocation_sizing import (
+            replicated_draft_pool_scale,
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        for dcp_size in (1, 8):
+            with get_parallel().override(attn_dcp_size=dcp_size):
+                self.assertEqual(replicated_draft_pool_scale(), dcp_size)
+                kvc.is_draft_worker = True
+                self.assertEqual(kvc.loc_space_scale, dcp_size)
+                kvc.is_draft_worker = False
+                self.assertEqual(kvc.loc_space_scale, 1)
 
 
 class TestDflashDraftKvBudget(CustomTestCase):

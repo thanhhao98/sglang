@@ -14,6 +14,7 @@ from sglang.srt.configs.hybrid_arch import (
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
@@ -31,7 +32,10 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_req_to_token_extra_context_len,
+    replicated_draft_pool_scale,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -315,8 +319,7 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        return replicated_draft_pool_scale() if self.is_draft_worker else 1
 
     @property
     def pool_page_size(self) -> int:
@@ -2251,3 +2254,49 @@ def calculate_mla_kv_cache_dim(
         )
 
     return kv_cache_dim
+
+
+def eagle_draft_cell_size_per_token(
+    *,
+    draft_model_config: ModelConfig,
+    draft_num_layers: Optional[int],
+    draft_kv_cache_dtype: torch.dtype,
+    draft_kv_cache_dtype_str: Optional[str],
+    tp_size: int,
+    server_args: ServerArgs,
+) -> Optional[int]:
+    """Exact bytes/token of an EAGLE/STANDALONE draft's KV pool, BEFORE DCP
+    replication (see allocation_sizing.replicated_draft_pool_scale).
+
+    Mirrors DefaultPoolConfigurator._compute_cell_size per attention arch.
+    Returns None for the layouts it does not price — DSA (the configurator's
+    additive DSA branch already prices the draft indexer exactly) and the
+    fp4/mxfp8 scale-buffer layouts — leaving callers on layer-ratio scaling.
+    """
+    if not draft_num_layers or int(draft_num_layers) <= 0:
+        return None
+    if is_deepseek_dsa(draft_model_config.hf_config):
+        return None
+    if is_float4_e2m1fn_x2(draft_kv_cache_dtype) or draft_kv_cache_dtype_str == "mxfp8":
+        return None
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    if draft_model_config.attention_arch == AttentionArch.MLA:
+        return int(
+            calculate_mla_kv_cache_dim(
+                model_config=draft_model_config,
+                kv_cache_dtype=draft_kv_cache_dtype,
+                server_args=server_args,
+            )
+            * int(draft_num_layers)
+            * dtype_size
+        )
+    # GQA/MHA: a draft never joins the DCP head regroup
+    # (ModelConfig.get_num_kv_heads forces dcp_size=1 when is_draft_model), so
+    # its heads shard at plain attn-tp — matching the pool the draft builds.
+    num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
+    return int(
+        num_kv_heads
+        * (draft_model_config.head_dim + draft_model_config.v_head_dim)
+        * int(draft_num_layers)
+        * dtype_size
+    )
