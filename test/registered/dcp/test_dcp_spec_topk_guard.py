@@ -58,6 +58,17 @@ class TestDCPSpecTopkGuard(CustomTestCase):
             with self.subTest(topk=topk):
                 self._validate("DSPARK", topk, dcp_size=8)
 
+    def test_frozen_kv_mtp_is_rejected(self):
+        """FROZEN_KV_MTP's draft reads the target's DCP-sharded pool directly,
+        so the replicated-draft rule (DCP-flat draft ParallelState) cannot
+        apply; it must be refused regardless of topk."""
+        for topk in (None, 1):
+            with self.subTest(topk=topk):
+                with self.assertRaises(ValueError) as ctx:
+                    self._validate("FROZEN_KV_MTP", topk, dcp_size=8)
+                self.assertIn("FROZEN_KV_MTP", str(ctx.exception))
+        self._validate("FROZEN_KV_MTP", topk=1, dcp_size=1)
+
     def test_algorithm_predicates_are_not_getattr_defaulted(self):
         """A renamed predicate must break loudly, not silently disable the guard."""
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
