@@ -333,6 +333,16 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # Fail closed: a draft runner must carry a DCP-flat ParallelState
+        # (TpModelWorker.__init__ flattens it). A miss here would silently
+        # shard the draft's replicated KV pool — the accept-length bug class.
+        if is_draft_worker:
+            assert ps.attn_dcp_size == 1 and ps.attn_dcp_rank == 0, (
+                "draft ModelRunner requires a DCP-flat ParallelState "
+                f"(got attn_dcp_size={ps.attn_dcp_size}, "
+                f"attn_dcp_rank={ps.attn_dcp_rank}); construct draft workers "
+                "through TpModelWorker so DCP is flattened at the chokepoint"
+            )
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
         # Before the constructor's bag reads (page_size below): a standalone

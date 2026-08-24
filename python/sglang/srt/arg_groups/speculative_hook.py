@@ -193,6 +193,14 @@ def _validate_dcp_spec(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if algo.is_frozen_kv_mtp():
+        # Its draft reads the target's DCP-sharded pool directly, so the
+        # replicated-draft rule (DCP-flat draft ParallelState) does not apply.
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) does not support "
+            "FROZEN_KV_MTP: its draft shares the target's DCP-sharded KV pool "
+            "and has no rank-local metadata path."
+        )
     # STANDALONE inherits the EAGLE V2 tree-draft path, so it is gated too.
     # Not is_dflash_family(): DSPARK ships with DCP and is not gated here.
     if not (algo.is_eagle() or algo.is_standalone() or algo.is_dflash()):

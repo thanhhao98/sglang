@@ -755,6 +755,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         # Per-runner DCP topology (DCP-flat for drafts): DCP decode gathers Q to
         # the full head count, so size for the gathered launch shape.
         self.dcp_enabled = model_runner.ps.attn_dcp_size > 1
+        self.is_draft_runner = model_runner.is_draft_worker
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size
@@ -849,6 +850,12 @@ class FlashInferMLAIndicesUpdaterDecode:
                 valid.copy_(self._translate_kv_loc_dense(valid))
 
             if self.dcp_enabled:
+                # A draft plans against a replicated pool; DCP-partitioned
+                # metadata would silently misread it (the accept-length bug).
+                assert not self.is_draft_runner, (
+                    "draft runner reached the DCP decode planner; its "
+                    "ParallelState must be DCP-flat"
+                )
                 plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,

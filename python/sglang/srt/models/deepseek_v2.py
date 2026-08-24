@@ -1771,6 +1771,10 @@ class DeepseekV2AttentionMLA(
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+        # DCP is a property of the layer's owner: a nextn/MTP draft layer is
+        # TP-sharded against a replicated draft pool and never splits the token
+        # dim, so it must not take DCP dispatch (same rule as qwen3_5).
+        self.dcp_enabled = get_parallel().dcp_enabled and not is_nextn
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1904,7 +1908,7 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if get_parallel().dcp_enabled:
+        if self.dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,

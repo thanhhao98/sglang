@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -322,6 +323,12 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.server_args = server_args
+        if is_draft_worker:
+            # A draft is TP-sharded and never splits the token dim across DCP
+            # ranks; its pools are replicated over the allocator's widened loc
+            # space. Flatten DCP here, at the single construction chokepoint,
+            # so every draft runner/backend freezes a DCP-flat view at init.
+            ps = replace(ps, attn_dcp_size=1, attn_dcp_rank=0)
         self.ps = ps
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
