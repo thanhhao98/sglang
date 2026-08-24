@@ -479,7 +479,10 @@ class Scheduler(
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=configured_attn_cp_size(),
-            attn_dcp_rank=tp_rank % configured_dcp_size(),
+            # DCP sub-partitions the attention-TP rank set; equals the live
+            # group's rank_in_group under the enforced attn_tp % dcp == 0
+            # containment (asserted post-init in bootstrap).
+            attn_dcp_rank=attn_tp_rank % configured_dcp_size(),
             attn_dcp_size=configured_dcp_size(),
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,

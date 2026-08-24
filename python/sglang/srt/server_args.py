@@ -6974,6 +6974,23 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
+        if self.dcp_size > 1:
+            # Runs after DP-attention/CP resolution so it sees the final
+            # topology (_handle_dcp_validation runs before overrides can flip
+            # enable_dp_attention). Containment: a DCP group stripes KV across
+            # ranks that hold redundant KV, i.e. ranks of ONE attention-TP
+            # group; only tp_size % dcp_size was checked before, so DPA + DCP
+            # could silently span attention-DP replicas and corrupt results.
+            attn_dp_size = self.dp_size if view.enable_dp_attention else 1
+            attn_tp_size = self.tp_size // attn_dp_size // view.attn_cp_size
+            if attn_tp_size % self.dcp_size != 0:
+                raise ValueError(
+                    f"A DCP group must fit inside one attention-TP group: "
+                    f"attn_tp_size ({attn_tp_size} = tp_size {self.tp_size} // "
+                    f"attn_dp {attn_dp_size} // attn_cp {view.attn_cp_size}) "
+                    f"must be divisible by dcp_size ({self.dcp_size})."
+                )
+
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (

@@ -322,6 +322,10 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.server_args = server_args
+        if is_draft_worker:
+            # Single construction chokepoint: every draft runner/backend below
+            # freezes this DCP-flat view at init (see ParallelState.dcp_flat).
+            ps = ps.dcp_flat()
         self.ps = ps
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port

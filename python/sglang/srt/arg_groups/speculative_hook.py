@@ -178,6 +178,43 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args,
         )
 
+    _validate_dcp_spec(server_args)
+
+
+def _validate_dcp_spec(server_args: ServerArgs) -> None:
+    """Validate speculative-decoding options under decode context parallelism."""
+    # Runs after the per-algorithm handler so speculative_eagle_topk is resolved.
+    if (
+        server_args.speculative_algorithm is None
+        or getattr(server_args, "dcp_size", 1) <= 1
+    ):
+        return
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if algo.is_frozen_kv_mtp():
+        # Its draft reads the target's DCP-sharded pool directly, so the
+        # replicated-draft rule (DCP-flat draft ParallelState) does not apply.
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) does not support "
+            "FROZEN_KV_MTP: its draft shares the target's DCP-sharded KV pool "
+            "and has no rank-local metadata path."
+        )
+    # STANDALONE inherits the EAGLE V2 tree-draft path, so it is gated too.
+    # Not is_dflash_family(): DSPARK ships with DCP and is not gated here.
+    if not (algo.is_eagle() or algo.is_standalone() or algo.is_dflash()):
+        return
+
+    topk = getattr(server_args, "speculative_eagle_topk", None)
+    if topk is not None and int(topk) > 1:
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) supports only chain "
+            "speculative drafts: the DCP verify path folds the draft tokens as "
+            "a linear causal chain. Set --speculative-eagle-topk 1, or run "
+            "without --dcp-size."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view

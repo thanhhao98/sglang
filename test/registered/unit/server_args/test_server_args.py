@@ -905,6 +905,8 @@ class TestContextParallelServerArgs(CustomTestCase):
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
+            dcp_size=1,
+            enable_dp_attention=False,
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
@@ -965,6 +967,32 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertFalse(server_args.enable_prefill_context_parallel)
         self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
         self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+
+    def test_dcp_must_nest_in_attn_tp(self):
+        """DPA + DCP: a DCP group must not span attention-DP replicas."""
+        server_args = self._new_cp_args(
+            tp_size=8, dp_size=4, enable_dp_attention=True, dcp_size=4
+        )
+        with self.assertRaisesRegex(ValueError, "must be divisible by dcp_size"):
+            server_args._handle_context_parallelism()
+
+    def test_dcp_crossing_replicas_rejected_even_when_tp_divides(self):
+        """The docs example: TP=64, DP=4 -> attn_tp=16. dcp=32 divides tp_size
+        (the only condition checked historically) but crosses replicas."""
+        server_args = self._new_cp_args(
+            tp_size=64, dp_size=4, enable_dp_attention=True, dcp_size=32
+        )
+        with self.assertRaisesRegex(ValueError, "must be divisible by dcp_size"):
+            server_args._handle_context_parallelism()
+
+    def test_dcp_containment_accepts_valid_topologies(self):
+        for kwargs in (
+            dict(tp_size=8, dcp_size=8),
+            dict(tp_size=64, dp_size=4, enable_dp_attention=True, dcp_size=16),
+            dict(tp_size=8, dp_size=4, dcp_size=8),  # dp without DPA: attn_tp = tp
+        ):
+            with self.subTest(**kwargs):
+                self._new_cp_args(**kwargs)._handle_context_parallelism()
 
     def test_context_parallel_handler_initializes_cp_strategy(self):
         server_args = self._new_cp_args(

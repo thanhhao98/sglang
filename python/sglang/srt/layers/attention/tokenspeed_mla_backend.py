@@ -56,7 +56,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -86,12 +85,13 @@ def _get_tokenspeed_workspace(
     num_heads: int,
     kv_lora_rank: int,
     max_q_len: int = _TOKENSPEED_MAX_Q_LEN,
+    dcp_size: int = 1,
 ) -> torch.Tensor:
     from sglang.srt.runtime_context import get_resources
 
     # DCP target verification gathers Q to the full head count before launching
     # TokenSpeed; size for that launch shape, not the rank-local head count.
-    num_heads *= get_parallel().attn_dcp_size
+    num_heads *= dcp_size
     max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (
         tokenspeed_mla.get_num_sm(device)
@@ -148,6 +148,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 max_q_len=(
                     model_runner.server_args.max_speculative_num_draft_tokens or 1
                 ),
+                dcp_size=self.dcp_size,
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -302,19 +303,15 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
 
     def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
+        if not self.dcp_enabled:
             return seq_lens
-        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
-            torch.int32
-        )
+        return get_dcp_lens(seq_lens, self.dcp_size, self.dcp_rank).to(torch.int32)
 
     def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
+        if not self.dcp_enabled:
             return max_seq_len
-        local_max = max_seq_len // parallel.dcp_size + int(
-            parallel.dcp_rank < max_seq_len % parallel.dcp_size
+        local_max = max_seq_len // self.dcp_size + int(
+            self.dcp_rank < max_seq_len % self.dcp_size
         )
         # TokenSpeed requires a positive scheduling bound even when every
         # sequence in a padded graph row is empty on this rank.
@@ -326,7 +323,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         req_pool_indices: torch.Tensor,
         local_seq_lens: torch.Tensor,
     ) -> None:
-        parallel = get_parallel()
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
         create_mla_kv_page_table_for_dcp[
             (
@@ -343,8 +339,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
             PHYSICAL_PAGE_SIZE=self.page_size,
-            DCP_SIZE=parallel.dcp_size,
-            DCP_RANK=parallel.dcp_rank,
+            DCP_SIZE=self.dcp_size,
+            DCP_RANK=self.dcp_rank,
             PAGES_PER_BLOCK=pages_per_block,
         )
 
@@ -356,7 +352,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        if not get_parallel().dcp_enabled:
+        if not self.dcp_enabled:
             return super()._create_block_kv_indices(
                 batch_size,
                 max_blocks,
@@ -386,7 +382,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         super()._init_cuda_graph_metadata(
             bs, num_tokens, forward_mode, seq_lens, device
         )
-        if get_parallel().dcp_enabled:
+        if self.dcp_enabled:
             self.forward_decode_metadata.max_seq_len_k = (
                 self._get_dcp_local_max_seq_len(
                     self.max_context_len
@@ -401,7 +397,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         forward_mode,
     ):
-        if not get_parallel().dcp_enabled:
+        if not self.dcp_enabled:
             return super()._apply_cuda_graph_metadata(
                 bs,
                 req_pool_indices,
@@ -440,7 +436,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if (
-            get_parallel().dcp_enabled
+            self.dcp_enabled
             and self.forward_decode_metadata is not None
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
@@ -515,14 +511,13 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        parallel = get_parallel()
         # FlashInfer autotunes MoE kernels with a synthetic full-model decode
         # and discards the attention/logits result.  On multi-node GB300, the
         # synthetic full-head DCP metadata can make both the TokenSpeed and
         # TRTLLM decode kernels surface cudaErrorNvlinkUncorrectable.  Skip
         # attention only inside that explicitly scoped dummy pass.  Real
         # requests and CUDA graph capture continue through TokenSpeed below.
-        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+        if self.dcp_enabled and get_in_autotune_dummy_run():
             output = torch.zeros(
                 (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
                 dtype=self.q_data_type,
@@ -535,7 +530,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
             return output, lse
 
-        if not parallel.dcp_enabled:
+        if not self.dcp_enabled:
             return super().forward_decode(
                 q,
                 k,
@@ -603,8 +598,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
             causal_seqs=global_seq_lens,
-            cp_world=parallel.dcp_size,
-            cp_rank=parallel.dcp_rank,
+            cp_world=self.dcp_size,
+            cp_rank=self.dcp_rank,
             return_lse=True,
         )
 

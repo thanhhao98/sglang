@@ -72,6 +72,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         return self._verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # No-op: verify metadata here depends only on the draft token count,
+        # not on the sampled tokens (same as trtllm_mha / triton).
+        pass
 
     def _init_cuda_graph_metadata(
         self,
@@ -1019,7 +1027,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope=q_rope_3d,
         ):
             return None
-        parallel = get_parallel()
         return set_mla_kv_concat_q_fp8(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1028,9 +1035,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_nope=q_nope,
             q_rope=q_rope_3d,
             # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
-            # (identity when attn_dcp_size == 1).
-            dcp_world_size=parallel.attn_dcp_size,
-            dcp_rank=parallel.attn_dcp_rank,
+            # (identity when this runner's attn_dcp_size == 1, e.g. any draft).
+            dcp_world_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
     def forward_decode(
@@ -1310,7 +1317,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             if forward_batch.forward_mode.is_target_verify():
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                dcp_enabled = get_parallel().dcp_enabled
+                dcp_enabled = self.dcp_enabled
                 max_seq_len = metadata.max_seq_len_k + (
                     0 if dcp_enabled else draft_token_num
                 )
@@ -1396,10 +1403,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and get_parallel().dcp_enabled
-            ):
+            if forward_batch.forward_mode.is_target_verify() and self.dcp_enabled:
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,
@@ -1408,8 +1412,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     max_seq_len=max_seq_len,
                     layer=layer,
                     causal_seqs=metadata.global_seq_lens_k,
-                    cp_world=get_parallel().dcp_size,
-                    cp_rank=get_parallel().dcp_rank,
+                    cp_world=self.dcp_size,
+                    cp_rank=self.dcp_rank,
                     return_lse=True,
                 )
                 output = raw_out.view(

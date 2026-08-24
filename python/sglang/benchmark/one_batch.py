@@ -322,7 +322,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         attn_tp_size=attn_tp_size,
         attn_cp_rank=0,
         attn_cp_size=server_args.attn_cp_size,
-        attn_dcp_rank=tp_rank % server_args.dcp_size,
+        attn_dcp_rank=attn_tp_rank % server_args.dcp_size,
         attn_dcp_size=server_args.dcp_size,
         attn_dp_rank=attn_dp_rank,
         attn_dp_size=attn_dp_size,

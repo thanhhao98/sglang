@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.runtime_context import (
     configured_tp_size,
     get_model,
+    get_parallel,
     get_spec,
 )
 
@@ -38,6 +39,9 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_draft_num_layers: Optional[int] = None
     # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
+    # EAGLE/STANDALONE draft KV bytes/token (pre-DCP-replication); None when
+    # unresolved -> the pool budget stays on layer-ratio scaling.
+    eagle_draft_cell_size_per_token: int | None = None
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
@@ -108,6 +112,12 @@ def _resolve_eagle_aux_hidden_state(
                 draft_model_config.swa_attention_layer_ids
             )
 
+        config.eagle_draft_cell_size_per_token = _resolve_eagle_draft_cell_size(
+            server_args=server_args,
+            draft_model_config=draft_model_config,
+            draft_num_layers=config.eagle_draft_num_layers,
+        )
+
         if spec_algorithm.is_eagle3():
             config.eagle_use_aux_hidden_state = True
             try:
@@ -123,6 +133,55 @@ def _resolve_eagle_aux_hidden_state(
             except:
                 # if there is no aux layer, set to None
                 config.eagle_aux_hidden_state_layer_ids = None
+
+
+def _resolve_eagle_draft_cell_size(
+    *,
+    server_args: ServerArgs,
+    draft_model_config: ModelConfig,
+    draft_num_layers: Optional[int],
+) -> int | None:
+    """Bytes/token the EAGLE/STANDALONE draft KV pool will cost the target's
+    pool budget, resolved from the draft's own geometry and the KV dtype the
+    draft worker will actually resolve (the DFLASH resolver's shape). Returns
+    None if anything is unresolvable, leaving callers on layer-ratio scaling.
+    """
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        eagle_draft_cell_size_per_token,
+    )
+    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+    try:
+        draft_kv_cache_dtype_str, draft_kv_cache_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+            speculative_draft_kv_cache_dtype=(
+                get_spec().speculative_draft_kv_cache_dtype
+            ),
+            model=None,
+            model_dtype=draft_model_config.dtype,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend=(
+                get_spec().speculative_draft_attention_backend
+            ),
+        )
+        return eagle_draft_cell_size_per_token(
+            draft_model_config=draft_model_config,
+            draft_num_layers=draft_num_layers,
+            draft_kv_cache_dtype=draft_kv_cache_dtype,
+            draft_kv_cache_dtype_str=draft_kv_cache_dtype_str,
+            # The head-shard degree the pools use (DefaultPoolConfigurator
+            # reads attn_tp_size); differs from configured_tp_size() under DPA.
+            tp_size=get_parallel().attn_tp_size,
+            server_args=server_args,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Could not resolve EAGLE draft KV bytes/token (%s); falling back to "
+            "layer-ratio scaling for the KV pool budget.",
+            e,
+        )
+        return None
 
 
 def _resolve_dflash_aux_hidden_state(

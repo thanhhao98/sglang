@@ -332,7 +332,7 @@ class DeepseekMLARocmForwardMixin:
 
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
-            and is_dcp_mla_decode_phase(forward_batch)
+            and is_dcp_mla_decode_phase(self, forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -584,8 +584,8 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch):
+        if self.dcp_enabled:
+            if is_dcp_mla_decode_phase(self, forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -703,7 +703,7 @@ class DeepseekMLARocmForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                if is_dcp_mla_decode_phase(forward_batch):
+                if is_dcp_mla_decode_phase(self, forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -764,7 +764,7 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if is_dcp_mla_decode_phase(self, forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

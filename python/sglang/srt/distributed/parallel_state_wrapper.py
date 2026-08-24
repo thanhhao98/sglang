@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 
@@ -23,6 +23,14 @@ class ParallelState:
     moe_dp_rank: Optional[int]
     moe_dp_size: int
     gpu_id: int
+
+    def dcp_flat(self) -> "ParallelState":
+        """This state with DCP flattened — the view a draft worker freezes.
+
+        A draft is TP-sharded and never splits the token dimension across DCP
+        ranks; its pools are replicated over the allocator's widened loc space.
+        """
+        return replace(self, attn_dcp_size=1, attn_dcp_rank=0)
 
     @staticmethod
     def trivial(**overrides: Optional[int]) -> "ParallelState":

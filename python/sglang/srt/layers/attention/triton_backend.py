@@ -221,8 +221,10 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # Per-runner DCP topology: a draft runner's ps is DCP-flat (drafts are
+        # TP-sharded and never split the token dim), the target's mirrors the group.
+        self.dcp_size = model_runner.ps.attn_dcp_size
+        self.dcp_rank = model_runner.ps.attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
