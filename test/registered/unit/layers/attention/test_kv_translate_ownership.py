@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
+    get_spec,
     publish,
     reset_context,
 )
@@ -208,8 +209,10 @@ class TestBackendDcpGeometry(CustomTestCase):
     def test_a_target_takes_the_group_geometry(self):
         self.assertEqual(self._geometry(is_draft_worker=False), (8, 5))
 
-    def test_a_draft_takes_a_local_span(self):
+    def test_a_draft_takes_the_width_the_flag_states(self):
         self.assertEqual(self._geometry(is_draft_worker=True), (1, 0))
+        with get_spec().override(speculative_dcp_size=2):
+            self.assertEqual(self._geometry(is_draft_worker=True), (2, 1))
 
     def test_wrappers_report_the_geometry_of_the_backend_they_delegate_to(self):
         """At the class default a wrapper would report width 1 and skip the DCP merge."""

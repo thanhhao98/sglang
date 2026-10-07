@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -92,9 +92,14 @@ class AttentionBackend(ABC):
 
     def _init_dcp(self, is_draft_worker: bool) -> None:
         parallel = get_parallel()
-        self.dcp_size = 1 if is_draft_worker else parallel.attn_dcp_size
+        if is_draft_worker:
+            self.dcp_size = get_spec().speculative_dcp_size
+        else:
+            self.dcp_size = parallel.attn_dcp_size
         # attn_dcp_rank is stamped only by a placed publish; never read it without DCP.
-        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_size > 1 else 0
+        self.dcp_rank = (
+            parallel.attn_dcp_rank % self.dcp_size if self.dcp_size > 1 else 0
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
