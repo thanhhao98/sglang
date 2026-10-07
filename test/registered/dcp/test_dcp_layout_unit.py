@@ -474,6 +474,47 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
 
+    def test_only_a_draft_mla_pool_under_dcp_is_built_replicated(self):
+        """A draft MLA pool stores one widened id per row; a target pool keeps
+        the owner rule."""
+        override = rc.get_context().override_server_args(page_size=1)
+        override.install()
+        self.addCleanup(override.restore)
+
+        def build(builder, *, kv_cache_dtype, is_draft_worker):
+            cfg = object.__new__(KVCacheConfigurator)
+            cfg.is_draft_worker = is_draft_worker
+            cfg.kv_cache_dtype = kv_cache_dtype
+            cfg.device = "cpu"
+            cfg.model_config = SimpleNamespace(kv_lora_rank=16, qk_rope_head_dim=8)
+            cfg.layer_info = SimpleNamespace(
+                num_effective_layers=1, start_layer=0, end_layer=1
+            )
+            return builder(cfg, max_total_num_tokens=64)
+
+        for builder, kv_cache_dtype in (
+            (KVCacheConfigurator._build_mla_kv_pool, torch.bfloat16),
+            (KVCacheConfigurator._build_mla_fp4_kv_pool, torch.float4_e2m1fn_x2),
+        ):
+            for dcp_size, is_draft_worker, replicated, span in (
+                (4, True, True, 1),
+                (4, False, False, 4),
+                (1, True, False, 1),
+            ):
+                with (
+                    self.subTest(builder.__name__, dcp=dcp_size, draft=is_draft_worker),
+                    rc.get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    pool = build(
+                        builder,
+                        kv_cache_dtype=kv_cache_dtype,
+                        is_draft_worker=is_draft_worker,
+                    )
+                    self.assertEqual(
+                        (pool.dcp_replicated, pool._write_loc_dcp_span),
+                        (replicated, span),
+                    )
+
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4
         physical_page_size = 64

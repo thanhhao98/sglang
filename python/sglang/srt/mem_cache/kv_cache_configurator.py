@@ -1766,6 +1766,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            dcp_replicated=self.loc_space_scale > 1,
         )
         return token_to_kv_pool
 
@@ -1781,6 +1782,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            dcp_replicated=self.loc_space_scale > 1,
         )
         return token_to_kv_pool
 
@@ -1902,6 +1904,7 @@ class KVCacheConfigurator:
             extra_args = {
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                "dcp_replicated": self.loc_space_scale > 1,
             }
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
