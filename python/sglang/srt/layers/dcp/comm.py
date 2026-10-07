@@ -35,6 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
@@ -187,7 +188,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
-    if get_parallel().dcp_enabled:
+    if get_attn_backend().dcp_size > 1:
         kv_a = kv_a.unsqueeze(1)
         gathered_kv = all_gather_kv_cache_for_dcp(
             kv_a,

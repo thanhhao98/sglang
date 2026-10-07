@@ -102,16 +102,17 @@ def filter_dcp_local_chunk_kv_indices(
     kv_indices: torch.Tensor,
     chunk_starts_cpu: torch.Tensor,
     chunk_seq_lens_cpu: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
 ) -> torch.Tensor:
-    parallel = get_parallel()
-    if not parallel.dcp_enabled:
+    if dcp_size == 1:
         return kv_indices
 
-    dcp_size = parallel.dcp_size
     parts = []
     offset = 0
     for start, length in zip(chunk_starts_cpu.tolist(), chunk_seq_lens_cpu.tolist()):
-        first = (parallel.dcp_rank - start) % dcp_size
+        first = (dcp_rank - start) % dcp_size
         parts.append(kv_indices[offset + first : offset + length : dcp_size])
         offset += length
     return torch.cat(parts)

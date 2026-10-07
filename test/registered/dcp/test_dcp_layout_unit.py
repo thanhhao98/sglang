@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
@@ -30,6 +31,13 @@ from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
+from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    ForwardBatchDeepSeekMHAMixin,
+)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -76,12 +84,13 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
         kv = self._build_chunk(starts, lens, dcp_size, seed)
-        with rc.get_parallel().override(
-            dcp_enabled=dcp_size > 1, dcp_size=dcp_size, dcp_rank=dcp_rank
-        ):
-            got = filter_dcp_local_chunk_kv_indices(
-                kv, torch.tensor(starts), torch.tensor(lens)
-            )
+        got = filter_dcp_local_chunk_kv_indices(
+            kv,
+            torch.tensor(starts),
+            torch.tensor(lens),
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
         return kv, got
 
     def test_matches_owner_rule_on_unaligned_runs(self):
@@ -134,15 +143,92 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def test_identity_without_dcp(self):
         kv = torch.arange(37)
-        with rc.get_parallel().override(
-            dcp_enabled=False, dcp_size=1, dcp_rank=0, attn_dcp_rank=0
+        self.assertIs(
+            filter_dcp_local_chunk_kv_indices(
+                kv, torch.tensor([0]), torch.tensor([37]), dcp_size=1, dcp_rank=0
+            ),
+            kv,
+        )
+
+
+class _Backend(AttentionBackend):
+    def __init__(self, translator, req_to_token):
+        self.kv_index_translator = translator
+        self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+
+
+class _PrefixBatch(ForwardBatchDeepSeekMHAMixin):
+    pass
+
+
+class _ChunkIndexKernel:
+    """CPU stand-in for the Triton producer of chunked-prefix read ids."""
+
+    def __getitem__(self, grid):
+        def fill(req_to_token, req_pool_indices, starts, lens, cu_lens, out, stride):
+            for i, req in enumerate(req_pool_indices.tolist()):
+                start, length, at = int(starts[i]), int(lens[i]), int(cu_lens[i])
+                out[at : at + length] = req_to_token[req, start : start + length]
+
+        return fill
+
+
+class TestChunkedPrefixReadsFollowTheRunnersWidth(CustomTestCase):
+    """A draft's chunked-prefix read ids are its replicated pool's rows,
+    unfiltered and uncollapsed."""
+
+    def setUp(self):
+        rc.reset_context()
+        self.addCleanup(rc.reset_context)
+        rc.publish(
+            ServerArgs(model_path="dummy", tp_size=4, dcp_size=4),
+            role="scheduler",
+            ranks=rc.SpawnRanks(world_rank=1),
+        )
+
+    def _chunk_ids(self, is_draft_worker):
+        # Positions 0..11 on the widened pages 5, 2 and 9.
+        ids = torch.cat([torch.arange(4) + 4 * page for page in (5, 2, 9)])
+        req_to_token = ids.to(torch.int32)[None, :]
+        runner = SimpleNamespace(
+            is_draft_worker=is_draft_worker,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device="cpu",
+        )
+        ModelRunner.init_kv_index_translator(runner)
+        backend = _Backend(runner.kv_index_translator, req_to_token)
+        backend._init_dcp(is_draft_worker)
+
+        batch = _PrefixBatch()
+        batch.batch_size = 1
+        batch.req_pool_indices = torch.tensor([0])
+        batch.num_prefix_chunks = 1
+        batch.prefix_chunk_starts = [torch.tensor([0])]
+        batch.prefix_chunk_seq_lens = [torch.tensor([12])]
+        batch.prefix_chunk_cu_seq_lens = [torch.tensor([0, 12])]
+        batch.prefix_chunk_num_tokens = [12]
+        batch.prefix_chunk_starts_cpu = [torch.tensor([0])]
+        batch.prefix_chunk_seq_lens_cpu = [torch.tensor([12])]
+        with (
+            patch.object(
+                forward_batch_deepseek_mha_mixin,
+                "create_chunked_prefix_cache_kv_indices",
+                _ChunkIndexKernel(),
+            ),
+            forward_context(ForwardContext(attn_backend=backend)),
         ):
-            self.assertIs(
-                filter_dcp_local_chunk_kv_indices(
-                    kv, torch.tensor([0]), torch.tensor([37])
-                ),
-                kv,
-            )
+            batch.prepare_chunked_kv_indices(torch.device("cpu"))
+        return ids, batch.prefix_chunk_kv_indices[0]
+
+    def test_only_a_target_reads_its_share_of_a_chunk(self):
+        ids, target_rows = self._chunk_ids(is_draft_worker=False)
+        self.assertEqual(target_rows.tolist(), (ids[1::4] // 4).tolist())
+
+        ids, draft_rows = self._chunk_ids(is_draft_worker=True)
+        self.assertEqual(draft_rows.tolist(), ids.tolist())
 
 
 class TestGetDcpLens(CustomTestCase):
