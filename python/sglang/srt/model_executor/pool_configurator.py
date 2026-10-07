@@ -30,7 +30,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    replicated_draft_pool_scale,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -109,7 +112,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size) * get_parallel().attn_dcp_size
+    return int(cell_size) * replicated_draft_pool_scale()
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -284,8 +287,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
+                    replicated_layers = draft_num_layers * replicated_draft_pool_scale()
                     self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                        self._cell_size * (1 + replicated_layers / int(num_layers))
                     )
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
@@ -305,7 +309,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
+                    * replicated_draft_pool_scale(),
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
