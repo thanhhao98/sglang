@@ -33,7 +33,14 @@ from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxHybridAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_context,
+    get_spec,
+    publish,
+    reset_context,
+)
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -132,6 +139,7 @@ class _Runner:
     """HybridAttnBackend takes its translator from the runner, not an inner."""
 
     def __init__(self, translator):
+        self.is_draft_worker = False
         self.kv_index_translator = translator
         self.kv_cache_dtype = None
         self.token_to_kv_pool = None
@@ -179,6 +187,44 @@ class TestWrapperBackendsForwardTranslator(CustomTestCase):
         for name, wrapper in _build_wrappers(translator).items():
             with self.subTest(wrapper=name):
                 self.assertIs(wrapper.kv_index_translator, translator)
+
+
+class TestBackendDcpGeometry(CustomTestCase):
+    """A backend's DCP geometry follows the role of the worker that builds it."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", tp_size=8, dcp_size=8),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=5),
+        )
+
+    def _geometry(self, is_draft_worker):
+        backend = _Inner()
+        backend._init_dcp(is_draft_worker)
+        return backend.dcp_size, backend.dcp_rank
+
+    def test_a_target_takes_the_group_geometry(self):
+        self.assertEqual(self._geometry(is_draft_worker=False), (8, 5))
+
+    def test_a_draft_takes_the_width_the_flag_states(self):
+        self.assertEqual(self._geometry(is_draft_worker=True), (1, 0))
+        with get_spec().override(speculative_dcp_size=2):
+            self.assertEqual(self._geometry(is_draft_worker=True), (2, 1))
+
+    def test_wrappers_report_the_geometry_of_the_backend_they_delegate_to(self):
+        """At the class default a wrapper would report width 1 and skip the DCP merge."""
+        carrier = _Inner()
+        carrier.dcp_size, carrier.dcp_rank = 8, 5
+        wrappers = {
+            "HybridLinearAttnBackend": HybridLinearAttnBackend(carrier, _Inner(), [0]),
+            "TboAttnBackend": TboAttnBackend(carrier, [_Inner()]),
+        }
+        for name, wrapper in wrappers.items():
+            with self.subTest(wrapper=name):
+                self.assertEqual((wrapper.dcp_size, wrapper.dcp_rank), (8, 5))
 
 
 if __name__ == "__main__":

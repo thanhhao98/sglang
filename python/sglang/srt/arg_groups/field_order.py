@@ -268,6 +268,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_num_steps",
     "speculative_eagle_topk",
     "speculative_num_draft_tokens",
+    "speculative_dcp_size",
     "speculative_dflash_block_size",
     "speculative_dspark_block_size",
     "speculative_dspark_sps_table_path",

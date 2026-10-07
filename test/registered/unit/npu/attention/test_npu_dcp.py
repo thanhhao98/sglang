@@ -32,7 +32,6 @@ _real_utils_is_npu = _utils.is_npu
 _common_utils.is_npu = lambda: False
 _utils.is_npu = _common_utils.is_npu
 try:
-    from sglang.srt import runtime_context as rc
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
@@ -149,8 +148,9 @@ class TestNpuDcpLengths(unittest.TestCase):
         starts = torch.tensor([1, 7, 12])
         lengths = torch.tensor([5, 4, 6])
         values = torch.arange(15)
-        with rc.get_parallel().override(dcp_enabled=True, dcp_size=4, dcp_rank=2):
-            got = filter_dcp_local_chunk_kv_indices(values, starts, lengths)
+        got = filter_dcp_local_chunk_kv_indices(
+            values, starts, lengths, dcp_size=4, dcp_rank=2
+        )
         # The first owned offset is (rank-start) mod size for each chunk.
         expected = torch.tensor([1, 8, 11])
         self.assertTrue(torch.equal(got, expected))

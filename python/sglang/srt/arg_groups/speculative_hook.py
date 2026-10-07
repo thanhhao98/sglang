@@ -270,6 +270,44 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # stash on that instead.
             algo.handle_server_args(server_args)
 
+    _validate_dcp_spec(server_args)
+
+
+def _validate_dcp_spec(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.speculative_dcp_size < 1:
+        raise ValueError(
+            f"--speculative-dcp-size must be at least 1, got {cfg.speculative_dcp_size}."
+        )
+    if cfg.speculative_dcp_size != 1:
+        raise ValueError(
+            "--speculative-dcp-size > 1 is not supported yet: the draft KV cache is "
+            "replicated across the target's DCP ranks."
+        )
+
+    if cfg.speculative_algorithm is None or cfg.dcp_size <= 1:
+        return
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    if algo.is_frozen_kv_mtp():
+        raise ValueError(
+            "FROZEN_KV_MTP reads the target's DCP-sharded KV pool directly instead "
+            "of owning a replicated draft pool, so it cannot run with --dcp-size."
+        )
+    if not (algo.is_eagle() or algo.is_standalone()):
+        return
+
+    topk = cfg.speculative_eagle_topk
+    if topk is not None and int(topk) > 1:
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) supports only chain "
+            "speculative drafts: the DCP verify path folds the draft tokens as "
+            "a linear causal chain. Set --speculative-eagle-topk 1, or run "
+            "without --dcp-size."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)

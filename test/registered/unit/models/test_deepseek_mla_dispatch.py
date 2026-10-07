@@ -17,10 +17,16 @@ from unittest import mock
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    is_dcp_mla_decode_phase,
+)
+from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +146,35 @@ class TestCPMLADispatch(CustomTestCase):
                                 abh._handle_attention_backend(attn, batch, "fa3"),
                                 expected,
                             )
+
+
+class TestDcpDecodePhaseFollowsTheRunningBackend(CustomTestCase):
+    """The MLA DCP decode phase follows the running backend's width."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", tp_size=8, dcp_size=8),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=5),
+        )
+
+    def _phase(self, dcp_size, mode):
+        backend = SimpleNamespace(dcp_size=dcp_size)
+        with forward_context(ForwardContext(attn_backend=backend)):
+            return is_dcp_mla_decode_phase(SimpleNamespace(forward_mode=mode))
+
+    def test_a_striped_backend_runs_the_dcp_decode_phase(self):
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                self.assertTrue(self._phase(8, mode))
+        self.assertFalse(self._phase(8, ForwardMode.EXTEND))
+
+    def test_a_draft_backend_never_does_under_a_striped_target(self):
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                self.assertFalse(self._phase(1, mode))
 
 
 if __name__ == "__main__":

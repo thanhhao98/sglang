@@ -70,6 +70,7 @@ from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
+from sglang.srt.layers.attention.base_attn_backend import dcp_size_for_role
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
@@ -898,6 +899,7 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
             device=self.device,
+            dcp_size=dcp_size_for_role(self.is_draft_worker),
         )
 
     def max_shared_logits_buffer_rows(self) -> int:

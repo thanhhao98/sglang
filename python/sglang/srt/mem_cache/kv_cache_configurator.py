@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.mem_cache.allocation_sizing import (
     get_mamba_tracking_slots,
     get_req_to_token_extra_context_len,
+    replicated_draft_pool_scale,
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -426,8 +427,7 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        return replicated_draft_pool_scale() if self.is_draft_worker else 1
 
     @property
     def pool_page_size(self) -> int:
@@ -1766,6 +1766,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            dcp_replicated=self.loc_space_scale > 1,
         )
         return token_to_kv_pool
 
@@ -1781,6 +1782,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            dcp_replicated=self.loc_space_scale > 1,
         )
         return token_to_kv_pool
 
@@ -1902,6 +1904,7 @@ class KVCacheConfigurator:
             extra_args = {
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                "dcp_replicated": self.loc_space_scale > 1,
             }
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)

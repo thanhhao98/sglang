@@ -102,12 +102,15 @@ class ForwardBatchDeepSeekMHAMixin:
                 chunk_kv_indices,
                 req_to_token.shape[1],
             )
+            backend = get_attn_backend()
             chunk_kv_indices = filter_dcp_local_chunk_kv_indices(
                 chunk_kv_indices,
                 self.prefix_chunk_starts_cpu[idx],
                 self.prefix_chunk_seq_lens_cpu[idx],
+                dcp_size=backend.dcp_size,
+                dcp_rank=backend.dcp_rank,
             )
-            translator = get_attn_backend().kv_index_translator
+            translator = backend.kv_index_translator
             chunk_kv_indices = translator.translate_dcp_read_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 

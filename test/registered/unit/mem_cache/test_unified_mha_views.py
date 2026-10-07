@@ -569,12 +569,10 @@ class TestFactoryViews(unittest.TestCase):
 
         fb = _FB()
         fb.out_cache_loc = v.clone()
-        # The translating paths read the DCP topology twice: construction reads
-        # `attn_dcp_size` to decide whether the read translate defers, and the
-        # write translate reads `attn_dcp_rank`, which derives from
-        # `dcp_enabled`. Neither has a pre-publish default and nothing is
-        # published in a unit test, so state both and hold the scope across
-        # every call that translates.
+        # The write translate reads `attn_dcp_size` and `attn_dcp_rank`, which
+        # derives from `dcp_enabled`. Neither has a pre-publish default and
+        # nothing is published in a unit test, so state both and hold the scope
+        # across every call that translates.
         with get_parallel().override(attn_dcp_size=1, dcp_enabled=False):
             source = KVIndexTranslator(
                 req_to_token=torch.zeros((2, 8), dtype=torch.int64),

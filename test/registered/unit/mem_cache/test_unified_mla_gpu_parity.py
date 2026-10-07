@@ -26,9 +26,10 @@ import unittest
 
 import torch
 
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
@@ -199,6 +200,50 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             for l in range(_L):
                 got = unified.get_key_buffer(l)[_kernel_id(dst_t, ps)]
                 torch.testing.assert_close(got, before[l], rtol=0, atol=0)
+
+
+@unittest.skipUnless(_HAS_CUDA, "requires CUDA")
+class TestMLAPoolWritesUnderDcp(CustomTestCase):
+    """Under DCP only a replicated draft pool stores every widened id as a row;
+    a striped pool keeps this rank's ids at `id // dcp_size`."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", tp_size=4, dcp_size=4),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=1),
+        )
+
+    def _write(self, *, dcp_replicated):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        pool = MLATokenToKVPool(
+            size=64,
+            page_size=1,
+            dtype=_DTYPE,
+            kv_lora_rank=_LORA,
+            qk_rope_head_dim=_ROPE,
+            layer_num=1,
+            device=_DEV,
+            enable_memory_saver=False,
+            dcp_replicated=dcp_replicated,
+        )
+        loc = torch.arange(8, 24, device=_DEV)
+        nope = torch.randn(loc.numel(), 1, _LORA, dtype=_DTYPE, device=_DEV)
+        rope = torch.randn(loc.numel(), 1, _ROPE, dtype=_DTYPE, device=_DEV)
+        pool.set_mla_kv_buffer(types.SimpleNamespace(layer_id=0), loc, nope, rope)
+        torch.cuda.synchronize()
+        return pool.get_key_buffer(0), loc, torch.cat([nope, rope], dim=-1)
+
+    def test_only_a_replicated_pool_stores_every_widened_id(self):
+        buf, loc, rows = self._write(dcp_replicated=True)
+        torch.testing.assert_close(buf[loc], rows, rtol=0, atol=0)
+
+        buf, loc, rows = self._write(dcp_replicated=False)
+        owned = loc % 4 == 1
+        torch.testing.assert_close(buf[loc[owned] // 4], rows[owned], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

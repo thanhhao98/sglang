@@ -25,6 +25,12 @@ def get_alloc_page_size() -> int:
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
+def replicated_draft_pool_scale() -> int:
+    """Draft pool rows per target pool row: a draft replicates the part of the
+    target's DCP width it does not stripe itself."""
+    return get_parallel().attn_dcp_size // get_spec().speculative_dcp_size
+
+
 def get_alloc_len_per_decode() -> int:
     """KV length one request may allocate in a single decode step.
 

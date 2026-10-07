@@ -298,6 +298,7 @@ class EagerRunner(BaseRunner):
         ):
             if (
                 get_parallel().attn_dcp_size > 1
+                and not model_runner.is_draft_worker
                 and hasattr(
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )

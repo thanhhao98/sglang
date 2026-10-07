@@ -71,7 +71,6 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.runtime_context import get_parallel
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -107,10 +106,12 @@ class KVIndexTranslator:
         token_to_kv_pool,
         page_size: int,
         device: str,
+        dcp_size: int = 1,
     ):
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
+        self.dcp_size = dcp_size
 
         self.is_translating = (
             isinstance(
@@ -132,7 +133,7 @@ class KVIndexTranslator:
             self._translate_write_full = alloc.translate_write_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
-            self.defer_read_translate = get_parallel().attn_dcp_size > 1
+            self.defer_read_translate = dcp_size > 1
             if isinstance(alloc, UnifiedSWAAllocatorBase):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
@@ -505,7 +506,7 @@ class KVIndexTranslator:
     def needs_read_translate(self) -> bool:
         """Whether `translate_dcp_read_ids` is anything but the identity, so a
         hot path can skip the call rather than round-trip a no-op copy."""
-        return self.is_translating or get_parallel().attn_dcp_size > 1
+        return self.is_translating or self.dcp_size > 1
 
     def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
         """Widened logical READ ids -> physical ids, for either pool.
@@ -513,9 +514,8 @@ class KVIndexTranslator:
         The one hook every DCP read-index production site calls; on a static
         pool `widened // dcp_size` IS the whole virtual->physical translation.
         """
-        dcp_size = get_parallel().attn_dcp_size
-        if dcp_size > 1:
-            widened_ids = widened_ids // dcp_size
+        if self.dcp_size > 1:
+            widened_ids = widened_ids // self.dcp_size
         return self.translate_full_attn_ids(widened_ids)
 
     def translate_full_attn_ids(

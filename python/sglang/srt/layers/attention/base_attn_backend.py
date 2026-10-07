@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -31,6 +32,12 @@ class SharedReadEnds(Enum):
     def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
         # Ordered by lateness: the latest end covers every child.
         return max(items, key=lambda x: x.value)
+
+
+def dcp_size_for_role(is_draft_worker: bool) -> int:
+    if is_draft_worker:
+        return get_spec().speculative_dcp_size
+    return get_parallel().attn_dcp_size
 
 
 class AttentionBackend(ABC):
@@ -84,6 +91,17 @@ class AttentionBackend(ABC):
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
     kv_index_translator = None
+
+    # NOTE(kpham-sgl): Replicated drafts and backends without DCP use a local span.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+
+    def _init_dcp(self, is_draft_worker: bool) -> None:
+        self.dcp_size = dcp_size_for_role(is_draft_worker)
+        # attn_dcp_rank is stamped only by a placed publish; never read it without DCP.
+        self.dcp_rank = (
+            get_parallel().attn_dcp_rank % self.dcp_size if self.dcp_size > 1 else 0
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.

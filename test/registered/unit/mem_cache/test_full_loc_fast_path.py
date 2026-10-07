@@ -301,7 +301,7 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     two backends that could reach it disagree on the loc space -- flashinfer's
     `k_rope is None` branch passes a WIDENED loc, the Triton backend one it
     already collapsed -- so there is no single correct translation and refusing
-    is the contract."""
+    is the contract. A replicated draft pool has no owner rule and takes it."""
 
     def setUp(self):
         # `set_kv_buffer` asks the parallel context whether DCP is in play, and
@@ -343,6 +343,24 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         self.assertIn("set_mla_kv_buffer", str(cm.exception))
         # Nothing was written on the way to refusing.
         self.assertTrue(bool((pool.kv_buffer[0] == 0).all()))
+
+    def test_a_replicated_pool_writes_every_id_under_dcp(self):
+        """A replicated pool stores every widened id as its own row."""
+        from sglang.srt.runtime_context import get_parallel
+
+        pool = self._bare_mla_pool()
+        pool.dcp_replicated = True
+        layer = types.SimpleNamespace(layer_id=0)
+        loc = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        cache_k = torch.ones((4, 1, 8), dtype=torch.float16)
+
+        with get_parallel().override(
+            dcp_enabled=True, attn_dcp_size=2, attn_dcp_rank=1
+        ):
+            pool.set_kv_buffer(layer, _loc_info(loc), cache_k, None)
+
+        self.assertTrue(bool((pool.kv_buffer[0][:4] == 1).all()))
+        self.assertTrue(bool((pool.kv_buffer[0][4:] == 0).all()))
 
     def test_set_kv_buffer_still_writes_without_dcp(self):
         pool = self._bare_mla_pool()
