@@ -1478,7 +1478,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # so it never reaches forward_decode's guard.
         if (
             forward_batch.forward_mode.is_target_verify()
-            and get_parallel().dcp_enabled
+            and self.dcp_size > 1
             and get_in_autotune_dummy_run()
         ):
             return self._dummy_dcp_decode_for_autotune(q, layer)

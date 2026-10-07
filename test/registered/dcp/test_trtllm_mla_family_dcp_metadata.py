@@ -126,6 +126,8 @@ class _DCPMetadataTests:
         k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
         k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")
         parallel = SimpleNamespace(dcp_enabled=dcp_enabled)
+        backend.dcp_size = DCP_SIZE if dcp_enabled else 1
+        backend.dcp_rank = DCP_RANK if dcp_enabled else 0
         autotune = (
             autotune_dummy_run_mode(run_lm_head=False)
             if in_autotune
