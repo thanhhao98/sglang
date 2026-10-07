@@ -37,6 +37,8 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.runner import eager_runner
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -229,6 +231,51 @@ class TestChunkedPrefixReadsFollowTheRunnersWidth(CustomTestCase):
 
         ids, draft_rows = self._chunk_ids(is_draft_worker=True)
         self.assertEqual(draft_rows.tolist(), ids.tolist())
+
+
+class TestEagerDcpGatherPlanning(CustomTestCase):
+    """A draft extend gets no DCP gather metadata."""
+
+    def setUp(self):
+        rc.reset_context()
+        self.addCleanup(rc.reset_context)
+        rc.publish(
+            ServerArgs(model_path="dummy", tp_size=4, dcp_size=4),
+            role="scheduler",
+            ranks=rc.SpawnRanks(world_rank=1),
+        )
+
+    def _gather_metadata(self, *, is_draft_worker):
+        plan = object()
+        model_runner = MagicMock(
+            is_draft_worker=is_draft_worker,
+            device="cpu",
+            device_timer=None,
+            prefill_cuda_graph_runner=None,
+        )
+        model_runner._extend_forward_kwargs.return_value = {}
+        model_runner.model.prepare_context_parallel_metadata_for_dcp.return_value = plan
+        runner = object.__new__(EagerRunner)
+        runner.model_runner = model_runner
+        runner.enable_pdmux = False
+        batch = MagicMock(attn_dcp_metadata=None)
+        batch.needs_forward_metadata_init.return_value = True
+        batch.forward_mode.is_target_verify.return_value = False
+        with (
+            patch.object(EagerRunner, "load_batch", lambda self, fb, pp=None: fb),
+            patch.object(eager_runner, "is_cp_active", return_value=False),
+            patch.object(eager_runner, "get_req_to_token_pool"),
+            patch.object(eager_runner, "get_token_to_kv_pool"),
+            patch.object(eager_runner, "maybe_publish_prefill_shared_read_done"),
+        ):
+            runner._execute_extend(batch)
+        return batch.attn_dcp_metadata, plan
+
+    def test_only_a_target_extend_plans_the_gather(self):
+        metadata, plan = self._gather_metadata(is_draft_worker=False)
+        self.assertIs(metadata, plan)
+        metadata, _ = self._gather_metadata(is_draft_worker=True)
+        self.assertIsNone(metadata)
 
 
 class TestGetDcpLens(CustomTestCase):
