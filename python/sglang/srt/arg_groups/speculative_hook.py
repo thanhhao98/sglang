@@ -275,6 +275,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 def _validate_dcp_spec(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    if cfg.speculative_dcp_size < 1:
+        raise ValueError(
+            f"--speculative-dcp-size must be at least 1, got {cfg.speculative_dcp_size}."
+        )
+    if cfg.speculative_dcp_size != 1:
+        raise ValueError(
+            "--speculative-dcp-size > 1 is not supported yet: the draft KV cache is "
+            "replicated across the target's DCP ranks."
+        )
+
     if cfg.speculative_algorithm is None or cfg.dcp_size <= 1:
         return
 

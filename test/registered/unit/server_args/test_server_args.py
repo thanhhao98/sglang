@@ -4052,7 +4052,7 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 
 
 class TestDcpSpecValidation(CustomTestCase):
-    """The DCP x speculative-decoding gates."""
+    """--speculative-dcp-size and the DCP x speculative-decoding gates."""
 
     def _validate(self, **fields):
         _validate_dcp_spec(ServerArgs(model_path="dummy", tp_size=8, **fields))
@@ -4101,6 +4101,23 @@ class TestDcpSpecValidation(CustomTestCase):
         """Its draft reads the target's sharded pool, so replication cannot apply."""
         with self.assertRaisesRegex(ValueError, "FROZEN_KV_MTP"):
             self._validate(speculative_algorithm="FROZEN_KV_MTP", dcp_size=8)
+
+    def test_rejects_a_width_above_one(self):
+        with self.assertRaisesRegex(ValueError, "not supported yet"):
+            self._validate(
+                speculative_algorithm="EAGLE3", speculative_dcp_size=2, dcp_size=8
+            )
+
+    def test_the_width_is_checked_even_when_the_gates_below_return(self):
+        """A bad width is rejected on every early-return path."""
+        for fields in (
+            dict(speculative_dcp_size=0, dcp_size=8),
+            dict(speculative_dcp_size=0, dcp_size=1),
+            dict(speculative_dcp_size=0, speculative_algorithm="NGRAM", dcp_size=8),
+        ):
+            with self.subTest(**fields):
+                with self.assertRaisesRegex(ValueError, "at least 1"):
+                    self._validate(**fields)
 
 
 class TestDcpCommBackendDefault(CustomTestCase):
