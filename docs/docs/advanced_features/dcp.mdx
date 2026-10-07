@@ -144,6 +144,8 @@ DCP adds a context-independent decode collective while cutting context-dependent
 
 The draft KV cache is replicated: every DCP rank stores the full draft context. DCP only stripes the target MLA KV, so it saves target cache, not draft cache.
 
+EAGLE and standalone drafts must be chains (`--speculative-eagle-topk 1`): the DCP verify path folds the draft tokens as a linear causal chain. FROZEN_KV_MTP is rejected, because its draft reads the target's striped KV directly instead of owning a replicated pool.
+
 Target verify and decode use the DCP-aware MLA kernel `cutedsl_mla`. It:
 
 1. Builds a rank-local page table from the cyclic token map (`owner(p) = p mod c`).
