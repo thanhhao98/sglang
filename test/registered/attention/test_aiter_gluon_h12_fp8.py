@@ -323,7 +323,7 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
         be = AiterAttnBackend.__new__(AiterAttnBackend)
         be.use_mla_dcp_asm = True
-        be.dcp_world_size = 8
+        be.dcp_size = 8
         be.input_dtype = torch.bfloat16
         be.max_split_per_batch = 64
         be.forward_metadata = mock.Mock(
@@ -389,7 +389,7 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         """DCP>1 without ASM must not allocate persist metadata (main default)."""
         be = self._make_backend()
         be.use_mla_dcp_asm = False
-        be.dcp_world_size = 8
+        be.dcp_size = 8
         self.assertFalse(be._use_mla_decode_persist_metadata())
 
 

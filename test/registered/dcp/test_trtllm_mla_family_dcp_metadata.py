@@ -38,6 +38,8 @@ class _RealVerifyPath(Exception):
 
 def _make_backend(backend_cls, bs: int):
     backend = object.__new__(backend_cls)
+    backend.dcp_size = DCP_SIZE
+    backend.dcp_rank = DCP_RANK
     backend.num_draft_tokens = NUM_DRAFT_TOKENS
     metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.full((bs, 4), -1, dtype=torch.int32, device="cuda"),
@@ -210,6 +212,8 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
             dcp_size=DCP_SIZE if dcp_enabled else 1,
             dcp_rank=DCP_RANK if dcp_enabled else 0,
         )
+        backend.dcp_size = parallel.dcp_size
+        backend.dcp_rank = parallel.dcp_rank
         flashinfer_stub = SimpleNamespace(
             decode=SimpleNamespace(
                 trtllm_batch_decode_with_kv_cache_mla=kernel or (lambda **kw: None)
@@ -316,6 +320,8 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                     base, base + (end - start), dtype=torch.int32, device="cuda"
                 )
         backend = object.__new__(TRTLLMMLABackend)
+        backend.dcp_size = self.DCP_SIZE
+        backend.dcp_rank = self.DCP_RANK
         backend.page_size = self.PAGE_SIZE
         backend.req_to_token = req_to_token
         backend.kv_index_translator = translator
@@ -461,6 +467,8 @@ class TestFusedFp8WriteGate(CustomTestCase):
         parallel = SimpleNamespace(
             dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
         )
+        backend.dcp_size = parallel.attn_dcp_size
+        backend.dcp_rank = parallel.attn_dcp_rank
         layer = SimpleNamespace(
             tp_q_head_num=1, v_head_dim=512, head_dim=576, layer_id=0
         )

@@ -389,6 +389,8 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 needs_cpu_seq_lens=False,
                 kv_index_translator=None,
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
+                dcp_size=1,
+                dcp_rank=0,
             )
 
         fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
@@ -402,6 +404,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 kv_index_translator=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
                 model_config=SimpleNamespace(context_len=2048),
+                is_draft_worker=False,
             ),
             prefill_backend=make_fake("prefill", calls),
             decode_backend=make_fake("decode", calls),

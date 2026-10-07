@@ -363,6 +363,8 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         req_to_token_pool=None,
         kv_index_translator=None,
         needs_cpu_seq_lens=True,
+        dcp_size=1,
+        dcp_rank=0,
     )
     hybrid = HybridLinearAttnBackend(
         full_attn_backend=full,
