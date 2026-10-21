@@ -98,6 +98,13 @@ struct MoeFinalizeAllReduceParams {
   const bf16_t* add_residual = nullptr;
   bf16_t* residual_out = nullptr;
   float norm_weight_offset = 0.0f;  // 1.0 for Gemma RMSNorm
+  // MXFP8 form (kQuant, not mHC) only: every CTA signals the dependent grid's launch
+  // (griddepcontrol.launch_dependents) at its entry, before its PDL wait, instead of
+  // after the epilogue. Caller's promise: the dependent reads nothing before its own
+  // griddepcontrol.wait that this kernel or a kernel before it writes (FlashInfer's
+  // low-latency MXFP8 GEMM, say, which loads only its weights there; they then
+  // overlap this kernel). False (the default) keeps the end trigger only.
+  bool trigger_at_entry = false;
 };
 
 template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
@@ -399,6 +406,20 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
   // this thread's first vector within a row: cluster rank picks the block's chunk,
   // and vector v sits v * kBlockSize further so a warp's accesses stay contiguous
   const auto hvec = cluster_rank * kBlockSize * kVecs + tx;
+
+  // trigger_at_entry: the dependent grid may launch once every CTA of this grid has
+  // signalled or exited, so every CTA, the bumper cluster's included, signals first:
+  // the dependent then starts while this grid waits on its predecessor and
+  // all-reduces. It changes no store of this kernel and no order of its own: its
+  // waits, stores and end trigger below are as without it. The dependent's
+  // griddepcontrol.wait still returns only once this whole grid has completed and
+  // its stores are visible (PTX ISA, griddepcontrol), so it reads every output of
+  // this kernel, the ones stored after the trigger included, after its wait; the
+  // end trigger then repeats the instruction in the same CTA, which the PTX ISA
+  // defines as having no effect past the first.
+  if constexpr (kQuant && !kMhc) {
+    if (params.trigger_at_entry) PDLTriggerSecondary<kUsePDL>();
+  }
 
   // Reading the epoch before the PDL wait can see a predecessor all-reduce
   // mid-flip on this plane; prefetch_metadata defers the wait to finalize_vec.
@@ -826,7 +847,8 @@ struct MoeFinalizeAllReduceKernel {
   /// FlashInfer's mxfp8_quantize rule (mxfp8_quant_vec): `quantized` [T, kHiddenDim]
   /// e4m3 and `scales` [(kHiddenDim / 32) * 128] UE8M0 in the 128x4 swizzle of one
   /// 128-row tile (T <= 128, padding rows zeroed). `out` and `residual_out` are
-  /// run_residual_norm()'s, bit for bit.
+  /// run_residual_norm()'s, bit for bit. `trigger_at_entry`: see
+  /// MoeFinalizeAllReduceParams::trigger_at_entry.
   static void run_residual_norm_quant(
       CommunicatorRef ref,
       TensorView out,
@@ -842,7 +864,8 @@ struct MoeFinalizeAllReduceKernel {
       bool two_shot,
       int64_t vecs_per_thread,
       TensorView quantized,
-      TensorView scales) {
+      TensorView scales,
+      bool trigger_at_entry) {
     static_assert(!kMhc && kQuant && kTopK != 0);
     run_impl(
         ref,
@@ -866,7 +889,9 @@ struct MoeFinalizeAllReduceKernel {
         residual_out,
         weight_offset,
         two_shot,
-        vecs_per_thread);
+        vecs_per_thread,
+        std::nullopt,
+        trigger_at_entry);
   }
 
   /// kTopK == 0: out = RMSNorm(allreduce(input) + add_residual), residual_out the
@@ -883,7 +908,8 @@ struct MoeFinalizeAllReduceKernel {
       bool two_shot,
       int64_t vecs_per_thread,
       TensorView quantized,
-      TensorView scales) {
+      TensorView scales,
+      bool trigger_at_entry) {
     static_assert(!kMhc && kQuant && kTopK == 0);
     run_impl(
         ref,
@@ -907,7 +933,9 @@ struct MoeFinalizeAllReduceKernel {
         residual_out,
         weight_offset,
         two_shot,
-        vecs_per_thread);
+        vecs_per_thread,
+        std::nullopt,
+        trigger_at_entry);
   }
 
   /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
@@ -1035,7 +1063,8 @@ struct MoeFinalizeAllReduceKernel {
       double weight_offset = 0.0,
       bool two_shot = false,
       int64_t vecs_per_thread = 1,
-      std::optional<TensorView> shared_gate = std::nullopt) {
+      std::optional<TensorView> shared_gate = std::nullopt,
+      bool trigger_at_entry = false) {
     using namespace host;
     const auto& comm = *ref.get();
     const auto& push = comm.get_push_obj();
@@ -1182,6 +1211,7 @@ struct MoeFinalizeAllReduceKernel {
             add_residual.has_value() ? static_cast<const bf16_t*>(add_residual.value().data_ptr()) : nullptr,
         .residual_out = add_residual.has_value() ? static_cast<bf16_t*>(residual_out.value().data_ptr()) : nullptr,
         .norm_weight_offset = static_cast<float>(weight_offset),
+        .trigger_at_entry = trigger_at_entry,
     };
 
     const auto has_shared = shared_output.has_value();

@@ -22,7 +22,8 @@ the routed values to BF16, before the collective.
 :func:`moe_finalize_all_reduce_residual_norm_quant` and
 :func:`all_reduce_residual_norm_quant` are the residual + norm entry points that
 also write the MXFP8 (FlashInfer's 128x4 layout) of the normalized output, for a
-consumer GEMM that takes it pre-quantized, at up to 128 rows.
+consumer GEMM that takes it pre-quantized, at up to 128 rows; with
+``trigger_at_entry`` they let that consumer launch (PDL) at their entry.
 """
 
 from __future__ import annotations
@@ -579,6 +580,7 @@ def _moe_finalize_all_reduce_residual_norm_quant_op(
     weight_offset: float,
     two_shot: bool,
     vecs_per_thread: int,
+    trigger_at_entry: bool,
 ) -> None:
     _jit_quant_module(
         world_size, hidden_dim, top_k, cluster_size, expert_weights.dtype
@@ -598,6 +600,7 @@ def _moe_finalize_all_reduce_residual_norm_quant_op(
         vecs_per_thread,
         quantized,
         scales,
+        trigger_at_entry,
     )
 
 
@@ -617,6 +620,7 @@ def _all_reduce_residual_norm_quant_op(
     weight_offset: float,
     two_shot: bool,
     vecs_per_thread: int,
+    trigger_at_entry: bool,
 ) -> None:
     _jit_quant_module(world_size, hidden_dim, 0, cluster_size, torch.bfloat16).run(
         _COMM_MAP[world_size],
@@ -631,6 +635,7 @@ def _all_reduce_residual_norm_quant_op(
         vecs_per_thread,
         quantized,
         scales,
+        trigger_at_entry,
     )
 
 
@@ -654,6 +659,7 @@ def moe_finalize_all_reduce_residual_norm_quant(
     cluster_size: Optional[int] = None,
     two_shot: Optional[bool] = None,
     vecs_per_thread: Optional[int] = None,
+    trigger_at_entry: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`moe_finalize_all_reduce_residual_norm` that also writes the MXFP8 of
     its normalized output (see ``MXFP8_QUANT_MAX_TOKENS``), 1-128 rows.
@@ -662,6 +668,12 @@ def moe_finalize_all_reduce_residual_norm_quant(
     :param quantized: optional ``[T, hidden_dim]`` float8_e4m3fn for its codes.
     :param scales: optional ``[mxfp8_scale_bytes(hidden_dim)]`` uint8 for its
                    128x4-swizzled UE8M0 scales; every byte is written.
+    :param trigger_at_entry: let the next kernel on the stream launch (PDL) at this
+                             kernel's entry instead of after its epilogue. Valid
+                             only when that kernel reads nothing, before its own
+                             PDL wait, that this kernel or a kernel before it
+                             writes (FlashInfer's low-latency MXFP8 GEMM loads
+                             only its weights there). The outputs are the same.
     :returns: ``(normed, residual_out, quantized, scales)``; ``residual_out``
               defaults to ``residual`` (updated in place).
     """
@@ -698,6 +710,7 @@ def moe_finalize_all_reduce_residual_norm_quant(
         1.0 if gemma else 0.0,
         two_shot,
         vecs_per_thread,
+        trigger_at_entry,
     )
     return out, residual_out, quantized, scales
 
@@ -717,10 +730,12 @@ def all_reduce_residual_norm_quant(
     cluster_size: Optional[int] = None,
     two_shot: Optional[bool] = None,
     vecs_per_thread: Optional[int] = None,
+    trigger_at_entry: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`all_reduce_residual_norm` with the residual add and the norm, that also
     writes the MXFP8 of its normalized output, as
-    :func:`moe_finalize_all_reduce_residual_norm_quant` does.
+    :func:`moe_finalize_all_reduce_residual_norm_quant` does (``trigger_at_entry``
+    as there).
 
     :returns: ``(normed, residual_out, quantized, scales)``.
     """
@@ -753,6 +768,7 @@ def all_reduce_residual_norm_quant(
         1.0 if gemma else 0.0,
         two_shot,
         vecs_per_thread,
+        trigger_at_entry,
     )
     return out, residual_out, quantized, scales
 

@@ -1,7 +1,8 @@
 """CPU checks of the MXFP8 epilogue of the push-plane boundary kernel
 (``ops/communication/all_reduce_fusion.py`` over
 ``jit/csrc/distributed/all_reduce_fusion.cuh``): the quant ops' launch plumbing,
-the kernel's scale-tile arithmetic against FlashInfer's 128x4 layout, and two
+the kernel's scale-tile arithmetic against FlashInfer's 128x4 layout, a tripwire on
+the place of the entry trigger (``trigger_at_entry``) in the kernel, and two
 tripwires that keep DSV4's mHC quant entry (``run_mhc_post_combine_norm_quant``)
 on its own NaN rule and host checks, which the epilogue's addition left as they
 were. The GPU test is ``ops/communication/test_all_reduce_residual_norm_quant.py``."""
@@ -85,8 +86,9 @@ class TestQuantOps(CustomTestCase):
                     geometry = ops._norm_launch(
                         4, rows, hidden, finalize, None, None, None
                     )
-                    # weight offset 0 (gemma weight pre-folded), two-shot, vectors
-                    self.assertEqual(args[-3:], (0.0, geometry[0], geometry[1]))
+                    # weight offset 0 (gemma weight pre-folded), two-shot, vectors,
+                    # and the entry trigger off by default
+                    self.assertEqual(args[-4:], (0.0, geometry[0], geometry[1], False))
                     self.assertEqual(args[3 if finalize else 2], geometry[2])
                     self.assertIs(args[4 if finalize else 3], normed)
                     self.assertIs(args[5 if finalize else 4], quantized)
@@ -116,7 +118,7 @@ class TestQuantOps(CustomTestCase):
         self.assertIs(out[1], residual_out)
         self.assertEqual(out[2].data_ptr(), data.data_ptr())
         self.assertIs(out[3], scales)
-        self.assertEqual(op.call_args.args[-3], 1.0)  # Gemma's weight offset
+        self.assertEqual(op.call_args.args[-4], 1.0)  # Gemma's weight offset
         for rows in (0, 129):
             with (
                 self.subTest(rows=rows),
@@ -130,6 +132,38 @@ class TestQuantOps(CustomTestCase):
                     1e-6,
                     world_size=4,
                 )
+
+    def test_the_entry_trigger_reaches_the_kernel(self):
+        hidden = 256
+        residual = torch.zeros(8, hidden, dtype=torch.bfloat16)
+        norm = (torch.ones(hidden, dtype=torch.bfloat16), 1e-6)
+        for early in (False, True):
+            with self.subTest(early=early):
+                with patch.object(ops, "_all_reduce_residual_norm_quant_op") as op:
+                    ops.all_reduce_residual_norm_quant(
+                        residual,
+                        residual,
+                        *norm,
+                        world_size=4,
+                        trigger_at_entry=early,
+                    )
+                self.assertIs(op.call_args.args[-1], early)
+                with patch.object(
+                    ops, "_moe_finalize_all_reduce_residual_norm_quant_op"
+                ) as op:
+                    ops.moe_finalize_all_reduce_residual_norm_quant(
+                        torch.zeros(8 * TOP_K, hidden, dtype=torch.bfloat16),
+                        torch.zeros(8 * TOP_K, dtype=torch.int32),
+                        torch.zeros(8, TOP_K),
+                        TOP_K,
+                        None,
+                        residual,
+                        *norm,
+                        world_size=4,
+                        hidden_dim=hidden,
+                        trigger_at_entry=early,
+                    )
+                self.assertIs(op.call_args.args[-1], early)
 
     def test_build_loads_the_module_each_width_launches(self):
         with patch.object(ops, "_jit_quant_module") as module:
@@ -196,6 +230,44 @@ class TestScaleLayoutArithmetic(CustomTestCase):
                 row = swizzled_row // 4 + (swizzled_row % 4) * 32
                 col = (off // 512) * 4 + off % 4
                 self.assertEqual(_flashinfer_sf_offset(row, col, hidden // 32), off)
+
+
+class TestEntryTrigger(CustomTestCase):
+    """trigger_at_entry: the MXFP8 form's entry trigger is the kernel's first PDL
+    instruction, before its wait and before the bumper cluster branches off, so every
+    CTA executes it; only the non-mHC kQuant entries take the flag, off by default;
+    the end trigger after the epilogue stays."""
+
+    def test_the_kernel_signals_at_entry_only_on_request(self):
+        src = CUH.read_text()
+        self.assertIn("  bool trigger_at_entry = false;\n};", src)
+        body = src[src.index("void moe_finalize_all_reduce_kernel(") :]
+        body = body[: body.index("// --- host")]
+        entry = body.index(
+            "if (params.trigger_at_entry) PDLTriggerSecondary<kUsePDL>();"
+        )
+        self.assertLess(entry, body.index("PDLWaitPrimary"))
+        self.assertLess(entry, body.index("if (row_idx == params.num_tokens)"))
+        self.assertIn(
+            "if constexpr (kQuant && !kMhc) {\n"
+            "    if (params.trigger_at_entry) PDLTriggerSecondary<kUsePDL>();",
+            body,
+        )
+        # the bumper's and the epilogue's triggers are unchanged
+        self.assertEqual(body.count("PDLTriggerSecondary<kUsePDL>()"), 3)
+        self.assertIn("return PDLTriggerSecondary<kUsePDL>();", body)
+        # the host: the two MXFP8 entries pass the flag, everything else the default
+        for entry_name in ("run_residual_norm_quant", "run_plain_quant"):
+            start = src.index(f"static void {entry_name}(")
+            text = src[start : src.index("\n  }\n", start)]
+            self.assertIn("bool trigger_at_entry) {", text)
+            self.assertTrue(
+                text.rstrip().endswith("std::nullopt,\n        trigger_at_entry);"),
+                entry_name,
+            )
+        self.assertEqual(src.count("trigger_at_entry);"), 2)
+        self.assertIn("bool trigger_at_entry = false) {", src)
+        self.assertIn(".trigger_at_entry = trigger_at_entry,", src)
 
 
 def _sha256(text: str) -> str:

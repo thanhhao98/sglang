@@ -9,8 +9,9 @@ Against today's kernel followed by FlashInfer's mxfp8_quantize (cute-dsl, 128x4
 scales, as the qkv|index GEMM quantizes its bf16 input), on the same random inputs at
 every width of a decode step (1-16 and 8-128 rows): residual_out, the bf16 normed row,
 the e4m3 codes and every scale byte, bit for bit, with the outputs pre-filled with
-garbage, and the pair alike on every rank; the same at forced launch geometries (two
-vectors per thread).
+garbage, and the pair alike on every rank, with and without ``trigger_at_entry`` (the
+kernel lets its PDL dependent launch at its entry); the same at forced launch
+geometries (two vectors per thread).
 
 Then in a decode step's launch order: the MXFP8 form's launch from persistent buffers
 followed directly by the qkv|index GEMM on its pair (the boundary kernel is the
@@ -192,8 +193,11 @@ def _stock(inp, finalize, geometry=None):
     return normed, residual_out, q, sf
 
 
-def _quant(inp, finalize, buffers, geometry=None, residual_out=None):
-    """The MXFP8 form of the kernel, writing into ``buffers`` (normed, codes, scales)."""
+def _quant(
+    inp, finalize, buffers, geometry=None, residual_out=None, trigger_at_entry=False
+):
+    """The MXFP8 form of the kernel, writing into ``buffers`` (normed, codes, scales);
+    ``trigger_at_entry``: it signals the next kernel's launch at its entry."""
     from sglang.kernels.ops.communication import all_reduce_fusion as ops
 
     rows = inp["residual"].shape[0]
@@ -206,6 +210,7 @@ def _quant(inp, finalize, buffers, geometry=None, residual_out=None):
         out=normed[:rows],
         quantized=data[:rows],
         scales=scales,
+        trigger_at_entry=trigger_at_entry,
         **launch,
     )
     if finalize:
@@ -314,17 +319,21 @@ def _check_widths(coord, rank, failures, log):
         for rows in ROWS:
             inp = _inputs(rows, rank, finalize, seed=rows)
             want = _stock(inp, finalize)
-            _poison(buffers)
-            got = _quant(inp, finalize, buffers)
-            torch.cuda.synchronize()
-            tag = f"{variant} rows={rows}"
-            if _compare(tag, got, want, failures):
+            ok = True
+            for early in (False, True):
+                _poison(buffers)
+                got = _quant(inp, finalize, buffers, trigger_at_entry=early)
+                torch.cuda.synchronize()
+                tag = f"{variant} rows={rows}{' entry trigger' if early else ''}"
+                ok &= _compare(tag, got, want, failures)
+                _same_on_every_rank(
+                    tag, (("codes", got[2]), ("scales", got[3])), coord, failures
+                )
+            if ok:
                 bitwise.append(rows)
-            _same_on_every_rank(
-                tag, (("codes", got[2]), ("scales", got[3])), coord, failures
-            )
         log(
-            f"{variant}: bitwise (normed, residual_out, e4m3 codes, scales) at rows {bitwise}"
+            f"{variant}: bitwise (normed, residual_out, e4m3 codes, scales), with and "
+            f"without the entry trigger, at rows {bitwise}"
         )
         for rows, *geometry in FORCED:
             inp = _inputs(rows, rank, finalize, seed=1000 + rows)
