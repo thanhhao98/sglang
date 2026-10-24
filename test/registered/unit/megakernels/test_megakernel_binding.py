@@ -1,6 +1,7 @@
 """CPU checks of the megakernel binding: the view is the running forward's attention
 backend and KV pool, and a source replaced after capture is caught."""
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.megakernels import binding as mb
+from sglang.srt.mem_cache.step5_kv_pool import Step5TokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,7 +36,8 @@ class Pool:
 
 
 class Step5Pool(Pool):
-    """The Step-5 pool's DSA indexer state: per FULL layer, SWA ids rejected."""
+    """Step5TokenToKVPool's DSA indexer state under its getters' names (the test pins
+    them to the real pool): per FULL layer, SWA ids rejected."""
 
     full_layers = (3,)
 
@@ -147,6 +150,13 @@ class TestMegakernelBinding(CustomTestCase):
             s5.swa_head_gate
 
     def test_the_kv_pool_view_reads_the_step5_indexer_state(self):
+        # the fake copies the getters' names: pin them to the real pool, called as the
+        # view calls them (pool.<name>(layer_id)), so a rename or a new required
+        # argument there fails here, not at the megakernel's first read
+        for name in STEP5_INDEX_GETTERS:
+            getter = getattr(Step5TokenToKVPool, name, None)
+            self.assertTrue(callable(getter), f"Step5TokenToKVPool.{name}")
+            inspect.signature(getter).bind(None, 3)
         pool = Step5Pool()
         with patch(BACKEND, return_value=backend(pool)):
             kv = mb.MegakernelBinding(model=torch.nn.Module()).forward_view().kv_pool
