@@ -137,6 +137,41 @@ def round_up_to_multiple(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
 
+def deepseek_fp8_moe_input(
+    hidden_states: torch.Tensor, pre_quant, block_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The DeepSeekFp8 activation pair FlashInfer's block-scale MoE takes: E4M3
+    codes ``[T, H]`` and FP32 group scales ``[H / block_k, T]``.
+
+    A caller that already quantized ``hidden_states`` with the same per-token
+    group quant (``column_major_scales=True``) passes ``(q, scale)`` as
+    ``pre_quant``; it is used as given, so the MoE sees the same bytes. Anything
+    else quantizes here."""
+    if not (isinstance(pre_quant, tuple) and len(pre_quant) == 2):
+        a_q, a_sf = per_token_group_quant_fp8(
+            hidden_states, block_k, column_major_scales=True
+        )
+        return a_q, a_sf.t()
+    a_q, a_sf = pre_quant
+    rows, hidden = hidden_states.shape
+    groups = hidden // block_k
+    if (
+        a_q.dtype != torch.float8_e4m3fn
+        or tuple(a_q.shape) != (rows, hidden)
+        or not a_q.is_contiguous()
+        or a_sf.dtype != torch.float32
+        or tuple(a_sf.shape) != (rows, groups)
+        or not a_sf.t().is_contiguous()
+    ):
+        raise ValueError(
+            "a pre-quantized DeepSeekFp8 MoE input must be E4M3 "
+            f"[{rows}, {hidden}] and column-major FP32 scales [{rows}, {groups}]; "
+            f"got {a_q.dtype} {tuple(a_q.shape)} and {a_sf.dtype} "
+            f"{tuple(a_sf.shape)} strides {a_sf.stride()}"
+        )
+    return a_q, a_sf.t()
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
@@ -855,10 +890,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert a_sf_t.dtype == torch.uint8
             assert a_sf_t.shape[1] == hidden_states.shape[1] // 32
         else:
-            a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k, column_major_scales=True
+            a_q, a_sf_t = deepseek_fp8_moe_input(
+                hidden_states,
+                getattr(dispatch_output, "hidden_states_pre_quant", None),
+                quant_info.weight_block_k,
             )
-            a_sf_t = a_sf.t()
 
         symm_output = None
         if not defer_finalize:
