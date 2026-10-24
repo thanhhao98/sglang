@@ -40,6 +40,12 @@ TOLERATED_READS = (
     "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
     "MegakernelBinding.engram_host_table",  # the per-layer host table object
 )
+# Called by a Step-5 megakernel through ForwardView.step5, tolerated until offered as
+# data (its contract test pins it).
+TOLERATED_STEP5_CALLABLES = (
+    "Step5View.swa_kv_write_target",  # the fused q/k-norm + paged SWA K/V store target
+    "Step5View.indexer_metadata",  # a DSA layer's per-forward CSA indexer plan
+)
 
 
 class KvPoolView:
@@ -80,6 +86,41 @@ class KvPoolView:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope
 
 
+class Step5View:
+    """A Step-5 forward's attention decisions and per-forward plans, read from its
+    Step5AttentionBackend (layers/attention/step5_backend.py): what
+    Step5Attention.forward asks the backend, answered by the backend itself."""
+
+    def __init__(self, backend: Any):
+        self._backend = backend
+
+    @property
+    def swa_head_gate(self) -> bool:
+        """Whether the SWA attention applies the head gate in its epilogue."""
+        return self._backend.supports_swa_head_gate()
+
+    @property
+    def dsa_head_gate(self) -> bool:
+        """Whether this forward's sparse-decode merge can apply the head gate."""
+        return self._backend.supports_dsa_head_gate()
+
+    @property
+    def swa_metadata(self) -> Any:
+        """The SWA layers' attention metadata of this forward (FlashAttentionMetadata:
+        swa_page_table, cache_seqlens_int32, cu_seqlens_q, max_seq_len_q); for a graph
+        step these are the buffers the graph replays."""
+        return self._backend.swa_backend.forward_metadata
+
+    def swa_kv_write_target(self, layer: Any) -> Optional[tuple]:
+        """(k_cache [slots, head_dim], v_cache, loc int64) of the fused SWA K/V store,
+        or None when the layer stores through the attention call."""
+        return self._backend.swa_kv_write_target(layer)
+
+    def indexer_metadata(self, layer_id: int, forward_batch: Any) -> Any:
+        """The CSA indexer plan of this forward (Step5IndexerMetadata)."""
+        return self._backend.get_indexer_metadata(layer_id, forward_batch)
+
+
 class ForwardView:
     """The running forward's attention data, read from its attention backend; built
     at capture for a graph step, so its tensors are the ones the graph replays."""
@@ -112,6 +153,11 @@ class ForwardView:
     @property
     def core_compressor(self) -> Callable[..., Any]:
         return self._backend.forward_core_compressor
+
+    @property
+    def step5(self) -> Step5View:
+        """The Step-5 backend's view (a target Step5AttentionBackend only)."""
+        return Step5View(self._backend)
 
 
 class MegakernelBinding:

@@ -74,6 +74,40 @@ class TestMegakernelBinding(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "kv_pool"):
                 binding.assert_live()
 
+    def test_the_step5_view_asks_the_running_step5_backend(self):
+        calls = []
+        layer = SimpleNamespace(layer_id=4)
+        swa = SimpleNamespace(swa_page_table="pages", cache_seqlens_int32="lens")
+        step5_backend = SimpleNamespace(
+            token_to_kv_pool=Pool(),
+            forward_metadata=SimpleNamespace(indexer_metadata="plan"),
+            swa_backend=SimpleNamespace(forward_metadata=swa),
+            supports_swa_head_gate=lambda: True,
+            supports_dsa_head_gate=lambda: False,
+            swa_kv_write_target=lambda l: calls.append(l) or ("k", "v", "loc"),
+            get_indexer_metadata=lambda i, fb: (i, fb, "plan"),
+        )
+        with patch(BACKEND, return_value=step5_backend):
+            view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
+        s5 = view.step5
+        self.assertTrue(s5.swa_head_gate)
+        self.assertFalse(s5.dsa_head_gate)
+        self.assertIs(s5.swa_metadata, swa)
+        self.assertEqual(s5.swa_kv_write_target(layer), ("k", "v", "loc"))
+        self.assertEqual(calls, [layer])
+        self.assertEqual(s5.indexer_metadata(3, "fb"), (3, "fb", "plan"))
+        self.assertEqual(
+            mb.TOLERATED_STEP5_CALLABLES,
+            ("Step5View.swa_kv_write_target", "Step5View.indexer_metadata"),
+        )
+
+    def test_another_backend_fails_only_when_the_step5_view_is_read(self):
+        with patch(BACKEND, return_value=backend(Pool())):
+            view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
+        s5 = view.step5  # a draft's FA4 backend: built lazily, never read
+        with self.assertRaises(AttributeError):
+            s5.swa_head_gate
+
 
 if __name__ == "__main__":
     unittest.main()
