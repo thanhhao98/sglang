@@ -8,6 +8,7 @@ from sglang.kernels.ops.attention.step5.selection_triton import launch as pack_r
 from sglang.kernels.ops.elementwise.deep_select_topk import (
     DEEP_SELECT_INPUT_STRIDE_ALIGNMENT,
     deep_select_topk,
+    deep_select_topk_region_pack,
 )
 
 STEP5_HISTORY_REGIONS = 512
@@ -65,4 +66,45 @@ def step5_select_regions_deepselect(
         req_to_token=req_to_token,
         packed=packed,
         causal_lengths=causal_lengths,
+    )
+
+
+def step5_select_regions_deepselect_fused(
+    scores: torch.Tensor,
+    positions: torch.Tensor,
+    row_to_req: torch.Tensor,
+    packed: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    req_to_token: torch.Tensor,
+    causal_lengths: torch.Tensor,
+    history_lengths: torch.Tensor,
+    topk_ids: torch.Tensor,
+    region_ids: torch.Tensor,
+    history_ready: bool = False,
+) -> None:
+    """step5_select_regions_deepselect with the top-512 and the pack in one launch.
+
+    Same arguments and outputs, bit for bit: the kernel runs DeepSelect's device
+    function with deep_select_topk's config (topk_ids is written identically) and
+    then _pack_regions on the selected ids in the same CTA. Opt-in; the default
+    Step-5 path keeps the two launches. Unready history lengths are still prepared
+    by their own kernel: DeepSelect reads them through the read-only cache, so the
+    fused kernel cannot produce them itself.
+    """
+    if not history_ready:
+        _prepare_history_lengths[(triton.cdiv(positions.numel(), 128),)](
+            positions, row_to_req, history_lengths, positions.numel(), num_warps=4
+        )
+    deep_select_topk_region_pack(
+        scores,
+        history_lengths,
+        topk_ids,
+        positions,
+        row_to_req,
+        req_to_token,
+        region_ids,
+        counts,
+        packed,
+        causal_lengths,
     )
