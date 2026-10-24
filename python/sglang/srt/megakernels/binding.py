@@ -81,6 +81,24 @@ class KvPoolView:
     def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
         return self.pool.get_extra_key_bytes_per_token(layer_id)
 
+    # Step-5 DSA indexer state (Step5TokenToKVPool), per FULL-attention layer; the pool
+    # rejects SWA layer ids.
+    def get_compressed_index_key_buffer(self, layer_id: int) -> torch.Tensor:
+        """Completed R8 compressed index keys, [pages, 8, 1, 256] uint8."""
+        return self.pool.get_compressed_index_key_buffer(layer_id)
+
+    def get_index_key_ring(self, layer_id: int) -> torch.Tensor:
+        """Pending index keys, [request slots, ring, 1, 256] bf16."""
+        return self.pool.get_index_key_ring(layer_id)
+
+    def get_compression_logits_ring(self, layer_id: int) -> torch.Tensor:
+        """Pending compression logits, [request slots, ring, 1, 256] bf16."""
+        return self.pool.get_compression_logits_ring(layer_id)
+
+    def get_index_position_buffer(self, layer_id: int) -> torch.Tensor:
+        """Ring entries' absolute positions (-1: none), [request slots, ring] int64."""
+        return self.pool.get_index_position_buffer(layer_id)
+
     @property
     def set_swa_key_buffer_radix_fused_norm_rope(self) -> Callable[..., None]:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope

@@ -33,6 +33,44 @@ class Pool:
         return kw
 
 
+class Step5Pool(Pool):
+    """The Step-5 pool's DSA indexer state: per FULL layer, SWA ids rejected."""
+
+    full_layers = (3,)
+
+    def __init__(self):
+        super().__init__()
+        self.compressed = {3: torch.zeros(5, 8, 1, 256, dtype=torch.uint8)}
+        self.key_ring = {3: torch.zeros(4, 8, 1, 256, dtype=torch.bfloat16)}
+        self.logits_ring = {3: torch.zeros(4, 8, 1, 256, dtype=torch.bfloat16)}
+        self.ring_positions = {3: torch.full((4, 8), -1, dtype=torch.int64)}
+
+    def _full(self, table, layer_id):
+        if layer_id not in self.full_layers:
+            raise ValueError("Step5 indexer state belongs to FULL attention layers")
+        return table[layer_id]
+
+    def get_compressed_index_key_buffer(self, layer_id):
+        return self._full(self.compressed, layer_id)
+
+    def get_index_key_ring(self, layer_id):
+        return self._full(self.key_ring, layer_id)
+
+    def get_compression_logits_ring(self, layer_id):
+        return self._full(self.logits_ring, layer_id)
+
+    def get_index_position_buffer(self, layer_id):
+        return self._full(self.ring_positions, layer_id)
+
+
+STEP5_INDEX_GETTERS = (
+    "get_compressed_index_key_buffer",
+    "get_index_key_ring",
+    "get_compression_logits_ring",
+    "get_index_position_buffer",
+)
+
+
 def backend(pool):
     return SimpleNamespace(
         token_to_kv_pool=pool,
@@ -107,6 +145,29 @@ class TestMegakernelBinding(CustomTestCase):
         s5 = view.step5  # a draft's FA4 backend: built lazily, never read
         with self.assertRaises(AttributeError):
             s5.swa_head_gate
+
+    def test_the_kv_pool_view_reads_the_step5_indexer_state(self):
+        pool = Step5Pool()
+        with patch(BACKEND, return_value=backend(pool)):
+            kv = mb.MegakernelBinding(model=torch.nn.Module()).forward_view().kv_pool
+        self.assertIs(kv.get_compressed_index_key_buffer(3), pool.compressed[3])
+        self.assertIs(kv.get_index_key_ring(3), pool.key_ring[3])
+        self.assertIs(kv.get_compression_logits_ring(3), pool.logits_ring[3])
+        self.assertIs(kv.get_index_position_buffer(3), pool.ring_positions[3])
+        for name in STEP5_INDEX_GETTERS:
+            # an SWA layer has no indexer state: the pool's own error reaches the caller
+            with self.assertRaisesRegex(ValueError, "FULL attention layers"):
+                getattr(kv, name)(0)
+            # tensors under the pool's own names: data, not a tolerated callable
+            self.assertNotIn(f"KvPoolView.{name}", mb.TOLERATED_CALLABLES)
+
+    def test_another_pool_fails_only_when_a_step5_index_getter_is_read(self):
+        with patch(BACKEND, return_value=backend(Pool())):
+            kv = mb.MegakernelBinding(model=torch.nn.Module()).forward_view().kv_pool
+        self.assertIs(kv.get_swa_key_buffer_radix(0), kv.pool.keys[0])
+        for name in STEP5_INDEX_GETTERS:
+            with self.assertRaises(AttributeError):
+                getattr(kv, name)(3)
 
 
 if __name__ == "__main__":
