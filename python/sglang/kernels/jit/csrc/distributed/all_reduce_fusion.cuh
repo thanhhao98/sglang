@@ -1,7 +1,10 @@
 // Fused deferred-MoE finalize -> 1shot lamport push all-reduce [-> RMSNorm]
 // over the CustomAllReduceV2 push plane, for decode-sized batches (bf16). The
 // hidden width, top_k and cluster geometry are template parameters; the
-// shared-expert add and the RMSNorm epilogue are optional.
+// shared-expert add and the RMSNorm epilogue are optional, and kQuant adds the
+// MXFP8 (FlashInfer's 128x4 layout) of the normalized row to the norm epilogue,
+// kNvfp4 its per-token NVFP4 (FlashInfer's NVFP4QuantizePerTokenKernel, linear
+// scale layout; nvfp4_quant_row).
 //
 // `idx == -1` marks a dropped slot (EP: the token was routed to an expert that
 // is not local) and contributes nothing. Accumulation is fp32 and the bf16
@@ -97,6 +100,18 @@ struct MoeFinalizeAllReduceParams {
   const bf16_t* add_residual = nullptr;
   bf16_t* residual_out = nullptr;
   float norm_weight_offset = 0.0f;  // 1.0 for Gemma RMSNorm
+  // kNvfp4 only (nvfp4_quant_row): the per-token NVFP4 of the normalized row
+  uint8_t* fp4 = nullptr;                   // [num_tokens, kHiddenDim / 2] packed E2M1 codes
+  uint8_t* fp4_scales = nullptr;            // [num_tokens * kHiddenDim / 16] E4M3, linear layout
+  float* token_scales = nullptr;            // [num_tokens]
+  const float* global_scale_inv = nullptr;  // [1]
+  // MXFP8 form (kQuant, not mHC) only: every CTA signals the dependent grid's launch
+  // (griddepcontrol.launch_dependents) at its entry, before its PDL wait, instead of
+  // after the epilogue. Caller's promise: the dependent reads nothing before its own
+  // griddepcontrol.wait that this kernel or a kernel before it writes (FlashInfer's
+  // low-latency MXFP8 GEMM, say, which loads only its weights there; they then
+  // overlap this kernel). False (the default) keeps the end trigger only.
+  bool trigger_at_entry = false;
 };
 
 template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
@@ -133,6 +148,320 @@ SGL_DEVICE void mhc_quant_vec(
     const uint32_t g = hvec / 4;
     const uint32_t off = (g / 4) * 512 + ((token % 32) * 4 + (token / 32) % 4) * 4 + g % 4;
     params.scales[off] = sf;
+  }
+}
+
+/// MXFP8 of one 16B vector (8 bf16) of a normalized row, by FlashInfer's rule
+/// (mxfp8_quantize, cute-dsl backend, 128x4 scales; quantization_cute_dsl_utils.py):
+/// the 4 lanes holding a 32-element group share its amax (PTX max, which skips NaN;
+/// lane xor 1, then xor 2), the UE8M0 scale is the biased exponent of amax / 448
+/// rounded up (float_to_ue8m0_fast: 0 for amax 0, at most 254), and each value is
+/// multiplied by 2^(127 - scale) (ue8m0_to_inv_scale_fast), clamped to [-448, 448]
+/// (min first, so NaN becomes 448 as there) and rounded to nearest e4m3. The scale
+/// byte goes to the 128x4 swizzle of a single 128-row tile; the caller zeros the
+/// tile's padding rows. `hvec` is the vector's index within its row. The mHC entry
+/// keeps mhc_quant_vec, which differs only on NaN: its amax starts at 0 and its
+/// clamp takes the max first, so NaN becomes -448 and an all-NaN group scale 0.
+template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
+SGL_DEVICE void mxfp8_quant_vec(
+    const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params,
+    const StageVec& value,
+    uint32_t token,
+    uint32_t hvec) {
+  using namespace device;
+  fp32x2_t v[4];
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    v[j] = cast<fp32x2_t>(value[j]);
+  }
+  // seeded with the group's own values, so an all-NaN group keeps a NaN amax
+  float amax = fmaxf(fabsf(v[0].x), fabsf(v[0].y));
+#pragma unroll
+  for (uint32_t j = 1; j < 4; ++j) {
+    amax = fmaxf(amax, fmaxf(fabsf(v[j].x), fabsf(v[j].y)));
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 4));
+  const float normalized = amax * (1.0f / 448.0f);
+  const uint32_t bits = __float_as_uint(normalized);
+  const uint32_t exponent = (bits >> 23) & 255;
+  const uint32_t mantissa = bits & 0x7fffff;
+  const bool bump = mantissa != 0 && !(exponent == 0 && mantissa <= 0x400000);
+  const uint32_t sf = normalized <= 0 ? 0 : min(exponent + uint32_t(bump), 254u);
+  const float inv_scale = __uint_as_float(sf == 0 ? 0 : (254 - sf) << 23);
+  AlignedVector<fp8x2_e4m3_t, 4> q;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    q[j] = cast<fp8x2_e4m3_t>(
+        fp32x2_t{fmaxf(fminf(v[j].x * inv_scale, 448.0f), -448.0f), fmaxf(fminf(v[j].y * inv_scale, 448.0f), -448.0f)});
+  }
+  q.store(params.quantized + static_cast<int64_t>(token) * kHiddenDim, hvec);
+  if (hvec % 4 == 0) {
+    const uint32_t g = hvec / 4;
+    const uint32_t off = (g / 4) * 512 + ((token % 32) * 4 + (token / 32) % 4) * 4 + g % 4;
+    params.scales[off] = sf;
+  }
+}
+
+// --- the per-token NVFP4 of a normalized row (kNvfp4) -------------------------
+// FlashInfer's NVFP4QuantizePerTokenKernel (flashinfer/quantization/kernels/
+// nvfp4_quantize.py, 0.7.0) of a bf16 row, in the configuration SGLang's routed MoE
+// runs it in (fast math: FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH unset; no 4over6:
+// FLASHINFER_NVFP4_4OVER6 unset; linear scale layout), bit for bit: the same PTX in
+// the same order, every instruction FlashInfer writes as inline PTX copied from
+// there (cute_dsl/fp4_common.py, quantization/quantization_cute_dsl_utils.py).
+// FlashInfer runs one CTA per row; here the row's cluster does, each thread with the
+// 16B vectors (8 values) of the row it holds:
+//   row_amax = max(0, |x|) over the row: max.f32, which returns the other operand of
+//     a NaN, so the order is free (FlashInfer: per-thread, warp, block reductions);
+//   row_amax == 0: per_token = 0, encode = FLT_MAX; else per_token = row_amax *
+//     global_scale_inv, encode = rcp.approx.ftz(per_token)  (_row_scales);
+//   per 16 values, two adjacent lanes' vectors: block_max = the max.bf16x2 tree over
+//     |x| (bfloat2_max_abs_8: words 0-3 of the first vector, 4-7 of the second, the
+//     first lane's half first) then max.f32 of its halves; scale = encode *
+//     (block_max * rcp.approx.ftz(6)), to e4m3 (cvt.rn.satfinite); the output scale
+//     rcp.approx.ftz(e4m3 * rcp.approx.ftz(encode)), 0 for a zero scale
+//     (nvfp4_compute_output_scale); each value times it (mul.f32) to e2m1
+//     (cvt.rn.satfinite.e2m1x2).
+// The compare and the three multiplies FlashInfer leaves to CuTe-DSL (plain Python
+// `==` and `*`) are setp.eq / mul.rn here, with .ftz under kFtz: which one the DSL
+// emits is not in the source, and the two differ only on rows whose amax is below
+// about 3e-32, so a caller probes FlashInfer's kernel for it (Nvfp4RowQuantKernel).
+namespace nvfp4 {
+
+template <bool kFtz>
+SGL_DEVICE float mul(float a, float b) {
+  float r;
+  if constexpr (kFtz) {
+    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  } else {
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  }
+  return r;
+}
+
+template <bool kFtz>
+SGL_DEVICE bool is_zero(float a) {
+  uint32_t r;
+  if constexpr (kFtz) {
+    asm("{\n.reg .pred p;\nsetp.eq.ftz.f32 p, %1, 0f00000000;\nselp.u32 %0, 1, 0, p;\n}" : "=r"(r) : "f"(a));
+  } else {
+    asm("{\n.reg .pred p;\nsetp.eq.f32 p, %1, 0f00000000;\nselp.u32 %0, 1, 0, p;\n}" : "=r"(r) : "f"(a));
+  }
+  return r != 0;
+}
+
+// fp4_common.py rcp_approx_ftz
+SGL_DEVICE float rcp_approx_ftz(float a) {
+  float r;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+
+// fp4_common.py fmax_f32
+SGL_DEVICE float max_f32(float a, float b) {
+  float r;
+  asm("max.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+// fp4_common.py bfloat2_hmax2
+SGL_DEVICE uint32_t max_bf16x2(uint32_t a, uint32_t b) {
+  uint32_t r;
+  asm("max.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+// quantization_cute_dsl_utils.py bfloat2_hmax_reduce_to_f32
+SGL_DEVICE float hmax_to_f32(uint32_t x) {
+  float r;
+  asm("{\n"
+      ".reg .b32 lo, hi;\n"
+      ".reg .f32 f0, f1;\n"
+      "and.b32 lo, %1, 0xFFFF;\n"
+      "shr.b32 hi, %1, 16;\n"
+      "shl.b32 lo, lo, 16;\n"
+      "shl.b32 hi, hi, 16;\n"
+      "mov.b32 f0, lo;\n"
+      "mov.b32 f1, hi;\n"
+      "max.f32 %0, f0, f1;\n"
+      "}"
+      : "=f"(r)
+      : "r"(x));
+  return r;
+}
+
+// fp4_common.py cvt_f32_to_e4m3: the e4m3 code in the low byte
+SGL_DEVICE uint32_t cvt_f32_to_e4m3(float a) {
+  uint32_t r;
+  asm("{\n"
+      ".reg .b16 fp8_pair;\n"
+      ".reg .f32 zero;\n"
+      "mov.f32 zero, 0f00000000;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 fp8_pair, zero, %1;\n"
+      "cvt.u32.u16 %0, fp8_pair;\n"
+      "}"
+      : "=r"(r)
+      : "f"(a));
+  return r;
+}
+
+// fp4_common.py nvfp4_compute_output_scale
+SGL_DEVICE float output_scale(uint32_t fp8, float global_scale) {
+  float r;
+  asm("{\n"
+      ".reg .pred p_zero;\n"
+      ".reg .b16 fp8_pair;\n"
+      ".reg .b32 h2_32;\n"
+      ".reg .b16 h_lo, h_hi;\n"
+      ".reg .f32 scale_f32, rcp_gs, product, result;\n"
+      "cvt.u16.u32 fp8_pair, %1;\n"
+      "cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;\n"
+      "mov.b32 {h_lo, h_hi}, h2_32;\n"
+      "cvt.f32.f16 scale_f32, h_lo;\n"
+      "rcp.approx.ftz.f32 rcp_gs, %2;\n"
+      "mul.f32 product, scale_f32, rcp_gs;\n"
+      "rcp.approx.ftz.f32 result, product;\n"
+      "setp.eq.f32 p_zero, scale_f32, 0f00000000;\n"
+      "selp.f32 %0, 0f00000000, result, p_zero;\n"
+      "}"
+      : "=f"(r)
+      : "r"(fp8), "f"(global_scale));
+  return r;
+}
+
+// quantization_cute_dsl_utils.py bfloat2_to_float2_scaled: a bf16 pair to f32, each
+// times `scale`
+SGL_DEVICE void scaled_pair(uint32_t bf2, float scale, float& lo, float& hi) {
+  asm("{\n"
+      ".reg .b32 lo, hi;\n"
+      ".reg .f32 f0, f1;\n"
+      "and.b32 lo, %2, 0xFFFF;\n"
+      "shr.b32 hi, %2, 16;\n"
+      "shl.b32 lo, lo, 16;\n"
+      "shl.b32 hi, hi, 16;\n"
+      "mov.b32 f0, lo;\n"
+      "mov.b32 f1, hi;\n"
+      "mul.f32 %0, f0, %3;\n"
+      "mul.f32 %1, f1, %3;\n"
+      "}"
+      : "=f"(lo), "=f"(hi)
+      : "r"(bf2), "f"(scale));
+}
+
+// quantization_cute_dsl_utils.py bfloat2x8_to_e2m1x16_packed, one half: the 8 values
+// of 4 bf16 pairs times `scale` to 8 E2M1 codes (cvt_e2m1x8_f32; value 0 in the low
+// nibble of byte 0)
+SGL_DEVICE uint32_t e2m1x8(const uint32_t (&w)[4], float scale) {
+  float s[8];
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    scaled_pair(w[i], scale, s[2 * i], s[2 * i + 1]);
+  }
+  uint32_t r;
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  asm("{\n"
+      ".reg .b8 byte0, byte1, byte2, byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(r)
+      : "f"(s[0]), "f"(s[1]), "f"(s[2]), "f"(s[3]), "f"(s[4]), "f"(s[5]), "f"(s[6]), "f"(s[7]));
+#else
+  // Never compiled into a kernel: nvfp4_quant_row, the only caller, fails the build
+  // without SGL_ARCH_BLACKWELL_OR_GREATER (and require_nvfp4_arch declines first)
+  r = 0;
+  __trap();
+#endif
+  return r;
+}
+
+}  // namespace nvfp4
+
+/// FlashInfer's per-token NVFP4 quantize (above) of row `token`, of which this thread
+/// holds the kVecs 16B vectors `vec0 + v * kBlockSize` (`row[v]`). Every thread of the
+/// row's cluster calls it: the row's amax goes through `smem_amax` (a cluster
+/// barrier). Writes the vector's 4 code bytes (`fp4`: [T, kHiddenDim / 2]), the
+/// block's e4m3 scale from the first lane of each pair (`scales`: [T * kHiddenDim /
+/// 16], linear), and the per-token scale from the cluster's thread 0 (`token_scale`).
+template <uint32_t kHiddenDim, uint32_t kClusterSize, uint32_t kBlockSize, uint32_t kVecs, bool kFtz>
+SGL_DEVICE void nvfp4_quant_row(
+    const StageVec (&row)[kVecs],
+    uint32_t token,
+    uint32_t vec0,
+    uint32_t cluster_rank,
+    float (&smem_amax)[kClusterSize][kBlockSize / device::kWarpThreads],
+    uint8_t* fp4,
+    uint8_t* scales,
+    float* token_scale,
+    const float* global_scale_inv) {
+  namespace cg = cooperative_groups;
+  using namespace device;
+  static_assert(kHiddenDim % 16 == 0 && kBlockSize % kWarpThreads == 0 && kClusterSize <= kWarpThreads);
+  // e2m1x8's conversions need SM100+ and a CUDA 12.9+ nvcc (the macro); elsewhere the
+  // build fails here, as a module that cannot load, instead of a kernel that traps
+  static_assert(
+      SGL_ARCH_BLACKWELL_OR_GREATER || host::dependent_false_v<std::integral_constant<uint32_t, kHiddenDim>>,
+      "the NVFP4 epilogue needs SGL_ARCH_BLACKWELL_OR_GREATER (SM100+, CUDA 12.9+)");
+  constexpr uint32_t kNumWarps = kBlockSize / kWarpThreads;
+  constexpr uint32_t kAbs = 0x7fff7fffu;  // bfloat2_habs2
+  uint32_t bits[kVecs][4];
+  float amax = 0.0f;
+#pragma unroll
+  for (uint32_t v = 0; v < kVecs; ++v) {
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      bits[v][j] = reinterpret_cast<const uint32_t*>(row[v].data())[j];
+      amax = nvfp4::max_f32(amax, nvfp4::hmax_to_f32(bits[v][j] & kAbs));
+    }
+  }
+#pragma unroll
+  for (uint32_t offset = kWarpThreads / 2; offset > 0; offset /= 2) {
+    amax = nvfp4::max_f32(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+  }
+  // every warp's amax to every block of the cluster, as the norm's sum of squares
+  const uint32_t lane = threadIdx.x % kWarpThreads;
+  const uint32_t warp = threadIdx.x / kWarpThreads;
+  const auto cluster = cg::this_cluster();
+  if (lane < kClusterSize) {
+    *cluster.map_shared_rank(&smem_amax[cluster_rank][warp], lane) = amax;
+  }
+  cluster.sync();
+  float row_amax = 0.0f;
+#pragma unroll
+  for (uint32_t c = 0; c < kClusterSize; ++c) {
+#pragma unroll
+    for (uint32_t w = 0; w < kNumWarps; ++w) {
+      row_amax = nvfp4::max_f32(row_amax, smem_amax[c][w]);
+    }
+  }
+  float per_token = 0.0f;
+  float encode = __uint_as_float(0x7f7fffffu);  // FLOAT32_MAX
+  if (!nvfp4::is_zero<kFtz>(row_amax)) {
+    per_token = nvfp4::mul<kFtz>(row_amax, *global_scale_inv);
+    encode = nvfp4::rcp_approx_ftz(per_token);
+  }
+  if (cluster_rank == 0 && threadIdx.x == 0) token_scale[token] = per_token;
+  const float fp4_max_rcp = nvfp4::rcp_approx_ftz(6.0f);
+#pragma unroll
+  for (uint32_t v = 0; v < kVecs; ++v) {
+    const uint32_t vec = vec0 + v * kBlockSize;
+    const bool first = vec % 2 == 0;
+    const uint32_t mine = nvfp4::max_bf16x2(
+        nvfp4::max_bf16x2(bits[v][0] & kAbs, bits[v][1] & kAbs),
+        nvfp4::max_bf16x2(bits[v][2] & kAbs, bits[v][3] & kAbs));
+    const uint32_t other = __shfl_xor_sync(0xffffffffu, mine, 1);
+    const float block_max = nvfp4::hmax_to_f32(first ? nvfp4::max_bf16x2(mine, other) : nvfp4::max_bf16x2(other, mine));
+    const float scale = nvfp4::mul<kFtz>(encode, nvfp4::mul<kFtz>(block_max, fp4_max_rcp));
+    const uint32_t scale_fp8 = nvfp4::cvt_f32_to_e4m3(scale);
+    const uint32_t codes = nvfp4::e2m1x8(bits[v], nvfp4::output_scale(scale_fp8, encode));
+    reinterpret_cast<uint32_t*>(fp4 + static_cast<int64_t>(token) * (kHiddenDim / 2))[vec] = codes;
+    if (first) {
+      scales[static_cast<int64_t>(token) * (kHiddenDim / 16) + vec / 2] = static_cast<uint8_t>(scale_fp8 & 0xffu);
+    }
   }
 }
 
@@ -325,7 +654,9 @@ template <
     bool kCollapse = false,
     bool kTwoShot = false,
     uint32_t kVecs = 1,
-    bool kGatedShared = false>
+    bool kGatedShared = false,
+    bool kNvfp4 = false,
+    bool kNvfp4Ftz = false>
 __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
         const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
@@ -334,6 +665,9 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
   using T = RowClusterTrait<kHiddenDim, kClusterSize, kVecs>;
   static_assert(!kTwoShot || !kMhc, "two-shot has no mHC epilogue");
   static_assert(kVecs == 1 || (kNorm && !kMhc), "several vectors per thread is a norm-epilogue path");
+  // FlashInfer pads the scale columns to a multiple of 4; none here, so every byte is written
+  static_assert(!kQuant || kHiddenDim % 128 == 0, "the MXFP8 epilogue needs whole 4-column scale groups");
+  static_assert(!kNvfp4 || (!kMhc && kHiddenDim % 16 == 0), "the NVFP4 epilogue quantizes whole 16-value blocks");
   constexpr uint32_t kRowVecs = T::kRowVecs;
   constexpr uint32_t kBlockSize = T::kBlockSize;
   constexpr uint32_t kNumWarps = T::kNumWarps;
@@ -345,6 +679,20 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
   // and vector v sits v * kBlockSize further so a warp's accesses stay contiguous
   const auto hvec = cluster_rank * kBlockSize * kVecs + tx;
 
+  // trigger_at_entry: the dependent grid may launch once every CTA of this grid has
+  // signalled or exited, so every CTA, the bumper cluster's included, signals first:
+  // the dependent then starts while this grid waits on its predecessor and
+  // all-reduces. It changes no store of this kernel and no order of its own: its
+  // waits, stores and end trigger below are as without it. The dependent's
+  // griddepcontrol.wait still returns only once this whole grid has completed and
+  // its stores are visible (PTX ISA, griddepcontrol), so it reads every output of
+  // this kernel, the ones stored after the trigger included, after its wait; the
+  // end trigger then repeats the instruction in the same CTA, which the PTX ISA
+  // defines as having no effect past the first.
+  if constexpr (kQuant && !kMhc) {
+    if (params.trigger_at_entry) PDLTriggerSecondary<kUsePDL>();
+  }
+
   // Reading the epoch before the PDL wait can see a predecessor all-reduce
   // mid-flip on this plane; prefetch_metadata defers the wait to finalize_vec.
   if (!params.prefetch_metadata) PDLWaitPrimary<kUsePDL>();
@@ -352,9 +700,11 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
   if (row_idx == params.num_tokens) {
     PDLWaitPrimary<kUsePDL>();
     if constexpr (kQuant) {
-      // The SF buffer is padded to 128 rows. Active rows are written by the
-      // norm epilogue; the existing bumper zeros only the disjoint padding.
-      for (uint32_t off = hvec; off < (kHiddenDim / 32) * 128; off += kRowVecs) {
+      // The SF tile is padded to 128 rows. Active rows are written by the norm
+      // epilogue; the bumper zeros only the disjoint padding rows, as FlashInfer
+      // does. One pass of the cluster's threads covers kRowVecs / kVecs bytes.
+      for (uint32_t off = cluster_rank * kBlockSize + tx; off < (kHiddenDim / 32) * 128;
+           off += kClusterSize * kBlockSize) {
         const uint32_t swizzled_row = (off % 512) / 4;
         const uint32_t row = swizzled_row / 4 + (swizzled_row % 4) * 32;
         if (row >= params.num_tokens) params.scales[off] = 0;
@@ -538,6 +888,7 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     }
     const auto factor = math::rsqrt(total / static_cast<float>(kHiddenDim) + params.norm_eps);
     const auto off = params.norm_weight_offset;
+    [[maybe_unused]] StageVec normed[kVecs];
 #pragma unroll
     for (uint32_t v = 0; v < kVecs; ++v) {
       StageVec w;
@@ -549,7 +900,28 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
         out[j] = cast<bf16x2_t>(fp32x2_t{acc[v][j].x * factor * (wa + off), acc[v][j].y * factor * (wb + off)});
       }
       ptx::st_global_16B(out, kMhc ? params.normalized : params.out, vid[v]);
-      if constexpr (kQuant) mhc_quant_vec<kHiddenDim>(params, out, row_idx, hvec);
+      // the mHC entry keeps its own NaN rule (mhc_quant_vec, one vector per thread)
+      if constexpr (kQuant) {
+        if constexpr (kMhc) {
+          mhc_quant_vec<kHiddenDim>(params, out, row_idx, hvec);
+        } else {
+          mxfp8_quant_vec<kHiddenDim>(params, out, row_idx, hvec + v * kBlockSize);
+        }
+      }
+      if constexpr (kNvfp4) normed[v] = out;
+    }
+    if constexpr (kNvfp4) {
+      __shared__ float smem_amax[kClusterSize][kNumWarps];
+      nvfp4_quant_row<kHiddenDim, kClusterSize, kBlockSize, kVecs, kNvfp4Ftz>(
+          normed,
+          row_idx,
+          hvec,
+          cluster_rank,
+          smem_amax,
+          params.fp4,
+          params.fp4_scales,
+          params.token_scales,
+          params.global_scale_inv);
     }
   }
   PDLTriggerSecondary<kUsePDL>();
@@ -584,7 +956,9 @@ template <
     bool kMhc = false,
     bool kQuant = false,
     bool kCollapse = false,
-    bool kGatedShared = false>
+    bool kGatedShared = false,
+    bool kNvfp4 = false,
+    bool kNvfp4Ftz = false>
 struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
@@ -607,7 +981,9 @@ struct MoeFinalizeAllReduceKernel {
       kCollapse,
       kTwoShot,
       kVecs,
-      kGatedShared>;
+      kGatedShared,
+      kNvfp4,
+      kNvfp4Ftz>;
   static constexpr bool kTwoVecsFit = Trait::kRowVecs % (kClusterSize * 2 * device::kWarpThreads) == 0;
 
  public:
@@ -624,7 +1000,7 @@ struct MoeFinalizeAllReduceKernel {
       std::optional<TensorView> norm_weight,
       double eps,
       bool prefetch_metadata) {
-    static_assert(!kMhc);
+    static_assert(!kMhc && !kQuant && !kNvfp4);
     run_impl(
         ref,
         out,
@@ -650,7 +1026,7 @@ struct MoeFinalizeAllReduceKernel {
       TensorView expert_weights,
       TensorView shared_output,
       TensorView shared_gate) {
-    static_assert(kGatedShared && !kMhc);
+    static_assert(kGatedShared && !kMhc && !kNvfp4);
     run_impl(
         ref,
         out,
@@ -694,7 +1070,7 @@ struct MoeFinalizeAllReduceKernel {
       double weight_offset,
       bool two_shot,
       int64_t vecs_per_thread) {
-    static_assert(!kMhc && kTopK != 0);
+    static_assert(!kMhc && !kQuant && !kNvfp4 && kTopK != 0);
     run_impl(
         ref,
         out,
@@ -732,7 +1108,7 @@ struct MoeFinalizeAllReduceKernel {
       double weight_offset,
       bool two_shot,
       int64_t vecs_per_thread) {
-    static_assert(!kMhc && kTopK == 0);
+    static_assert(!kMhc && !kQuant && !kNvfp4 && kTopK == 0);
     run_impl(
         ref,
         out,
@@ -756,6 +1132,164 @@ struct MoeFinalizeAllReduceKernel {
         weight_offset,
         two_shot,
         vecs_per_thread);
+  }
+
+  /// run_residual_norm() that also writes the MXFP8 of the normalized output, by
+  /// FlashInfer's mxfp8_quantize rule (mxfp8_quant_vec): `quantized` [T, kHiddenDim]
+  /// e4m3 and `scales` [(kHiddenDim / 32) * 128] UE8M0 in the 128x4 swizzle of one
+  /// 128-row tile (T <= 128, padding rows zeroed). `out` and `residual_out` are
+  /// run_residual_norm()'s, bit for bit. `trigger_at_entry`: see
+  /// MoeFinalizeAllReduceParams::trigger_at_entry.
+  static void run_residual_norm_quant(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      TensorView norm_weight,
+      double eps,
+      TensorView add_residual,
+      TensorView residual_out,
+      double weight_offset,
+      bool two_shot,
+      int64_t vecs_per_thread,
+      TensorView quantized,
+      TensorView scales,
+      bool trigger_at_entry) {
+    static_assert(!kMhc && kQuant && !kNvfp4 && kTopK != 0);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        eps,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        quantized,
+        scales,
+        add_residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        trigger_at_entry);
+  }
+
+  /// kTopK == 0: out = RMSNorm(allreduce(input) + add_residual), residual_out the
+  /// sum, plus the MXFP8 of `out` as in run_residual_norm_quant().
+  static void run_plain_quant(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView input,
+      TensorView norm_weight,
+      double eps,
+      TensorView add_residual,
+      TensorView residual_out,
+      double weight_offset,
+      bool two_shot,
+      int64_t vecs_per_thread,
+      TensorView quantized,
+      TensorView scales,
+      bool trigger_at_entry) {
+    static_assert(!kMhc && kQuant && !kNvfp4 && kTopK == 0);
+    run_impl(
+        ref,
+        out,
+        input,
+        input,
+        input,
+        std::nullopt,
+        norm_weight,
+        eps,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        quantized,
+        scales,
+        add_residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        trigger_at_entry);
+  }
+
+  /// run_plain_quant() that also writes the per-token NVFP4 of `out`, as FlashInfer's
+  /// NVFP4QuantizePerTokenKernel does with `global_scale_inv` [1] fp32 in the linear
+  /// layout (nvfp4_quant_row; kNvfp4Ftz: the subnormal mode the caller found FlashInfer's
+  /// kernel to have): `fp4` [T, kHiddenDim / 2] packed e2m1 codes, `fp4_scales`
+  /// [T * kHiddenDim / 16] e4m3 block scales, `token_scales` [T] fp32; every byte of
+  /// the T rows written. `out`, `residual_out`, `quantized` and `scales` are
+  /// run_plain_quant()'s, bit for bit.
+  static void run_plain_quant_nvfp4(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView input,
+      TensorView norm_weight,
+      double eps,
+      TensorView add_residual,
+      TensorView residual_out,
+      double weight_offset,
+      bool two_shot,
+      int64_t vecs_per_thread,
+      TensorView quantized,
+      TensorView scales,
+      TensorView fp4,
+      TensorView fp4_scales,
+      TensorView token_scales,
+      TensorView global_scale_inv) {
+    static_assert(!kMhc && kQuant && kNvfp4 && kTopK == 0);
+    run_impl(
+        ref,
+        out,
+        input,
+        input,
+        input,
+        std::nullopt,
+        norm_weight,
+        eps,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        quantized,
+        scales,
+        add_residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        std::nullopt,
+        fp4,
+        fp4_scales,
+        token_scales,
+        global_scale_inv);
   }
 
   /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
@@ -883,7 +1417,12 @@ struct MoeFinalizeAllReduceKernel {
       double weight_offset = 0.0,
       bool two_shot = false,
       int64_t vecs_per_thread = 1,
-      std::optional<TensorView> shared_gate = std::nullopt) {
+      std::optional<TensorView> shared_gate = std::nullopt,
+      std::optional<TensorView> fp4 = std::nullopt,
+      std::optional<TensorView> fp4_scales = std::nullopt,
+      std::optional<TensorView> token_scales = std::nullopt,
+      std::optional<TensorView> global_scale_inv = std::nullopt,
+      bool trigger_at_entry = false) {
     using namespace host;
     const auto& comm = *ref.get();
     const auto& push = comm.get_push_obj();
@@ -945,7 +1484,23 @@ struct MoeFinalizeAllReduceKernel {
           .verify(norm_weight.value());
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
-    if constexpr (kQuant) {
+    if constexpr (kQuant && !kMhc) {
+      CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
+      CHECK_HOST(norm_weight.has_value()) << "the quant epilogue quantizes the normalized row";
+      CHECK_HOST(quantized.has_value() && scales.has_value()) << "the quant epilogue needs its outputs";
+      TensorMatcher({T, kHiddenDim})
+          .with_strides({kHiddenDim, 1})
+          .with_dtype<fp8_e4m3_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(quantized.value());
+      TensorMatcher({(kHiddenDim / 32) * 128})
+          .with_strides({1})
+          .with_dtype<uint8_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(scales.value());
+    }
+    // DeepSeek-V4's mHC entry keeps the checks it shipped with
+    if constexpr (kQuant && kMhc) {
       CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
       CHECK_HOST(norm_weight.has_value());
       TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(quantized.value());
@@ -953,6 +1508,24 @@ struct MoeFinalizeAllReduceKernel {
           .with_dtype<uint8_t>()
           .with_device<kDLCUDA>(device)
           .verify(scales.value());
+    }
+    if constexpr (kNvfp4) {
+      CHECK_HOST(norm_weight.has_value()) << "the NVFP4 epilogue quantizes the normalized row";
+      CHECK_HOST(fp4.has_value() && fp4_scales.has_value() && token_scales.has_value() && global_scale_inv.has_value())
+          << "the NVFP4 epilogue needs its outputs and global scale";
+      TensorMatcher({T, kHiddenDim / 2})
+          .with_strides({kHiddenDim / 2, 1})
+          .with_dtype<uint8_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(fp4.value());
+      auto SF = SymbolicSize{"num_nvfp4_scales"};
+      SF.set_value(T.unwrap() * (kHiddenDim / 16));
+      TensorMatcher({SF}).with_strides({1}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(
+          fp4_scales.value());
+      TensorMatcher({T}).with_strides({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(
+          token_scales.value());
+      TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(global_scale_inv.value());
+      CHECK_HOST(reinterpret_cast<uintptr_t>(fp4.value().data_ptr()) % 4 == 0) << "fp4 must be 4B aligned";
     }
     if constexpr (kMhc) {
       static_assert(kHiddenDim == 5120);
@@ -983,6 +1556,10 @@ struct MoeFinalizeAllReduceKernel {
     CHECK_HOST(num_tokens <= push.num_blocks)
         << "num_tokens = " << num_tokens << " exceeds the " << push.num_blocks << " push phase counters of the plane";
     const uint32_t num_clusters = num_tokens + (num_tokens < push.num_blocks ? 1 : 0);
+    if constexpr (kQuant && !kMhc) {
+      CHECK_HOST(num_tokens == 128 || num_tokens < push.num_blocks)
+          << "the bumper cluster zeros the scale tile's padding rows; the plane has no counter left for it";
+    }
 
     const auto params = Params{
         .out = static_cast<bf16_t*>(out.data_ptr()),
@@ -1010,6 +1587,12 @@ struct MoeFinalizeAllReduceKernel {
             add_residual.has_value() ? static_cast<const bf16_t*>(add_residual.value().data_ptr()) : nullptr,
         .residual_out = add_residual.has_value() ? static_cast<bf16_t*>(residual_out.value().data_ptr()) : nullptr,
         .norm_weight_offset = static_cast<float>(weight_offset),
+        .fp4 = fp4.has_value() ? static_cast<uint8_t*>(fp4.value().data_ptr()) : nullptr,
+        .fp4_scales = fp4_scales.has_value() ? static_cast<uint8_t*>(fp4_scales.value().data_ptr()) : nullptr,
+        .token_scales = token_scales.has_value() ? static_cast<float*>(token_scales.value().data_ptr()) : nullptr,
+        .global_scale_inv =
+            global_scale_inv.has_value() ? static_cast<const float*>(global_scale_inv.value().data_ptr()) : nullptr,
+        .trigger_at_entry = trigger_at_entry,
     };
 
     const auto has_shared = shared_output.has_value();
@@ -1036,6 +1619,103 @@ struct MoeFinalizeAllReduceKernel {
     // __cluster_dims__(1, kClusterSize, 1) is compiled in, so a plain launch
     // already forms the clusters along y
     LaunchKernel(dim3(num_clusters, kClusterSize), block_size, out.device()).enable_pdl(kUsePDL)(kern, params);
+  }
+};
+
+// --- the NVFP4 epilogue on rows from memory ------------------------------------
+// nvfp4_quant_row on bf16 rows read from global memory, each row by one cluster laid
+// out as the norm epilogue lays out a row (kClusterSize blocks, kVecs 16B vectors a
+// thread), without a push plane: a caller checks the epilogue's arithmetic against
+// FlashInfer's kernel with it (and picks kNvfp4Ftz), and the tests use it.
+
+struct Nvfp4RowQuantParams {
+  const bf16_t* input;  // [num_tokens, kHiddenDim]
+  uint8_t* fp4;
+  uint8_t* scales;
+  float* token_scales;
+  const float* global_scale_inv;
+};
+
+template <uint32_t kHiddenDim, uint32_t kClusterSize, uint32_t kVecs, bool kFtz>
+__global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::kBlockSize) __cluster_dims__(
+    1, kClusterSize, 1) void nvfp4_row_quant_kernel(const __grid_constant__ Nvfp4RowQuantParams params) {
+  using T = RowClusterTrait<kHiddenDim, kClusterSize, kVecs>;
+  const uint32_t token = blockIdx.x;
+  const uint32_t cluster_rank = blockIdx.y;
+  const uint32_t vec0 = cluster_rank * T::kBlockSize * kVecs + threadIdx.x;
+  StageVec row[kVecs];
+#pragma unroll
+  for (uint32_t v = 0; v < kVecs; ++v) {
+    row[v].load(params.input + static_cast<int64_t>(token) * kHiddenDim, vec0 + v * T::kBlockSize);
+  }
+  __shared__ float smem_amax[kClusterSize][T::kNumWarps];
+  nvfp4_quant_row<kHiddenDim, kClusterSize, T::kBlockSize, kVecs, kFtz>(
+      row,
+      token,
+      vec0,
+      cluster_rank,
+      smem_amax,
+      params.fp4,
+      params.scales,
+      params.token_scales,
+      params.global_scale_inv);
+}
+
+template <uint32_t kHiddenDim, uint32_t kClusterSize, uint32_t kVecs>
+struct Nvfp4RowQuantKernel {
+  using TensorView = tvm::ffi::TensorView;
+
+  /// The per-token NVFP4 of `input` [T, kHiddenDim] bf16 into `fp4` [T, kHiddenDim / 2],
+  /// `scales` [T * kHiddenDim / 16] and `token_scales` [T], as the kNvfp4 epilogue writes
+  /// them (subnormals kept).
+  static void
+  run(TensorView input, TensorView fp4, TensorView scales, TensorView token_scales, TensorView global_scale_inv) {
+    launch<false>(input, fp4, scales, token_scales, global_scale_inv);
+  }
+
+  /// run() with kNvfp4Ftz: the compare and the multiplies flush subnormals.
+  static void
+  run_ftz(TensorView input, TensorView fp4, TensorView scales, TensorView token_scales, TensorView global_scale_inv) {
+    launch<true>(input, fp4, scales, token_scales, global_scale_inv);
+  }
+
+ private:
+  template <bool kFtz>
+  static void
+  launch(TensorView input, TensorView fp4, TensorView scales, TensorView token_scales, TensorView global_scale_inv) {
+    using namespace host;
+    using Trait = RowClusterTrait<kHiddenDim, kClusterSize, kVecs>;
+    auto T = SymbolicSize{"num_tokens"};
+    auto SF = SymbolicSize{"num_scales"};
+    SymbolicDevice device;
+    device.set_options<kDLCUDA>();
+    TensorMatcher({T, kHiddenDim})
+        .with_strides({kHiddenDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device<kDLCUDA>(device)
+        .verify(input);
+    TensorMatcher({T, kHiddenDim / 2})
+        .with_strides({kHiddenDim / 2, 1})
+        .with_dtype<uint8_t>()
+        .with_device<kDLCUDA>(device)
+        .verify(fp4);
+    SF.set_value(T.unwrap() * (kHiddenDim / 16));
+    TensorMatcher({SF}).with_strides({1}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(scales);
+    TensorMatcher({T}).with_strides({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(token_scales);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(global_scale_inv);
+    const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    CHECK_HOST(num_tokens > 0) << "num_tokens must be positive";
+    CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0) << "input must be 16B aligned";
+    CHECK_HOST(reinterpret_cast<uintptr_t>(fp4.data_ptr()) % 4 == 0) << "fp4 must be 4B aligned";
+    const auto params = Nvfp4RowQuantParams{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .fp4 = static_cast<uint8_t*>(fp4.data_ptr()),
+        .scales = static_cast<uint8_t*>(scales.data_ptr()),
+        .token_scales = static_cast<float*>(token_scales.data_ptr()),
+        .global_scale_inv = static_cast<const float*>(global_scale_inv.data_ptr()),
+    };
+    LaunchKernel(dim3(num_tokens, kClusterSize), Trait::kBlockSize, input.device())(
+        nvfp4_row_quant_kernel<kHiddenDim, kClusterSize, kVecs, kFtz>, params);
   }
 };
 

@@ -18,6 +18,15 @@ The base entry point needs :func:`register_comm` once per process and keys on
 ``world_size`` alone. :func:`moe_finalize_shared_gate_all_reduce` takes the
 caller's communicator directly and applies an FP32 shared gate after rounding
 the routed values to BF16, before the collective.
+
+:func:`moe_finalize_all_reduce_residual_norm_quant` and
+:func:`all_reduce_residual_norm_quant` are the residual + norm entry points that
+also write the MXFP8 (FlashInfer's 128x4 layout) of the normalized output, for a
+consumer GEMM that takes it pre-quantized, at up to 128 rows; with
+``trigger_at_entry`` they let that consumer launch (PDL) at their entry.
+:func:`all_reduce_residual_norm_quant_nvfp4` also writes its per-token NVFP4, as
+FlashInfer's per-token NVFP4 quantize does, for a routed MoE that takes it
+pre-quantized; :func:`nvfp4_row_quant` runs that epilogue on rows from memory.
 """
 
 from __future__ import annotations
@@ -455,6 +464,603 @@ def all_reduce_residual_norm(
         vecs_per_thread,
     )
     return out, residual_out
+
+
+# MXFP8 norm epilogue (kQuant): besides ``out`` and ``residual_out``, the kernel
+# writes the MXFP8 of the normalized row exactly as FlashInfer's
+# ``mxfp8_quantize(out, is_sf_swizzled_layout=True, alignment=32,
+# backend="cute-dsl")`` does: ``[T, hidden]`` e4m3 codes and the UE8M0 scales of
+# every 32 columns in FlashInfer's 128x4 swizzle, one 128-row tile whose padding
+# rows are zero. ``out`` and ``residual_out`` are the plain kernel's, bit for bit
+# (same launch geometry, same epilogue).
+
+MXFP8_QUANT_MAX_TOKENS = 128  # one 128-row scale tile
+
+
+def mxfp8_scale_bytes(hidden_dim: int) -> int:
+    """Size of the MXFP8 scale tensor: one 128-row tile of ``hidden_dim / 32`` UE8M0
+    scales per row, FlashInfer's size for up to 128 rows."""
+    return (hidden_dim // 32) * 128
+
+
+@cache_once
+def _jit_quant_module(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    weight_dtype: torch.dtype,
+) -> Module:
+    require_cluster_launch_arch()
+    assert cluster_size in valid_cluster_sizes(hidden_dim), (
+        f"cluster_size={cluster_size} is not valid for hidden_dim={hidden_dim}; "
+        f"choose from {valid_cluster_sizes(hidden_dim)}"
+    )
+    args = make_cpp_args(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        is_arch_support_pdl(),
+        weight_dtype,
+        False,  # kMhc
+        True,  # kQuant
+    )
+    entry = "run_plain_quant" if top_k == 0 else "run_residual_norm_quant"
+    return load_jit(
+        "moe_finalize_all_reduce_quant",
+        *args,
+        cuda_files=["distributed/all_reduce_fusion.cuh"],
+        cuda_wrappers=[("run", f"MoeFinalizeAllReduceKernel<{args}>::{entry}")],
+    )
+
+
+def load_residual_norm_quant(
+    world_size: int,
+    num_tokens: int,
+    hidden_dim: int,
+    *,
+    top_k: int = 0,
+    weight_dtype: torch.dtype = torch.float32,
+) -> None:
+    """Load (compiling once) the JIT module that the quant op of this batch runs:
+    :func:`moe_finalize_all_reduce_residual_norm_quant` with ``top_k`` > 0 and
+    ``weight_dtype`` routing weights, else :func:`all_reduce_residual_norm_quant`.
+    For callers that build before graph capture."""
+    _, _, cluster_size = _norm_launch(
+        world_size, num_tokens, hidden_dim, top_k != 0, None, None, None
+    )
+    _jit_quant_module(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        weight_dtype if top_k else torch.bfloat16,
+    )
+
+
+def _quant_outputs(
+    num_tokens: int,
+    hidden_dim: int,
+    device: torch.device,
+    out: Optional[torch.Tensor],
+    quantized: Optional[torch.Tensor],
+    scales: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert 0 < num_tokens <= MXFP8_QUANT_MAX_TOKENS, (
+        f"the MXFP8 epilogue takes 1-{MXFP8_QUANT_MAX_TOKENS} rows, got {num_tokens}"
+    )
+    if out is None:
+        out = torch.empty(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
+    if quantized is None:
+        quantized = torch.empty(
+            num_tokens, hidden_dim, dtype=torch.float8_e4m3fn, device=device
+        )
+    if scales is None:
+        scales = torch.empty(
+            mxfp8_scale_bytes(hidden_dim), dtype=torch.uint8, device=device
+        )
+    return out, quantized, scales
+
+
+@register_custom_op(mutates_args=["out", "residual_out", "quantized", "scales"])
+def _moe_finalize_all_reduce_residual_norm_quant_op(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    out: torch.Tensor,
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    shared_output: Optional[torch.Tensor],
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    weight_offset: float,
+    two_shot: bool,
+    vecs_per_thread: int,
+    trigger_at_entry: bool,
+) -> None:
+    _jit_quant_module(
+        world_size, hidden_dim, top_k, cluster_size, expert_weights.dtype
+    ).run(
+        _COMM_MAP[world_size],
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        norm_eps,
+        residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+        trigger_at_entry,
+    )
+
+
+@register_custom_op(mutates_args=["out", "residual_out", "quantized", "scales"])
+def _all_reduce_residual_norm_quant_op(
+    world_size: int,
+    hidden_dim: int,
+    cluster_size: int,
+    out: torch.Tensor,
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    weight_offset: float,
+    two_shot: bool,
+    vecs_per_thread: int,
+    trigger_at_entry: bool,
+) -> None:
+    _jit_quant_module(world_size, hidden_dim, 0, cluster_size, torch.bfloat16).run(
+        _COMM_MAP[world_size],
+        out,
+        input,
+        norm_weight,
+        norm_eps,
+        residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+        trigger_at_entry,
+    )
+
+
+def moe_finalize_all_reduce_residual_norm_quant(
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    top_k: int,
+    shared_output: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    *,
+    world_size: int,
+    hidden_dim: int,
+    gemma: bool = False,
+    residual_out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    quantized: Optional[torch.Tensor] = None,
+    scales: Optional[torch.Tensor] = None,
+    cluster_size: Optional[int] = None,
+    two_shot: Optional[bool] = None,
+    vecs_per_thread: Optional[int] = None,
+    trigger_at_entry: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`moe_finalize_all_reduce_residual_norm` that also writes the MXFP8 of
+    its normalized output (see ``MXFP8_QUANT_MAX_TOKENS``), 1-128 rows.
+
+    :param out: optional ``[T, hidden_dim]`` bf16 for the normalized output.
+    :param quantized: optional ``[T, hidden_dim]`` float8_e4m3fn for its codes.
+    :param scales: optional ``[mxfp8_scale_bytes(hidden_dim)]`` uint8 for its
+                   128x4-swizzled UE8M0 scales; every byte is written.
+    :param trigger_at_entry: let the next kernel on the stream launch (PDL) at this
+                             kernel's entry instead of after its epilogue. Valid
+                             only when that kernel reads nothing, before its own
+                             PDL wait, that this kernel or a kernel before it
+                             writes (FlashInfer's low-latency MXFP8 GEMM loads
+                             only its weights there). The outputs are the same.
+    :returns: ``(normed, residual_out, quantized, scales)``; ``residual_out``
+              defaults to ``residual`` (updated in place).
+    """
+    num_tokens = expert_weights.shape[0]
+    out, quantized, scales = _quant_outputs(
+        num_tokens, hidden_dim, gemm2_out.device, out, quantized, scales
+    )
+    residual_out = residual if residual_out is None else residual_out
+    two_shot, vecs_per_thread, cluster_size = _norm_launch(
+        world_size,
+        num_tokens,
+        hidden_dim,
+        True,
+        two_shot,
+        vecs_per_thread,
+        cluster_size,
+    )
+    _moe_finalize_all_reduce_residual_norm_quant_op(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        out,
+        quantized,
+        scales,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        float(norm_eps),
+        residual,
+        residual_out,
+        1.0 if gemma else 0.0,
+        two_shot,
+        vecs_per_thread,
+        trigger_at_entry,
+    )
+    return out, residual_out, quantized, scales
+
+
+def all_reduce_residual_norm_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    *,
+    world_size: int,
+    gemma: bool = False,
+    residual_out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    quantized: Optional[torch.Tensor] = None,
+    scales: Optional[torch.Tensor] = None,
+    cluster_size: Optional[int] = None,
+    two_shot: Optional[bool] = None,
+    vecs_per_thread: Optional[int] = None,
+    trigger_at_entry: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`all_reduce_residual_norm` with the residual add and the norm, that also
+    writes the MXFP8 of its normalized output, as
+    :func:`moe_finalize_all_reduce_residual_norm_quant` does (``trigger_at_entry``
+    as there).
+
+    :returns: ``(normed, residual_out, quantized, scales)``.
+    """
+    num_tokens, hidden_dim = input.shape
+    out, quantized, scales = _quant_outputs(
+        num_tokens, hidden_dim, input.device, out, quantized, scales
+    )
+    residual_out = residual if residual_out is None else residual_out
+    two_shot, vecs_per_thread, cluster_size = _norm_launch(
+        world_size,
+        num_tokens,
+        hidden_dim,
+        False,
+        two_shot,
+        vecs_per_thread,
+        cluster_size,
+    )
+    _all_reduce_residual_norm_quant_op(
+        world_size,
+        hidden_dim,
+        cluster_size,
+        out,
+        quantized,
+        scales,
+        input,
+        norm_weight,
+        float(norm_eps),
+        residual,
+        residual_out,
+        1.0 if gemma else 0.0,
+        two_shot,
+        vecs_per_thread,
+        trigger_at_entry,
+    )
+    return out, residual_out, quantized, scales
+
+
+# NVFP4 norm epilogue (kNvfp4, with kQuant): besides the MXFP8 epilogue's outputs,
+# the kernel writes the per-token NVFP4 of the normalized row exactly as FlashInfer's
+# ``nvfp4_quantize(out, global_scale_inv, sfLayout=layout_linear,
+# per_token_activation=True, backend="cute-dsl")`` does in its default configuration
+# (fast math, no 4over6): ``[T, hidden / 2]`` packed E2M1 codes, ``[T * hidden / 16]``
+# E4M3 block scales in the linear layout and ``[T]`` fp32 per-token scales. ``ftz``
+# is the subnormal mode of the few f32 operations FlashInfer leaves to CuTe-DSL
+# (all_reduce_fusion.cuh, nvfp4_quant_row); a caller finds FlashInfer's with
+# :func:`nvfp4_row_quant` on rows that tell the two apart.
+
+NVFP4_SF_VEC = 16  # values per E4M3 block scale
+
+
+def nvfp4_scale_bytes(num_tokens: int, hidden_dim: int) -> int:
+    """Size of the per-token NVFP4 block scales in the linear layout."""
+    return num_tokens * (hidden_dim // NVFP4_SF_VEC)
+
+
+def require_nvfp4_arch() -> None:
+    """Raise unless the NVFP4 epilogue compiles here: its e2m1 conversions need the
+    kernel's SGL_ARCH_BLACKWELL_OR_GREATER, SM100 or newer and a CUDA 12.9 or newer
+    nvcc (the one the JIT runs), without which the build fails."""
+    # the version of the nvcc the JIT builds run, as the arch module resolves it
+    from sglang.kernels.jit.utils.arch import _jit_cuda_version
+
+    if is_hip_runtime() or get_jit_cuda_arch().major < 10:
+        raise RuntimeError("the NVFP4 epilogue needs CUDA SM100 or newer (e2m1)")
+    version = _jit_cuda_version()
+    if version < (12, 9):
+        raise RuntimeError(
+            "the NVFP4 epilogue needs a CUDA 12.9 or newer nvcc for its e2m1 "
+            "conversions (SGL_ARCH_BLACKWELL_OR_GREATER); the JIT runs nvcc "
+            + ".".join(map(str, version))
+        )
+
+
+@cache_once
+def _jit_quant_nvfp4_module(
+    world_size: int, hidden_dim: int, cluster_size: int, ftz: bool
+) -> Module:
+    require_cluster_launch_arch()
+    require_nvfp4_arch()
+    assert cluster_size in valid_cluster_sizes(hidden_dim), (
+        f"cluster_size={cluster_size} is not valid for hidden_dim={hidden_dim}; "
+        f"choose from {valid_cluster_sizes(hidden_dim)}"
+    )
+    args = make_cpp_args(
+        world_size,
+        hidden_dim,
+        0,  # kTopK: the plain all-reduce
+        cluster_size,
+        is_arch_support_pdl(),
+        torch.bfloat16,
+        False,  # kMhc
+        True,  # kQuant
+        False,  # kCollapse
+        False,  # kGatedShared
+        True,  # kNvfp4
+        ftz,  # kNvfp4Ftz
+    )
+    return load_jit(
+        "all_reduce_residual_norm_quant_nvfp4",
+        *args,
+        cuda_files=["distributed/all_reduce_fusion.cuh"],
+        cuda_wrappers=[
+            ("run", f"MoeFinalizeAllReduceKernel<{args}>::run_plain_quant_nvfp4")
+        ],
+    )
+
+
+def load_residual_norm_quant_nvfp4(
+    world_size: int, num_tokens: int, hidden_dim: int, *, ftz: bool = False
+) -> None:
+    """Load (compiling once) the JIT module that
+    :func:`all_reduce_residual_norm_quant_nvfp4` runs for this batch. For callers
+    that build before graph capture."""
+    _, _, cluster_size = _norm_launch(
+        world_size, num_tokens, hidden_dim, False, None, None, None
+    )
+    _jit_quant_nvfp4_module(world_size, hidden_dim, cluster_size, ftz)
+
+
+def _nvfp4_outputs(
+    num_tokens: int,
+    hidden_dim: int,
+    device: torch.device,
+    fp4: Optional[torch.Tensor],
+    fp4_scales: Optional[torch.Tensor],
+    token_scales: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if fp4 is None:
+        fp4 = torch.empty(num_tokens, hidden_dim // 2, dtype=torch.uint8, device=device)
+    if fp4_scales is None:
+        fp4_scales = torch.empty(
+            nvfp4_scale_bytes(num_tokens, hidden_dim), dtype=torch.uint8, device=device
+        )
+    if token_scales is None:
+        token_scales = torch.empty(num_tokens, dtype=torch.float32, device=device)
+    return fp4, fp4_scales, token_scales
+
+
+@register_custom_op(
+    mutates_args=[
+        "out",
+        "residual_out",
+        "quantized",
+        "scales",
+        "fp4",
+        "fp4_scales",
+        "token_scales",
+    ]
+)
+def _all_reduce_residual_norm_quant_nvfp4_op(
+    world_size: int,
+    hidden_dim: int,
+    cluster_size: int,
+    ftz: bool,
+    out: torch.Tensor,
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+    fp4: torch.Tensor,
+    fp4_scales: torch.Tensor,
+    token_scales: torch.Tensor,
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    global_scale_inv: torch.Tensor,
+    weight_offset: float,
+    two_shot: bool,
+    vecs_per_thread: int,
+) -> None:
+    _jit_quant_nvfp4_module(world_size, hidden_dim, cluster_size, ftz).run(
+        _COMM_MAP[world_size],
+        out,
+        input,
+        norm_weight,
+        norm_eps,
+        residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+        fp4,
+        fp4_scales,
+        token_scales,
+        global_scale_inv,
+    )
+
+
+def all_reduce_residual_norm_quant_nvfp4(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    global_scale_inv: torch.Tensor,
+    *,
+    world_size: int,
+    gemma: bool = False,
+    ftz: bool = False,
+    residual_out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    quantized: Optional[torch.Tensor] = None,
+    scales: Optional[torch.Tensor] = None,
+    fp4: Optional[torch.Tensor] = None,
+    fp4_scales: Optional[torch.Tensor] = None,
+    token_scales: Optional[torch.Tensor] = None,
+    cluster_size: Optional[int] = None,
+    two_shot: Optional[bool] = None,
+    vecs_per_thread: Optional[int] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """:func:`all_reduce_residual_norm_quant` that also writes the per-token NVFP4 of
+    its normalized output (see ``NVFP4_SF_VEC``), 1-128 rows.
+
+    :param global_scale_inv: ``[1]`` fp32, the inverse global scale FlashInfer's
+                             per-token quantize takes (``1 / (e4m3_max * 6)``).
+    :param fp4: optional ``[T, hidden / 2]`` uint8 for the packed E2M1 codes.
+    :param fp4_scales: optional ``[T * hidden / 16]`` uint8 for the E4M3 block scales
+                       (linear layout); every byte is written.
+    :param token_scales: optional ``[T]`` fp32 for the per-token scales.
+    :returns: ``(normed, residual_out, quantized, scales, fp4, fp4_scales,
+              token_scales)``; ``residual_out`` defaults to ``residual`` (updated in
+              place).
+    """
+    num_tokens, hidden_dim = input.shape
+    out, quantized, scales = _quant_outputs(
+        num_tokens, hidden_dim, input.device, out, quantized, scales
+    )
+    fp4, fp4_scales, token_scales = _nvfp4_outputs(
+        num_tokens, hidden_dim, input.device, fp4, fp4_scales, token_scales
+    )
+    residual_out = residual if residual_out is None else residual_out
+    two_shot, vecs_per_thread, cluster_size = _norm_launch(
+        world_size,
+        num_tokens,
+        hidden_dim,
+        False,
+        two_shot,
+        vecs_per_thread,
+        cluster_size,
+    )
+    _all_reduce_residual_norm_quant_nvfp4_op(
+        world_size,
+        hidden_dim,
+        cluster_size,
+        bool(ftz),
+        out,
+        quantized,
+        scales,
+        fp4,
+        fp4_scales,
+        token_scales,
+        input,
+        norm_weight,
+        float(norm_eps),
+        residual,
+        residual_out,
+        global_scale_inv,
+        1.0 if gemma else 0.0,
+        two_shot,
+        vecs_per_thread,
+    )
+    return out, residual_out, quantized, scales, fp4, fp4_scales, token_scales
+
+
+@cache_once
+def _jit_nvfp4_rows_module(
+    hidden_dim: int, cluster_size: int, vecs_per_thread: int
+) -> Module:
+    require_cluster_launch_arch()
+    require_nvfp4_arch()
+    assert cluster_size in valid_cluster_sizes(hidden_dim), (
+        f"cluster_size={cluster_size} is not valid for hidden_dim={hidden_dim}"
+    )
+    assert vecs_per_thread in (1, 2), vecs_per_thread
+    args = make_cpp_args(hidden_dim, cluster_size, vecs_per_thread)
+    return load_jit(
+        "nvfp4_row_quant",
+        *args,
+        cuda_files=["distributed/all_reduce_fusion.cuh"],
+        cuda_wrappers=[
+            ("run", f"Nvfp4RowQuantKernel<{args}>::run"),
+            ("run_ftz", f"Nvfp4RowQuantKernel<{args}>::run_ftz"),
+        ],
+    )
+
+
+def nvfp4_row_quant(
+    input: torch.Tensor,
+    global_scale_inv: torch.Tensor,
+    *,
+    ftz: bool = False,
+    cluster_size: Optional[int] = None,
+    vecs_per_thread: int = 1,
+    fp4: Optional[torch.Tensor] = None,
+    fp4_scales: Optional[torch.Tensor] = None,
+    token_scales: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The NVFP4 epilogue of :func:`all_reduce_residual_norm_quant_nvfp4` on bf16 rows
+    ``input`` ``[T, hidden]`` from memory, one cluster a row laid out as the boundary
+    kernel lays out a row at ``cluster_size`` / ``vecs_per_thread`` (no push plane):
+    ``(fp4 [T, hidden / 2], fp4_scales [T * hidden / 16], token_scales [T])``.
+    Launched without PDL, on the current stream."""
+    num_tokens, hidden_dim = input.shape
+    fp4, fp4_scales, token_scales = _nvfp4_outputs(
+        num_tokens, hidden_dim, input.device, fp4, fp4_scales, token_scales
+    )
+    module = _jit_nvfp4_rows_module(
+        hidden_dim, cluster_size or default_cluster_size(hidden_dim), vecs_per_thread
+    )
+    (module.run_ftz if ftz else module.run)(
+        input, fp4, fp4_scales, token_scales, global_scale_inv
+    )
+    return fp4, fp4_scales, token_scales
 
 
 @cache_once
