@@ -451,6 +451,16 @@ register_kernel(
         ),
     )
 )
+# MiniMax-M3's grouped q/k/index norm + RoPE + FP8 q and the NVFP4 K / V / index-K
+# page store in one launch.
+register_kernel(
+    KernelSpec(
+        op="attention.minimax_qknorm_rope_store_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.minimax_qknorm_rope_store:minimax_qknorm_rope_store_fp8",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
 register_kernel(
     KernelSpec(
         op="attention.topk_index_reduce",
