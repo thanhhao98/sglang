@@ -82,6 +82,11 @@ TOLERATED_READS = (
     "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
     "MegakernelBinding.engram_host_table",  # the per-layer host table object
 )
+# Called by a megakernel on MiniMax-M3's NVFP4 KV pool, tolerated until offered as
+# data.
+TOLERATED_NVFP4_POOL_CALLABLES = (
+    "KvPoolView.set_kv_index_buffer_fused_qknorm_rope",  # the fused K / V / index-K write
+)
 
 
 class KvPoolView:
@@ -120,6 +125,10 @@ class KvPoolView:
     @property
     def set_swa_key_buffer_radix_fused_norm_rope(self) -> Callable[..., None]:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope
+
+    @property
+    def set_kv_index_buffer_fused_qknorm_rope(self) -> Callable[..., bool]:
+        return self.pool.set_kv_index_buffer_fused_qknorm_rope
 
 
 class ForwardView:
