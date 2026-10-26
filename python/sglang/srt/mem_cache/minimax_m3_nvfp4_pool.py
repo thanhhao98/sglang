@@ -670,6 +670,114 @@ class MiniMaxM3Nvfp4KVPool(MiniMaxSparseKVPool):
         not enabled for this platform or input, so the eager path stays the
         reference and remains available for A/B.
         """
+        args = self._nvfp4_store_kv_index_args(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            cache_idx_k,
+            cache_idx_v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            idx_k_scale=idx_k_scale,
+        )
+        if args is None:
+            self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
+            self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)
+            return
+
+        from sglang.kernels.ops.kvcache.nvfp4_store_kv_index import (
+            nvfp4_store_kv_index,
+        )
+
+        nvfp4_store_kv_index(**args)
+
+    def set_kv_index_buffer_fused_qknorm_rope(
+        self,
+        layer: RadixAttention,
+        loc,
+        qkv: torch.Tensor,
+        groups,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+        eps: float,
+        *,
+        fp8_a: torch.Tensor,
+        group_a: int,
+        fp8_b: torch.Tensor,
+        group_b: int,
+        k_group: int,
+        index_k_group: int,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        idx_k_scale: Optional[float] = None,
+    ) -> bool:
+        """The grouped q/k/index norm + RoPE with the FP8 q epilogue on ``qkv``
+        (``minimax_qknorm_rope_grouped_fp8(qkv, groups, cos_sin_cache, positions, eps,
+        fp8_a=..., group_a=..., fp8_b=..., group_b=...)``), then
+        ``set_fused_kv_index_buffer(layer, loc, cache_k, cache_v, cache_idx_k, None,
+        k_scale, v_scale, idx_k_scale)`` on the rows it normed, in one launch
+        (``minimax_qknorm_rope_store_fp8``) on this pool's buffers; True.
+
+        ``cache_k`` / ``cache_idx_k`` must be the heads of groups ``k_group`` /
+        ``index_k_group`` in place in ``qkv`` and ``cache_v`` whole heads of its rows
+        outside every group (the kernel checks both). Where
+        ``set_fused_kv_index_buffer`` would store these rows per buffer, launches
+        nothing and returns False: the caller then runs the norm and the store
+        itself. Raises where ``set_fused_kv_index_buffer`` raises.
+        """
+        args = self._nvfp4_store_kv_index_args(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            cache_idx_k,
+            None,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            idx_k_scale=idx_k_scale,
+        )
+        if args is None:
+            return False
+
+        from sglang.kernels.ops.attention.minimax_qknorm_rope_store import (
+            minimax_qknorm_rope_store_fp8,
+        )
+
+        minimax_qknorm_rope_store_fp8(
+            qkv,
+            groups,
+            cos_sin_cache,
+            positions,
+            eps,
+            fp8_a=fp8_a,
+            group_a=group_a,
+            fp8_b=fp8_b,
+            group_b=group_b,
+            k_group=k_group,
+            index_k_group=index_k_group,
+            **args,
+        )
+        return True
+
+    def _nvfp4_store_kv_index_args(
+        self,
+        layer: RadixAttention,
+        loc,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+        cache_idx_v: Optional[torch.Tensor],
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        idx_k_scale: Optional[float] = None,
+    ) -> Optional[dict]:
+        """The arguments ``set_fused_kv_index_buffer`` passes ``nvfp4_store_kv_index``,
+        or None where it stores per buffer instead; raises where it raises.
+        ``set_kv_index_buffer_fused_qknorm_rope`` hands them its fused kernel."""
         if cache_idx_v is not None:
             raise ValueError("M3.1 NVFP4 requires a K-only sparse index")
         for name, scale in (
@@ -688,13 +796,7 @@ class MiniMaxM3Nvfp4KVPool(MiniMaxSparseKVPool):
             and cache_v.dtype == cache_k.dtype
             and cache_idx_k.dtype == cache_k.dtype
         ):
-            self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
-            self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)
-            return
-
-        from sglang.kernels.ops.kvcache.nvfp4_store_kv_index import (
-            nvfp4_store_kv_index,
-        )
+            return None
 
         main = self.main_pool
         index = self.index_k_pool
@@ -719,18 +821,18 @@ class MiniMaxM3Nvfp4KVPool(MiniMaxSparseKVPool):
         idx_payload, idx_scale_buf = index.get_raw_k_buffers(
             self.index_k_layer_id_mapping[layer.layer_id]
         )
-        nvfp4_store_kv_index(
-            cache_k,
-            cache_v,
-            cache_idx_k.reshape(-1, main.head_dim),
-            k_payload,
-            k_scale_buf,
-            v_payload,
-            v_scale_buf,
-            idx_payload,
-            idx_scale_buf,
-            write_loc.reshape(-1),
-            main.global_scale,
+        return dict(
+            k=cache_k,
+            v=cache_v,
+            idx_k=cache_idx_k.reshape(-1, main.head_dim),
+            k_payload=k_payload,
+            k_scale=k_scale_buf,
+            v_payload=v_payload,
+            v_scale=v_scale_buf,
+            idx_k_payload=idx_payload,
+            idx_k_scale=idx_scale_buf,
+            indices=write_loc.reshape(-1),
+            global_scale=main.global_scale,
             page_size=main.page_size,
         )
 

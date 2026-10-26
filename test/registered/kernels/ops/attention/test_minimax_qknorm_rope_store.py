@@ -1,8 +1,9 @@
 """The fused MiniMax-M3.1 q/k/index norm + RoPE + FP8 q + NVFP4 K/V/index-K store
-(``minimax_qknorm_rope_store_fp8``) on one SM100-family GPU (GB300, B300, B200), on
-the buffers of SGLang's NVFP4 KV pool and the arguments its fused store hands its
-kernel (``MiniMaxM3Nvfp4KVPool.set_fused_kv_index_buffer``), against SGLang's two
-kernels as the attention runs them (``minimax_qknorm_rope_grouped_fp8`` in
+(``minimax_qknorm_rope_store_fp8``) on one SM100-family GPU (GB300, B300, B200), as
+SGLang's NVFP4 KV pool launches it on its own buffers
+(``MiniMaxM3Nvfp4KVPool.set_kv_index_buffer_fused_qknorm_rope``: the arguments its
+``set_fused_kv_index_buffer`` hands its kernel), against SGLang's two kernels as the
+attention runs them (``minimax_qknorm_rope_grouped_fp8`` in
 ``forward_prepare``, then the NVFP4 backend's ``set_fused_kv_index_buffer``, i.e.
 ``nvfp4_store_kv_index``), on one TP4 rank's shapes (q 16 heads, k / v 1 head, index q
 / k 1 head of 128; NeoX RoPE on 64 of 128 dims, theta 1e7), at every decode-step width
@@ -396,42 +397,16 @@ def _sglang(attn, pool, qkv, positions, loc):
     return fp8_q, fp8_idx_q
 
 
-def _store_args(pool, layer, loc, k, v, idx_k):
-    """What SGLang's fused KV store hands ``nvfp4_store_kv_index`` for these rows
-    (``MiniMaxM3Nvfp4KVPool.set_fused_kv_index_buffer``): the K / V / index-K views,
-    the layer's raw page buffers, the write slots, the global scale and page size."""
-    main, index = pool.main_pool, pool.index_k_pool
-    k_payload, v_payload, k_scale, v_scale = main.get_raw_kv_buffers(layer.layer_id)
-    idx_payload, idx_scale = index.get_raw_k_buffers(
-        pool.index_k_layer_id_mapping[layer.layer_id]
-    )
-    return dict(
-        k=k,
-        v=v,
-        idx_k=idx_k.reshape(-1, main.head_dim),
-        k_payload=k_payload,
-        k_scale=k_scale,
-        v_payload=v_payload,
-        v_scale=v_scale,
-        idx_k_payload=idx_payload,
-        idx_k_scale=idx_scale,
-        indices=loc.reshape(-1),
-        global_scale=main.global_scale,
-        page_size=main.page_size,
-    )
-
-
 def _fused(attn, pool, qkv, positions, loc):
-    """The fused kernel in place of the two, on the store's arguments
-    (``_store_args``) and the norm's (as ``_sglang`` passes them). Returns the FP8 q,
-    index q."""
-    from sglang.kernels.ops.attention.minimax_qknorm_rope_store import (
-        minimax_qknorm_rope_store_fp8,
-    )
-
+    """The fused kernel in place of the two, as the pool launches it
+    (``set_kv_index_buffer_fused_qknorm_rope``) on the views and the store call of
+    ``_sglang``. Returns the FP8 q, index q."""
     fp8_q, fp8_idx_q = _fp8_outputs(qkv)
     k, v, idx_k = _views(attn, qkv)
-    minimax_qknorm_rope_store_fp8(
+    layer = attn.attn
+    launched = pool.set_kv_index_buffer_fused_qknorm_rope(
+        layer,
+        loc,
         qkv,
         attn._qknorm_groups(),
         attn.rotary_emb.cos_sin_cache,
@@ -443,10 +418,14 @@ def _fused(attn, pool, qkv, positions, loc):
         group_b=2,
         k_group=1,
         index_k_group=3,
-        **_store_args(
-            pool, attn.attn, loc, k.view(-1, 1, 128), v.view(-1, 1, 128), idx_k
-        ),
+        cache_k=k.view(-1, 1, 128),
+        cache_v=v.view(-1, 1, 128),
+        cache_idx_k=idx_k,
+        k_scale=layer.k_scale_float,
+        v_scale=layer.v_scale_float,
+        idx_k_scale=layer.idx_k_scale_float,
     )
+    assert launched, "the pool stored these rows per buffer"
     return fp8_q, fp8_idx_q
 
 
