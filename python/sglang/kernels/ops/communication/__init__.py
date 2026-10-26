@@ -24,6 +24,24 @@ register_kernel(
     )
 )
 
+# The push-plane residual + norm kernel's MXFP8 epilogue (FlashInfer's 128x4 layout).
+register_kernel(
+    KernelSpec(
+        op="communication.all_reduce_residual_norm_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.all_reduce_fusion:all_reduce_residual_norm_quant",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="communication.moe_finalize_all_reduce_residual_norm_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_all_reduce_residual_norm_quant",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
+
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn in [
