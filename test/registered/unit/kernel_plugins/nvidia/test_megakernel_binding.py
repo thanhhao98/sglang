@@ -33,6 +33,13 @@ class Pool:
         return kw
 
 
+class Nvfp4Pool(Pool):
+    """A pool with the NVFP4 pool's fused q/k norm + RoPE + K / V / index-K write."""
+
+    def set_kv_index_buffer_fused_qknorm_rope(self, layer, loc, qkv, *args, **kw):
+        return True
+
+
 def backend(pool):
     return SimpleNamespace(
         token_to_kv_pool=pool,
@@ -54,6 +61,19 @@ class TestMegakernelBinding(CustomTestCase):
         self.assertEqual(view.metadata.core_attn_metadata, "core")
         self.assertIs(view.kv_pool.pool, pool)
         self.assertIs(view.kv_pool.get_swa_key_buffer_radix(1), pool.keys[1])
+
+    def test_the_fused_nvfp4_kv_index_write_is_the_pools_bound_method(self):
+        pool = Nvfp4Pool()
+        with patch(BACKEND, return_value=backend(pool)):
+            view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
+        write = view.kv_pool.set_kv_index_buffer_fused_qknorm_rope
+        self.assertEqual(write, pool.set_kv_index_buffer_fused_qknorm_rope)
+        self.assertIs(write.__self__, pool)
+        self.assertIs(write.__func__, Nvfp4Pool.set_kv_index_buffer_fused_qknorm_rope)
+        self.assertIn(
+            "KvPoolView.set_kv_index_buffer_fused_qknorm_rope",
+            mb.TOLERATED_NVFP4_POOL_CALLABLES,
+        )
 
     def test_a_replaced_source_fails_assert_live_by_name(self):
         model = torch.nn.Module()
