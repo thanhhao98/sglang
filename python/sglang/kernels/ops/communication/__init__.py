@@ -41,6 +41,24 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
     )
 )
+# Its per-token NVFP4 epilogue (FlashInfer's per-token NVFP4 quantize, linear scales).
+register_kernel(
+    KernelSpec(
+        op="communication.all_reduce_residual_norm_quant_nvfp4",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.all_reduce_fusion:all_reduce_residual_norm_quant_nvfp4",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+# The same NVFP4 epilogue on bf16 rows from memory (no push plane).
+register_kernel(
+    KernelSpec(
+        op="communication.nvfp4_row_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.all_reduce_fusion:nvfp4_row_quant",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
 
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
