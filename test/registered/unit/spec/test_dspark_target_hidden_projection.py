@@ -1,3 +1,5 @@
+import ast
+import inspect
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest import mock
@@ -105,6 +107,46 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
 
         draft_model.project_target_hidden.assert_not_called()
         self.assertIs(attention.input, projected_hidden)
+
+    def test_target_hidden_projections_run_under_the_draft_placement(self) -> None:
+        """Draft projections of target hidden in the worker run inside _draft_context();
+        outside it, the draft's all-gather can span the target's whole TP group."""
+        projections = {
+            name for name in vars(TargetHiddenKvInjector) if name.startswith("inject")
+        } | {"commit_hidden", "write_target_hidden_kv", "project_target_hidden"}
+        source, first_line = inspect.getsourcelines(DSparkWorkerV2)
+        sites = {}
+
+        def visit(node, in_draft_placement):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                # A nested callable runs where it is called, not where it is defined.
+                in_draft_placement = False
+            elif isinstance(node, ast.With) and any(
+                ast.unparse(item.context_expr) == "self._draft_context()"
+                for item in node.items
+            ):
+                in_draft_placement = True
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in projections
+            ):
+                sites.setdefault(node.func.attr, []).append(
+                    (first_line + node.lineno - 1, in_draft_placement)
+                )
+            for child in ast.iter_child_nodes(node):
+                visit(child, in_draft_placement)
+
+        visit(ast.parse("".join(source)), False)
+        self.assertLessEqual(
+            {"inject_prefill", "commit_hidden"},
+            set(sites),
+            "a projection call was renamed or removed; keep it inside _draft_context()",
+        )
+        unscoped = sorted(
+            line for calls in sites.values() for line, scoped in calls if not scoped
+        )
+        self.assertEqual(unscoped, [], "dspark_worker_v2.py lines outside the scope")
 
 
 if __name__ == "__main__":
